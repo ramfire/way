@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="fr">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AlfaWay — Monitoring fichiers</title>
+  <title>AlfaWay — Monitoring</title>
   <style>
     :root { --bg:#0f172a; --card:#1e293b; --txt:#e2e8f0; --mut:#94a3b8; --line:#334155; }
     * { box-sizing: border-box; }
@@ -23,9 +23,9 @@
     .dot.paused { background:#eab308; animation:none; }
     .dot.error { background:#ef4444; animation:none; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
-    button { background:var(--card); color:var(--txt); border:1px solid var(--line);
+    button, select { background:var(--card); color:var(--txt); border:1px solid var(--line);
              border-radius:6px; padding:.35rem .7rem; cursor:pointer; font-size:.8rem; }
-    button:hover { border-color:var(--mut); }
+    button:hover, select:hover { border-color:var(--mut); }
     table { width:100%; border-collapse:collapse; font-size:.86rem; }
     th, td { text-align:left; padding:.5rem .75rem; border-bottom:1px solid var(--line);
              white-space:nowrap; }
@@ -35,6 +35,8 @@
     .receiving { background:#1e3a8a; color:#bfdbfe; }
     .stored    { background:#14532d; color:#bbf7d0; }
     .failed    { background:#7f1d1d; color:#fecaca; }
+    .deleted   { background:#374151; color:#d1d5db; }
+    .missing   { background:#78350f; color:#fed7aa; }
     a.dl { color:#7dd3fc; text-decoration:none; }
     a.dl:hover { text-decoration:underline; }
     tr.new td { animation:flash 2.5s ease-out; }
@@ -48,68 +50,172 @@
 </head>
 <body>
   <header>
-    <h1>📡 Monitoring fichiers reçus</h1>
+    <h1>📡 <span id="t-title"></span></h1>
     <div class="stats" id="stats"></div>
     <div class="spacer"></div>
     <div class="meta">
-      <span><span class="dot" id="dot"></span> <span id="status">démarrage…</span></span>
+      <span><span class="dot" id="dot"></span> <span id="status"></span></span>
       <span id="updated"></span>
-      <button id="toggle">⏸ Pause</button>
+      <button id="toggle"></button>
+      <select id="lang" aria-label="Language">
+        <option value="en">English</option>
+        <option value="fr">Français</option>
+        <option value="it">Italiano</option>
+      </select>
     </div>
   </header>
   <div class="err" id="err"></div>
 
   <table>
     <thead>
-      <tr>
-        <th>État</th><th>Fichier</th><th>Utilisateur</th><th>Proto</th>
-        <th>IP</th><th>Taille</th><th>Transfert</th><th>Reçu</th><th>Stocké</th><th></th>
+      <tr id="head">
+        <th id="th-state"></th><th id="th-file"></th><th id="th-user"></th>
+        <th id="th-proto"></th><th id="th-ip"></th><th id="th-size"></th>
+        <th id="th-transfer"></th><th id="th-received"></th><th id="th-stored"></th><th></th>
       </tr>
     </thead>
-    <tbody id="rows"><tr><td colspan="10" class="empty">Chargement…</td></tr></tbody>
+    <tbody id="rows"></tbody>
   </table>
 
   <script>
+    // --- Dictionnaire de traductions (défaut : anglais) ------------------------
+    const I18N = {
+      en: {
+        locale: 'en-US',
+        title: 'Received files monitoring',
+        total: 'Total', receiving: 'receiving', stored: 'stored', failed: 'failed',
+        th_state: 'Status', th_file: 'File', th_user: 'User', th_proto: 'Proto',
+        th_ip: 'IP', th_size: 'Size', th_transfer: 'Transfer', th_received: 'Received',
+        th_stored: 'Stored',
+        st_starting: 'starting…', st_live: 'live ({s}s)', st_paused: 'paused',
+        st_error: 'error',
+        btn_pause: '⏸ Pause', btn_resume: '▶ Resume',
+        updated: 'updated {s}s ago',
+        loading: 'Loading…', empty: 'No files received.',
+        download: '⬇ Download',
+        err_session: 'session expired — sign in to the admin again',
+        // libellés d'état (clé stable r.state)
+        s_receiving: 'receiving', s_stored: 'stored', s_failed: 'failed',
+        s_deleted: 'deleted', s_missing: 'missing',
+        bytes_unit: 'B', units: ['KB','MB','GB','TB'],
+      },
+      fr: {
+        locale: 'fr-FR',
+        title: 'Monitoring fichiers reçus',
+        total: 'Total', receiving: 'réception', stored: 'stockés', failed: 'échecs',
+        th_state: 'État', th_file: 'Fichier', th_user: 'Utilisateur', th_proto: 'Proto',
+        th_ip: 'IP', th_size: 'Taille', th_transfer: 'Transfert', th_received: 'Reçu',
+        th_stored: 'Stocké',
+        st_starting: 'démarrage…', st_live: 'live ({s}s)', st_paused: 'en pause',
+        st_error: 'erreur',
+        btn_pause: '⏸ Pause', btn_resume: '▶ Reprendre',
+        updated: 'màj il y a {s}s',
+        loading: 'Chargement…', empty: 'Aucun fichier reçu.',
+        download: '⬇ Télécharger',
+        err_session: 'session expirée — reconnecte-toi à l’admin',
+        s_receiving: 'réception', s_stored: 'stocké', s_failed: 'échec',
+        s_deleted: 'supprimé', s_missing: 'absent',
+        bytes_unit: 'o', units: ['Ko','Mo','Go','To'],
+      },
+      it: {
+        locale: 'it-IT',
+        title: 'Monitoraggio file ricevuti',
+        total: 'Totale', receiving: 'in ricezione', stored: 'archiviati', failed: 'falliti',
+        th_state: 'Stato', th_file: 'File', th_user: 'Utente', th_proto: 'Proto',
+        th_ip: 'IP', th_size: 'Dimensione', th_transfer: 'Trasferimento', th_received: 'Ricevuto',
+        th_stored: 'Archiviato',
+        st_starting: 'avvio…', st_live: 'live ({s}s)', st_paused: 'in pausa',
+        st_error: 'errore',
+        btn_pause: '⏸ Pausa', btn_resume: '▶ Riprendi',
+        updated: 'agg. {s}s fa',
+        loading: 'Caricamento…', empty: 'Nessun file ricevuto.',
+        download: '⬇ Scarica',
+        err_session: 'sessione scaduta — accedi di nuovo all’admin',
+        s_receiving: 'in ricezione', s_stored: 'archiviato', s_failed: 'fallito',
+        s_deleted: 'eliminato', s_missing: 'assente',
+        bytes_unit: 'B', units: ['KB','MB','GB','TB'],
+      },
+    };
+
     const REFRESH_MS = 10000;          // 10 s (choix utilisateur)
+    const REFRESH_S = REFRESH_MS / 1000;
     const seen = new Set();            // ids déjà affichés → détecter les nouveaux
     let firstLoad = true, paused = false, lastUpdate = null, timer = null;
+    let lastData = null;               // dernier feed reçu → re-render au changement de langue
+
+    let lang = localStorage.getItem('monitoring_lang');
+    if (!I18N[lang]) lang = 'en';      // défaut : anglais
+    const t = (key) => (I18N[lang] || I18N.en)[key];
 
     const $ = (id) => document.getElementById(id);
 
     function fmtBytes(n) {
       if (n == null) return '—';
-      if (n < 1024) return n + ' o';
-      const u = ['Ko','Mo','Go','To']; let i = -1;
-      do { n /= 1024; i++; } while (n >= 1024 && i < u.length-1);
-      return n.toFixed(1) + ' ' + u[i];
+      const L = I18N[lang] || I18N.en;
+      if (n < 1024) return n + ' ' + L.bytes_unit;
+      let i = -1;
+      do { n /= 1024; i++; } while (n >= 1024 && i < L.units.length - 1);
+      return n.toLocaleString(L.locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })
+             + ' ' + L.units[i];
     }
     function fmtTime(iso) {
       if (!iso) return '—';
-      const d = new Date(iso);
-      return d.toLocaleTimeString('fr-FR') + ' ' + d.toLocaleDateString('fr-FR');
+      const d = new Date(iso), loc = (I18N[lang] || I18N.en).locale;
+      return d.toLocaleTimeString(loc) + ' ' + d.toLocaleDateString(loc);
     }
     function fmtDuration(ms) {
       if (ms == null) return '—';
+      const loc = (I18N[lang] || I18N.en).locale;
+      const num = (v, d) => v.toLocaleString(loc, { minimumFractionDigits: d, maximumFractionDigits: d });
       if (ms < 1000) return ms + ' ms';
-      if (ms < 60000) return (ms / 1000).toFixed(2) + ' s';
+      if (ms < 60000) return num(ms / 1000, 2) + ' s';
       return Math.floor(ms / 60000) + ' min ' + Math.round((ms % 60000) / 1000) + ' s';
     }
     function esc(s) {
       return (s == null ? '' : String(s)).replace(/[&<>"]/g,
         c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
     }
+    function stateLabel(state) {
+      return t('s_' + state) || state;
+    }
+    function statusText() {
+      if (paused) return t('st_paused');
+      return t('st_live').replace('{s}', REFRESH_S);
+    }
+
+    // Libellés statiques (chrome) : appliqués au chargement + à chaque changement de langue.
+    function applyStaticText() {
+      document.documentElement.lang = lang;
+      document.title = 'AlfaWay — ' + t('title');
+      $('t-title').textContent = t('title');
+      $('th-state').textContent = t('th_state');
+      $('th-file').textContent = t('th_file');
+      $('th-user').textContent = t('th_user');
+      $('th-proto').textContent = t('th_proto');
+      $('th-ip').textContent = t('th_ip');
+      $('th-size').textContent = t('th_size');
+      $('th-transfer').textContent = t('th_transfer');
+      $('th-received').textContent = t('th_received');
+      $('th-stored').textContent = t('th_stored');
+      $('toggle').textContent = paused ? t('btn_resume') : t('btn_pause');
+      $('lang').value = lang;
+      if (!lastData) {
+        $('rows').innerHTML = `<tr><td colspan="10" class="empty">${t('loading')}</td></tr>`;
+      }
+      $('status').textContent = lastUpdate ? statusText() : t('st_starting');
+    }
 
     function renderStats(counts, total) {
       $('stats').innerHTML =
-        `<span class="stat">Total <b>${total}</b></span>` +
-        `<span class="stat"><span class="badge receiving">réception</span> <b>${counts.receiving||0}</b></span>` +
-        `<span class="stat"><span class="badge stored">stockés</span> <b>${counts.stored||0}</b></span>` +
-        `<span class="stat"><span class="badge failed">échecs</span> <b>${counts.failed||0}</b></span>`;
+        `<span class="stat">${t('total')} <b>${total}</b></span>` +
+        `<span class="stat"><span class="badge receiving">${t('receiving')}</span> <b>${counts.receiving||0}</b></span>` +
+        `<span class="stat"><span class="badge stored">${t('stored')}</span> <b>${counts.stored||0}</b></span>` +
+        `<span class="stat"><span class="badge failed">${t('failed')}</span> <b>${counts.failed||0}</b></span>`;
     }
 
     function renderRows(rows) {
       if (!rows.length) {
-        $('rows').innerHTML = '<tr><td colspan="10" class="empty">Aucun fichier reçu.</td></tr>';
+        $('rows').innerHTML = `<tr><td colspan="10" class="empty">${t('empty')}</td></tr>`;
         return;
       }
       $('rows').innerHTML = rows.map(r => {
@@ -117,9 +223,9 @@
         const cls = [isNew ? 'new' : '', r.state === 'failed' ? 'row-failed' : '']
           .filter(Boolean).join(' ');
         const dl = r.downloadable
-          ? `<a class="dl" href="/files/${r.id}/download/">⬇ Télécharger</a>` : '';
+          ? `<a class="dl" href="/files/${r.id}/download/">${t('download')}</a>` : '';
         return `<tr class="${cls}">
-          <td><span class="badge ${esc(r.state)}">${esc(r.state_label)}</span></td>
+          <td><span class="badge ${esc(r.state)}">${esc(stateLabel(r.state))}</span></td>
           <td class="file" title="${esc(r.path)}">${esc(r.filename)}</td>
           <td>${esc(r.username)}</td>
           <td>${esc(r.protocol)}</td>
@@ -135,23 +241,33 @@
       firstLoad = false;
     }
 
+    // Re-render complet depuis le dernier feed (sans refaire d'appel réseau).
+    function rerender() {
+      applyStaticText();
+      if (lastData) {
+        renderStats(lastData.counts, lastData.total);
+        renderRows(lastData.rows);
+      }
+    }
+
     async function poll() {
       try {
         const res = await fetch('/monitoring/feed/', { credentials: 'same-origin' });
         if (res.redirected || res.status === 403 || res.status === 302) {
-          throw new Error('session expirée — reconnecte-toi à l\'admin');
+          throw new Error(t('err_session'));
         }
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
+        lastData = data;
         renderStats(data.counts, data.total);
         renderRows(data.rows);
         lastUpdate = Date.now();
         $('err').style.display = 'none';
         $('dot').className = paused ? 'dot paused' : 'dot';
-        $('status').textContent = paused ? 'en pause' : 'live (10 s)';
+        $('status').textContent = statusText();
       } catch (e) {
         $('dot').className = 'dot error';
-        $('status').textContent = 'erreur';
+        $('status').textContent = t('st_error');
         $('err').textContent = '⚠ ' + e.message;
         $('err').style.display = 'block';
       }
@@ -160,7 +276,7 @@
     function tickAgo() {
       if (!lastUpdate) return;
       const s = Math.round((Date.now() - lastUpdate) / 1000);
-      $('updated').textContent = 'maj il y a ' + s + ' s';
+      $('updated').textContent = t('updated').replace('{s}', s);
     }
 
     function schedule() {
@@ -170,11 +286,18 @@
 
     $('toggle').addEventListener('click', () => {
       paused = !paused;
-      $('toggle').textContent = paused ? '▶ Reprendre' : '⏸ Pause';
+      $('toggle').textContent = paused ? t('btn_resume') : t('btn_pause');
       $('dot').className = paused ? 'dot paused' : 'dot';
-      $('status').textContent = paused ? 'en pause' : 'live (10 s)';
+      $('status').textContent = statusText();
       schedule();
       if (!paused) poll();
+    });
+
+    $('lang').addEventListener('change', (e) => {
+      lang = I18N[e.target.value] ? e.target.value : 'en';
+      localStorage.setItem('monitoring_lang', lang);
+      rerender();
+      tickAgo();
     });
 
     // Économie : on suspend le polling quand l'onglet n'est pas visible.
@@ -183,6 +306,7 @@
       else if (!paused) { poll(); schedule(); }
     });
 
+    applyStaticText();
     poll();
     schedule();
     setInterval(tickAgo, 1000);
