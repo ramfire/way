@@ -12,6 +12,9 @@
     header { padding:1rem 1.5rem; border-bottom:1px solid var(--line);
              display:flex; align-items:center; gap:1.5rem; flex-wrap:wrap; }
     h1 { font-size:1.15rem; margin:0; }
+    .tabs { display:flex; gap:.3rem; }
+    .tab { font-size:.82rem; }
+    .tab.active { background:#334155; border-color:var(--mut); color:#fff; font-weight:600; }
     .stats { display:flex; gap:.6rem; flex-wrap:wrap; }
     .stat { background:var(--card); border:1px solid var(--line); border-radius:8px;
             padding:.35rem .7rem; font-size:.85rem; }
@@ -51,6 +54,10 @@
 <body>
   <header>
     <h1>📡 <span id="t-title"></span></h1>
+    <div class="tabs">
+      <button id="tab-live" class="tab active"></button>
+      <button id="tab-history" class="tab"></button>
+    </div>
     <div class="stats" id="stats"></div>
     <div class="spacer"></div>
     <div class="meta">
@@ -83,15 +90,16 @@
       en: {
         locale: 'en-US',
         title: 'Received files monitoring',
+        tab_live: 'Live', tab_history: 'History',
         total: 'Total', receiving: 'receiving', stored: 'stored', failed: 'failed',
         th_state: 'Status', th_file: 'File', th_user: 'User', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Size', th_transfer: 'Transfer', th_received: 'Received',
-        th_stored: 'Stored',
+        th_stored: 'Stored', th_archived: 'Archived',
         st_starting: 'starting…', st_live: 'live ({s}s)', st_paused: 'paused',
         st_error: 'error',
         btn_pause: '⏸ Pause', btn_resume: '▶ Resume',
         updated: 'updated {s}s ago',
-        loading: 'Loading…', empty: 'No files received.',
+        loading: 'Loading…', empty: 'No files received.', empty_history: 'History is empty.',
         download: '⬇ Download',
         err_session: 'session expired — sign in to the admin again',
         // libellés d'état (clé stable r.state)
@@ -102,15 +110,16 @@
       fr: {
         locale: 'fr-FR',
         title: 'Monitoring fichiers reçus',
+        tab_live: 'Live', tab_history: 'Historique',
         total: 'Total', receiving: 'réception', stored: 'stockés', failed: 'échecs',
         th_state: 'État', th_file: 'Fichier', th_user: 'Utilisateur', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Taille', th_transfer: 'Transfert', th_received: 'Reçu',
-        th_stored: 'Stocké',
+        th_stored: 'Stocké', th_archived: 'Archivé',
         st_starting: 'démarrage…', st_live: 'live ({s}s)', st_paused: 'en pause',
         st_error: 'erreur',
         btn_pause: '⏸ Pause', btn_resume: '▶ Reprendre',
         updated: 'màj il y a {s}s',
-        loading: 'Chargement…', empty: 'Aucun fichier reçu.',
+        loading: 'Chargement…', empty: 'Aucun fichier reçu.', empty_history: 'Historique vide.',
         download: '⬇ Télécharger',
         err_session: 'session expirée — reconnecte-toi à l’admin',
         s_receiving: 'réception', s_stored: 'stocké', s_failed: 'échec',
@@ -120,15 +129,16 @@
       it: {
         locale: 'it-IT',
         title: 'Monitoraggio file ricevuti',
+        tab_live: 'Live', tab_history: 'Cronologia',
         total: 'Totale', receiving: 'in ricezione', stored: 'archiviati', failed: 'falliti',
         th_state: 'Stato', th_file: 'File', th_user: 'Utente', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Dimensione', th_transfer: 'Trasferimento', th_received: 'Ricevuto',
-        th_stored: 'Archiviato',
+        th_stored: 'Archiviato', th_archived: 'Archiviato il',
         st_starting: 'avvio…', st_live: 'live ({s}s)', st_paused: 'in pausa',
         st_error: 'errore',
         btn_pause: '⏸ Pausa', btn_resume: '▶ Riprendi',
         updated: 'agg. {s}s fa',
-        loading: 'Caricamento…', empty: 'Nessun file ricevuto.',
+        loading: 'Caricamento…', empty: 'Nessun file ricevuto.', empty_history: 'Cronologia vuota.',
         download: '⬇ Scarica',
         err_session: 'sessione scaduta — accedi di nuovo all’admin',
         s_receiving: 'in ricezione', s_stored: 'archiviato', s_failed: 'fallito',
@@ -142,6 +152,7 @@
     const seen = new Set();            // ids déjà affichés → détecter les nouveaux
     let firstLoad = true, paused = false, lastUpdate = null, timer = null;
     let lastData = null;               // dernier feed reçu → re-render au changement de langue
+    let view = 'live';                 // 'live' | 'history'
 
     let lang = localStorage.getItem('monitoring_lang');
     if (!I18N[lang]) lang = 'en';      // défaut : anglais
@@ -183,7 +194,7 @@
       return t('st_live').replace('{s}', REFRESH_S);
     }
 
-    // Libellés statiques (chrome) : appliqués au chargement + à chaque changement de langue.
+    // Libellés statiques (chrome) : appliqués au chargement + à chaque changement de langue/vue.
     function applyStaticText() {
       document.documentElement.lang = lang;
       document.title = 'AlfaWay — ' + t('title');
@@ -196,26 +207,41 @@
       $('th-size').textContent = t('th_size');
       $('th-transfer').textContent = t('th_transfer');
       $('th-received').textContent = t('th_received');
-      $('th-stored').textContent = t('th_stored');
+      // En History, la dernière colonne « horodatage » devient « Archivé ».
+      $('th-stored').textContent = (view === 'history') ? t('th_archived') : t('th_stored');
       $('toggle').textContent = paused ? t('btn_resume') : t('btn_pause');
       $('lang').value = lang;
-      if (!lastData) {
-        $('rows').innerHTML = `<tr><td colspan="10" class="empty">${t('loading')}</td></tr>`;
-      }
       $('status').textContent = lastUpdate ? statusText() : t('st_starting');
     }
 
-    function renderStats(counts, total) {
-      $('stats').innerHTML =
-        `<span class="stat">${t('total')} <b>${total}</b></span>` +
-        `<span class="stat"><span class="badge receiving">${t('receiving')}</span> <b>${counts.receiving||0}</b></span>` +
-        `<span class="stat"><span class="badge stored">${t('stored')}</span> <b>${counts.stored||0}</b></span>` +
-        `<span class="stat"><span class="badge failed">${t('failed')}</span> <b>${counts.failed||0}</b></span>`;
+    function renderTabs(data) {
+      const hc = data ? (data.history_total || 0) : 0;
+      $('tab-live').textContent = t('tab_live');
+      $('tab-history').textContent = t('tab_history') + (hc ? ` (${hc})` : '');
+      $('tab-live').classList.toggle('active', view === 'live');
+      $('tab-history').classList.toggle('active', view === 'history');
+    }
+
+    function renderStats(data) {
+      const ps = data.per_state || {};
+      if (view === 'history') {
+        $('stats').innerHTML =
+          `<span class="stat">${t('total')} <b>${data.history_total||0}</b></span>` +
+          `<span class="stat"><span class="badge deleted">${t('s_deleted')}</span> <b>${ps.deleted||0}</b></span>` +
+          `<span class="stat"><span class="badge missing">${t('s_missing')}</span> <b>${ps.missing||0}</b></span>`;
+      } else {
+        $('stats').innerHTML =
+          `<span class="stat">${t('total')} <b>${data.live_total||0}</b></span>` +
+          `<span class="stat"><span class="badge receiving">${t('receiving')}</span> <b>${ps.receiving||0}</b></span>` +
+          `<span class="stat"><span class="badge stored">${t('stored')}</span> <b>${ps.stored||0}</b></span>` +
+          `<span class="stat"><span class="badge failed">${t('failed')}</span> <b>${ps.failed||0}</b></span>`;
+      }
     }
 
     function renderRows(rows) {
       if (!rows.length) {
-        $('rows').innerHTML = `<tr><td colspan="10" class="empty">${t('empty')}</td></tr>`;
+        const msg = (view === 'history') ? t('empty_history') : t('empty');
+        $('rows').innerHTML = `<tr><td colspan="10" class="empty">${msg}</td></tr>`;
         return;
       }
       $('rows').innerHTML = rows.map(r => {
@@ -224,6 +250,8 @@
           .filter(Boolean).join(' ');
         const dl = r.downloadable
           ? `<a class="dl" href="/files/${r.id}/download/">${t('download')}</a>` : '';
+        // Dernière colonne : date de stockage (Live) ou d'archivage (History).
+        const lastTime = (view === 'history') ? (r.deleted_at || r.stored_at) : r.stored_at;
         return `<tr class="${cls}">
           <td><span class="badge ${esc(r.state)}">${esc(stateLabel(r.state))}</span></td>
           <td class="file" title="${esc(r.path)}">${esc(r.filename)}</td>
@@ -233,7 +261,7 @@
           <td>${fmtBytes(r.file_size)}</td>
           <td>${fmtDuration(r.elapsed_ms)}</td>
           <td>${fmtTime(r.received_at)}</td>
-          <td>${fmtTime(r.stored_at)}</td>
+          <td>${fmtTime(lastTime)}</td>
           <td>${dl}</td>
         </tr>`;
       }).join('');
@@ -244,22 +272,26 @@
     // Re-render complet depuis le dernier feed (sans refaire d'appel réseau).
     function rerender() {
       applyStaticText();
+      renderTabs(lastData);
       if (lastData) {
-        renderStats(lastData.counts, lastData.total);
+        renderStats(lastData);
         renderRows(lastData.rows);
       }
     }
 
     async function poll() {
       try {
-        const res = await fetch('/monitoring/feed/', { credentials: 'same-origin' });
+        const res = await fetch('/monitoring/feed/?view=' + view, { credentials: 'same-origin' });
         if (res.redirected || res.status === 403 || res.status === 302) {
           throw new Error(t('err_session'));
         }
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
+        // Ignore une réponse tardive qui ne correspond plus à la vue courante.
+        if (data.view && data.view !== view) return;
         lastData = data;
-        renderStats(data.counts, data.total);
+        renderStats(data);
+        renderTabs(data);
         renderRows(data.rows);
         lastUpdate = Date.now();
         $('err').style.display = 'none';
@@ -273,6 +305,16 @@
       }
     }
 
+    function switchView(v) {
+      if (v === view) return;
+      view = v;
+      seen.clear(); firstLoad = true;       // pas de « flash nouveau » au changement de vue
+      applyStaticText();
+      renderTabs(lastData);
+      $('rows').innerHTML = `<tr><td colspan="10" class="empty">${t('loading')}</td></tr>`;
+      poll();
+    }
+
     function tickAgo() {
       if (!lastUpdate) return;
       const s = Math.round((Date.now() - lastUpdate) / 1000);
@@ -283,6 +325,9 @@
       clearInterval(timer);
       if (!paused) timer = setInterval(poll, REFRESH_MS);
     }
+
+    $('tab-live').addEventListener('click', () => switchView('live'));
+    $('tab-history').addEventListener('click', () => switchView('history'));
 
     $('toggle').addEventListener('click', () => {
       paused = !paused;
@@ -307,6 +352,8 @@
     });
 
     applyStaticText();
+    renderTabs(null);
+    $('rows').innerHTML = `<tr><td colspan="10" class="empty">${t('loading')}</td></tr>`;
     poll();
     schedule();
     setInterval(tickAgo, 1000);

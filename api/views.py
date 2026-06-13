@@ -3,7 +3,7 @@ import posixpath
 
 from django.conf import settings
 from django.contrib.admin.views.decorators import staff_member_required
-from django.db.models import Case, IntegerField, Value, When
+from django.db.models import Case, Count, IntegerField, Value, When
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
@@ -244,6 +244,19 @@ def download_received_file(request, pk):
 
 MONITORING_FEED_LIMIT = 50  # nb de lignes renvoyées par le feed
 
+# Vue « Live » : flux opérationnel courant (à surveiller / à traiter). Les `failed`
+# y restent visibles tant qu'ils ne sont pas traités (futures actions de remédiation).
+LIVE_STATES = (
+    ReceivedFile.State.RECEIVING,
+    ReceivedFile.State.STORED,
+    ReceivedFile.State.FAILED,
+)
+# Vue « History » : états terminaux/archivés (et, à terme, les échecs résolus).
+HISTORY_STATES = (
+    ReceivedFile.State.DELETED,
+    ReceivedFile.State.MISSING,
+)
+
 
 @staff_member_required
 def monitoring_page(request):
@@ -255,19 +268,26 @@ def monitoring_page(request):
 def monitoring_feed(request):
     """JSON consommé par la page monitoring : N derniers fichiers + compteurs.
 
-    Lecture seule, gardée par la session staff (cookie envoyé par le fetch
-    same-origin). Pas de CSRF nécessaire (GET, non mutant).
+    Deux vues via ``?view=`` : ``live`` (défaut — flux courant receiving/stored/
+    failed, échecs en tête) et ``history`` (archives deleted/missing). Lecture
+    seule, gardée par la session staff (cookie du fetch same-origin) ; pas de CSRF
+    (GET non mutant).
     """
-    # Erreurs (failed) remontées en tête, puis les plus récents.
-    err_first = Case(
-        When(state=ReceivedFile.State.FAILED, then=Value(0)),
-        default=Value(1),
-        output_field=IntegerField(),
-    )
-    qs = list(
-        ReceivedFile.objects.annotate(_err_first=err_first)
-        .order_by('_err_first', '-received_at')[:MONITORING_FEED_LIMIT]
-    )
+    view = 'history' if request.GET.get('view') == 'history' else 'live'
+    states = HISTORY_STATES if view == 'history' else LIVE_STATES
+    base = ReceivedFile.objects.filter(state__in=states)
+
+    if view == 'live':
+        # Erreurs (failed) remontées en tête, puis les plus récents.
+        err_first = Case(
+            When(state=ReceivedFile.State.FAILED, then=Value(0)),
+            default=Value(1),
+            output_field=IntegerField(),
+        )
+        qs = list(base.annotate(_err_first=err_first)
+                  .order_by('_err_first', '-received_at')[:MONITORING_FEED_LIMIT])
+    else:
+        qs = list(base.order_by('-received_at')[:MONITORING_FEED_LIMIT])
 
     def to_row(rf):
         name = posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)'
@@ -276,7 +296,6 @@ def monitoring_feed(request):
         return {
             'id': rf.pk,
             'state': rf.state,
-            'state_label': rf.get_state_display(),
             'filename': name,
             'path': rf.s3_key,
             'username': rf.username,
@@ -286,16 +305,22 @@ def monitoring_feed(request):
             'elapsed_ms': elapsed,
             'received_at': rf.received_at.isoformat() if rf.received_at else None,
             'stored_at': rf.stored_at.isoformat() if rf.stored_at else None,
+            'deleted_at': rf.deleted_at.isoformat() if rf.deleted_at else None,
             'downloadable': rf.state == ReceivedFile.State.STORED,
         }
 
-    counts = {s.value: 0 for s in ReceivedFile.State}
-    for rf in qs:
-        counts[rf.state] = counts.get(rf.state, 0) + 1
+    # Compteurs globaux par état (indexés) : pilotent les chips + le badge History.
+    per_state = {s.value: 0 for s in ReceivedFile.State}
+    for row in ReceivedFile.objects.values('state').annotate(n=Count('id')):
+        per_state[row['state']] = row['n']
+    live_total = sum(per_state[s.value] for s in LIVE_STATES)
+    history_total = sum(per_state[s.value] for s in HISTORY_STATES)
 
     return JsonResponse({
+        'view': view,
         'rows': [to_row(rf) for rf in qs],
-        'counts': counts,
-        'total': ReceivedFile.objects.count(),
+        'per_state': per_state,
+        'live_total': live_total,
+        'history_total': history_total,
         'server_time': timezone.now().isoformat(),
     })
