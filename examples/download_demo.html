@@ -1,0 +1,70 @@
+<!doctype html>
+<!--
+  Démo : liste des fichiers reçus + bouton "Télécharger" qui appelle
+  l'endpoint /api/internal/files/<id>/download-url/ et redirige vers
+  l'URL pré-signée Scaleway (15 min).
+
+  ⚠️ SÉCURITÉ : le INTERNAL_TOKEN ne doit JAMAIS être codé en dur dans une
+  page servie au public. Ici il est saisi à la main pour tester en interne.
+  En vrai : proxy server-side qui injecte le token, OU auth de session.
+
+  Test rapide : ouvrir ce fichier servi depuis le même host que l'API,
+  p.ex. via `python -m http.server` puis renseigner l'URL de base + le token.
+-->
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <title>AlfaWay — Téléchargement fichiers</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; }
+    label { display: block; margin: .5rem 0 .2rem; font-weight: 600; }
+    input { width: 100%; padding: .4rem; box-sizing: border-box; }
+    button { padding: .4rem .8rem; cursor: pointer; margin-top: .6rem; }
+    .row { display: flex; gap: .5rem; align-items: center; margin: .4rem 0; }
+    .msg { color: #b00; margin-top: .5rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Télécharger un fichier reçu</h1>
+
+  <label>URL de base de l'API</label>
+  <input id="base" value="https://alfaway.algotech.lu">
+
+  <label>INTERNAL_TOKEN</label>
+  <input id="token" type="password" placeholder="token interne">
+
+  <label>ID du fichier (ReceivedFile.pk)</label>
+  <div class="row">
+    <input id="fid" type="number" value="2" style="width:auto">
+    <button id="btn">Télécharger</button>
+  </div>
+
+  <div class="msg" id="msg"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    async function getDownloadUrl(base, id, token) {
+      const res = await fetch(`${base}/api/internal/files/${id}/download-url/`, {
+        headers: { 'X-Internal-Token': token },
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(`HTTP ${res.status} — ${body.detail || 'erreur'}`);
+      }
+      return res.json(); // { url, filename, expires_at, ... }
+    }
+
+    $('btn').addEventListener('click', async () => {
+      $('msg').textContent = '';
+      try {
+        const data = await getDownloadUrl($('base').value, $('fid').value, $('token').value);
+        // Redirige le navigateur vers l'URL pré-signée → téléchargement direct depuis Scaleway.
+        window.location.href = data.url;
+      } catch (e) {
+        $('msg').textContent = e.message;
+      }
+    });
+  </script>
+</body>
+</html>

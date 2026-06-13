@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AlfaWay — Monitoring fichiers</title>
+  <style>
+    :root { --bg:#0f172a; --card:#1e293b; --txt:#e2e8f0; --mut:#94a3b8; --line:#334155; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--txt);
+           font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
+    header { padding:1rem 1.5rem; border-bottom:1px solid var(--line);
+             display:flex; align-items:center; gap:1.5rem; flex-wrap:wrap; }
+    h1 { font-size:1.15rem; margin:0; }
+    .stats { display:flex; gap:.6rem; flex-wrap:wrap; }
+    .stat { background:var(--card); border:1px solid var(--line); border-radius:8px;
+            padding:.35rem .7rem; font-size:.85rem; }
+    .stat b { font-size:1.05rem; }
+    .spacer { flex:1; }
+    .meta { color:var(--mut); font-size:.8rem; display:flex; align-items:center; gap:.8rem; }
+    .dot { width:9px; height:9px; border-radius:50%; background:#22c55e; display:inline-block;
+           animation:pulse 2s infinite; }
+    .dot.paused { background:#eab308; animation:none; }
+    .dot.error { background:#ef4444; animation:none; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+    button { background:var(--card); color:var(--txt); border:1px solid var(--line);
+             border-radius:6px; padding:.35rem .7rem; cursor:pointer; font-size:.8rem; }
+    button:hover { border-color:var(--mut); }
+    table { width:100%; border-collapse:collapse; font-size:.86rem; }
+    th, td { text-align:left; padding:.5rem .75rem; border-bottom:1px solid var(--line);
+             white-space:nowrap; }
+    th { color:var(--mut); font-weight:600; position:sticky; top:0; background:var(--bg); }
+    td.file { font-family: ui-monospace, monospace; }
+    .badge { padding:.15rem .55rem; border-radius:999px; font-size:.75rem; font-weight:600; }
+    .receiving { background:#1e3a8a; color:#bfdbfe; }
+    .stored    { background:#14532d; color:#bbf7d0; }
+    .failed    { background:#7f1d1d; color:#fecaca; }
+    a.dl { color:#7dd3fc; text-decoration:none; }
+    a.dl:hover { text-decoration:underline; }
+    tr.new td { animation:flash 2.5s ease-out; }
+    @keyframes flash { from{background:#3730a3} to{background:transparent} }
+    tr.row-failed td { background:rgba(239,68,68,.14); }
+    tr.row-failed td:first-child { box-shadow:inset 3px 0 0 #ef4444; }
+    .err { background:#7f1d1d; color:#fecaca; padding:.5rem 1.5rem; font-size:.85rem;
+           display:none; }
+    .empty { color:var(--mut); padding:2rem; text-align:center; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📡 Monitoring fichiers reçus</h1>
+    <div class="stats" id="stats"></div>
+    <div class="spacer"></div>
+    <div class="meta">
+      <span><span class="dot" id="dot"></span> <span id="status">démarrage…</span></span>
+      <span id="updated"></span>
+      <button id="toggle">⏸ Pause</button>
+    </div>
+  </header>
+  <div class="err" id="err"></div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>État</th><th>Fichier</th><th>Utilisateur</th><th>Proto</th>
+        <th>IP</th><th>Taille</th><th>Transfert</th><th>Reçu</th><th>Stocké</th><th></th>
+      </tr>
+    </thead>
+    <tbody id="rows"><tr><td colspan="10" class="empty">Chargement…</td></tr></tbody>
+  </table>
+
+  <script>
+    const REFRESH_MS = 10000;          // 10 s (choix utilisateur)
+    const seen = new Set();            // ids déjà affichés → détecter les nouveaux
+    let firstLoad = true, paused = false, lastUpdate = null, timer = null;
+
+    const $ = (id) => document.getElementById(id);
+
+    function fmtBytes(n) {
+      if (n == null) return '—';
+      if (n < 1024) return n + ' o';
+      const u = ['Ko','Mo','Go','To']; let i = -1;
+      do { n /= 1024; i++; } while (n >= 1024 && i < u.length-1);
+      return n.toFixed(1) + ' ' + u[i];
+    }
+    function fmtTime(iso) {
+      if (!iso) return '—';
+      const d = new Date(iso);
+      return d.toLocaleTimeString('fr-FR') + ' ' + d.toLocaleDateString('fr-FR');
+    }
+    function fmtDuration(ms) {
+      if (ms == null) return '—';
+      if (ms < 1000) return ms + ' ms';
+      if (ms < 60000) return (ms / 1000).toFixed(2) + ' s';
+      return Math.floor(ms / 60000) + ' min ' + Math.round((ms % 60000) / 1000) + ' s';
+    }
+    function esc(s) {
+      return (s == null ? '' : String(s)).replace(/[&<>"]/g,
+        c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    }
+
+    function renderStats(counts, total) {
+      $('stats').innerHTML =
+        `<span class="stat">Total <b>${total}</b></span>` +
+        `<span class="stat"><span class="badge receiving">réception</span> <b>${counts.receiving||0}</b></span>` +
+        `<span class="stat"><span class="badge stored">stockés</span> <b>${counts.stored||0}</b></span>` +
+        `<span class="stat"><span class="badge failed">échecs</span> <b>${counts.failed||0}</b></span>`;
+    }
+
+    function renderRows(rows) {
+      if (!rows.length) {
+        $('rows').innerHTML = '<tr><td colspan="10" class="empty">Aucun fichier reçu.</td></tr>';
+        return;
+      }
+      $('rows').innerHTML = rows.map(r => {
+        const isNew = !firstLoad && !seen.has(r.id);
+        const cls = [isNew ? 'new' : '', r.state === 'failed' ? 'row-failed' : '']
+          .filter(Boolean).join(' ');
+        const dl = r.downloadable
+          ? `<a class="dl" href="/files/${r.id}/download/">⬇ Télécharger</a>` : '';
+        return `<tr class="${cls}">
+          <td><span class="badge ${esc(r.state)}">${esc(r.state_label)}</span></td>
+          <td class="file" title="${esc(r.path)}">${esc(r.filename)}</td>
+          <td>${esc(r.username)}</td>
+          <td>${esc(r.protocol)}</td>
+          <td>${esc(r.ip)}</td>
+          <td>${fmtBytes(r.file_size)}</td>
+          <td>${fmtDuration(r.elapsed_ms)}</td>
+          <td>${fmtTime(r.received_at)}</td>
+          <td>${fmtTime(r.stored_at)}</td>
+          <td>${dl}</td>
+        </tr>`;
+      }).join('');
+      rows.forEach(r => seen.add(r.id));
+      firstLoad = false;
+    }
+
+    async function poll() {
+      try {
+        const res = await fetch('/monitoring/feed/', { credentials: 'same-origin' });
+        if (res.redirected || res.status === 403 || res.status === 302) {
+          throw new Error('session expirée — reconnecte-toi à l\'admin');
+        }
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        renderStats(data.counts, data.total);
+        renderRows(data.rows);
+        lastUpdate = Date.now();
+        $('err').style.display = 'none';
+        $('dot').className = paused ? 'dot paused' : 'dot';
+        $('status').textContent = paused ? 'en pause' : 'live (10 s)';
+      } catch (e) {
+        $('dot').className = 'dot error';
+        $('status').textContent = 'erreur';
+        $('err').textContent = '⚠ ' + e.message;
+        $('err').style.display = 'block';
+      }
+    }
+
+    function tickAgo() {
+      if (!lastUpdate) return;
+      const s = Math.round((Date.now() - lastUpdate) / 1000);
+      $('updated').textContent = 'maj il y a ' + s + ' s';
+    }
+
+    function schedule() {
+      clearInterval(timer);
+      if (!paused) timer = setInterval(poll, REFRESH_MS);
+    }
+
+    $('toggle').addEventListener('click', () => {
+      paused = !paused;
+      $('toggle').textContent = paused ? '▶ Reprendre' : '⏸ Pause';
+      $('dot').className = paused ? 'dot paused' : 'dot';
+      $('status').textContent = paused ? 'en pause' : 'live (10 s)';
+      schedule();
+      if (!paused) poll();
+    });
+
+    // Économie : on suspend le polling quand l'onglet n'est pas visible.
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) { clearInterval(timer); }
+      else if (!paused) { poll(); schedule(); }
+    });
+
+    poll();
+    schedule();
+    setInterval(tickAgo, 1000);
+  </script>
+</body>
+</html>

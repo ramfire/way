@@ -1,0 +1,36 @@
+# --- Secrets : NE JAMAIS committer ---
+.env
+.env.*
+*.env
+secrets*
+*.pem
+*.key
+
+# --- Base de données locale ---
+db.sqlite3
+*.sqlite3
+
+# --- Virtualenv ---
+venv/
+.venv/
+
+# --- Fichiers générés / runtime ---
+logs/
+*.log
+media/
+.gunicorn/
+
+# collectstatic (assets admin + DRF), regénéré par `manage.py collectstatic`
+static/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- Éditeurs / OS ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
