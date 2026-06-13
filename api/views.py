@@ -7,6 +7,8 @@ from django.db.models import Case, Count, IntegerField, Value, When
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
+from django.views.decorators.csrf import ensure_csrf_cookie
+from django.views.decorators.http import require_POST
 from rest_framework.views import APIView
 from rest_framework.response import Response
 
@@ -251,17 +253,61 @@ LIVE_STATES = (
     ReceivedFile.State.STORED,
     ReceivedFile.State.FAILED,
 )
-# Vue « History » : états terminaux/archivés (et, à terme, les échecs résolus).
+# Vue « History » : états terminaux/archivés (deleted/missing automatiques +
+# `archived` posé manuellement sur un échec traité).
 HISTORY_STATES = (
     ReceivedFile.State.DELETED,
     ReceivedFile.State.MISSING,
+    ReceivedFile.State.ARCHIVED,
 )
 
 
+@ensure_csrf_cookie  # pose le cookie csrftoken : le JS le renvoie en header sur les actions POST
 @staff_member_required
 def monitoring_page(request):
     """Page de supervision live des fichiers reçus (polling JS, voir template)."""
     return render(request, 'monitoring.html', {'feed_limit': MONITORING_FEED_LIMIT})
+
+
+@require_POST
+@staff_member_required
+def archive_received_file(request, pk):
+    """Action UI : sortir un échec traité du board Live → état ``archived``.
+
+    Restreint aux lignes ``failed`` (cf. portée décidée). Idempotent côté effet :
+    si la ligne n'est plus ``failed`` (déjà archivée / changée), on renvoie 409.
+    """
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    if rf.state != ReceivedFile.State.FAILED:
+        return JsonResponse(
+            {'detail': f'non archivable (état: {rf.state})'}, status=409)
+    rf.state = ReceivedFile.State.ARCHIVED
+    rf.archived_at = timezone.now()
+    rf.action = 'archive'
+    rf.save(update_fields=['state', 'archived_at', 'action'])
+    logger.info('Archive ReceivedFile %s (%s) par %s', pk, rf.s3_key, request.user)
+    return JsonResponse({'ok': True, 'id': pk, 'state': rf.state})
+
+
+@require_POST
+@staff_member_required
+def restore_received_file(request, pk):
+    """Action UI : renvoyer un fichier archivé dans Live → état ``failed``.
+
+    Réversibilité de l'archivage : la portée n'autorisant que les ``failed`` à
+    être archivés, on les restaure vers ``failed``. Refuse (409) ce qui n'est
+    pas ``archived`` (un ``deleted``/``missing`` reflète l'état réel S3/SFTP).
+    """
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    if rf.state != ReceivedFile.State.ARCHIVED:
+        return JsonResponse(
+            {'detail': f'non restaurable (état: {rf.state})'}, status=409)
+    rf.state = ReceivedFile.State.FAILED
+    rf.archived_at = None
+    rf.action = 'restore'
+    rf.save(update_fields=['state', 'archived_at', 'action'])
+    logger.info('Restore ReceivedFile %s (%s) par %s', pk, rf.s3_key, request.user)
+    return JsonResponse({'ok': True, 'id': pk, 'state': rf.state})
 
 
 @staff_member_required
@@ -306,7 +352,11 @@ def monitoring_feed(request):
             'received_at': rf.received_at.isoformat() if rf.received_at else None,
             'stored_at': rf.stored_at.isoformat() if rf.stored_at else None,
             'deleted_at': rf.deleted_at.isoformat() if rf.deleted_at else None,
+            'archived_at': rf.archived_at.isoformat() if rf.archived_at else None,
             'downloadable': rf.state == ReceivedFile.State.STORED,
+            # Actions disponibles côté UI (gardées aussi côté serveur).
+            'can_archive': rf.state == ReceivedFile.State.FAILED,
+            'can_restore': rf.state == ReceivedFile.State.ARCHIVED,
         }
 
     # Compteurs globaux par état (indexés) : pilotent les chips + le badge History.

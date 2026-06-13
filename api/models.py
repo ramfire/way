@@ -16,6 +16,7 @@ class ReceivedFile(models.Model):
         FAILED = 'failed', 'Échec'
         DELETED = 'deleted', 'Supprimé via SFTP'
         MISSING = 'missing', 'Absent de S3 (drift réconciliation)'
+        ARCHIVED = 'archived', 'Archivé (sorti du board Live)'
 
     state = models.CharField(
         max_length=16, choices=State.choices, default=State.RECEIVING, db_index=True,
@@ -43,6 +44,7 @@ class ReceivedFile(models.Model):
     received_at = models.DateTimeField(auto_now_add=True, db_index=True)  # pre-upload
     stored_at = models.DateTimeField(null=True, blank=True)  # confirmation S3 (post)
     deleted_at = models.DateTimeField(null=True, blank=True)  # delete SFTP / drift S3
+    archived_at = models.DateTimeField(null=True, blank=True)  # archivage manuel (failed traité)
     # True quand la ligne provient d'un backfill `reconcile_files` (et non d'un hook).
     reconciled = models.BooleanField(default=False, db_index=True)
 

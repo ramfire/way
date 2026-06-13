@@ -21,9 +21,11 @@ from django.urls import path
 from api.views import (
     PresignedDownloadView,
     SFTPWebhookView,
+    archive_received_file,
     download_received_file,
     monitoring_feed,
     monitoring_page,
+    restore_received_file,
 )
 
 urlpatterns = [
@@ -31,6 +33,8 @@ urlpatterns = [
     path('api/internal/sftp-webhook/', SFTPWebhookView.as_view()),
     path('api/internal/files/<int:pk>/download-url/', PresignedDownloadView.as_view()),
     path('files/<int:pk>/download/', download_received_file, name='download-file'),
+    path('files/<int:pk>/archive/', archive_received_file, name='archive-file'),
+    path('files/<int:pk>/restore/', restore_received_file, name='restore-file'),
     path('monitoring/', monitoring_page, name='monitoring'),
     path('monitoring/feed/', monitoring_feed, name='monitoring-feed'),
     path('healthz/', lambda r: JsonResponse({'status': 'ok'})),

@@ -40,6 +40,8 @@
     .failed    { background:#7f1d1d; color:#fecaca; }
     .deleted   { background:#374151; color:#d1d5db; }
     .missing   { background:#78350f; color:#fed7aa; }
+    .archived  { background:#312e81; color:#c7d2fe; }
+    button.act { padding:.2rem .55rem; font-size:.76rem; }
     a.dl { color:#7dd3fc; text-decoration:none; }
     a.dl:hover { text-decoration:underline; }
     tr.new td { animation:flash 2.5s ease-out; }
@@ -100,11 +102,11 @@
         btn_pause: '⏸ Pause', btn_resume: '▶ Resume',
         updated: 'updated {s}s ago',
         loading: 'Loading…', empty: 'No files received.', empty_history: 'History is empty.',
-        download: '⬇ Download',
+        download: '⬇ Download', archive: '🗄 Archive', restore: '↩ Restore',
         err_session: 'session expired — sign in to the admin again',
         // libellés d'état (clé stable r.state)
         s_receiving: 'receiving', s_stored: 'stored', s_failed: 'failed',
-        s_deleted: 'deleted', s_missing: 'missing',
+        s_deleted: 'deleted', s_missing: 'missing', s_archived: 'archived',
         bytes_unit: 'B', units: ['KB','MB','GB','TB'],
       },
       fr: {
@@ -120,10 +122,10 @@
         btn_pause: '⏸ Pause', btn_resume: '▶ Reprendre',
         updated: 'màj il y a {s}s',
         loading: 'Chargement…', empty: 'Aucun fichier reçu.', empty_history: 'Historique vide.',
-        download: '⬇ Télécharger',
+        download: '⬇ Télécharger', archive: '🗄 Archiver', restore: '↩ Restaurer',
         err_session: 'session expirée — reconnecte-toi à l’admin',
         s_receiving: 'réception', s_stored: 'stocké', s_failed: 'échec',
-        s_deleted: 'supprimé', s_missing: 'absent',
+        s_deleted: 'supprimé', s_missing: 'absent', s_archived: 'archivé',
         bytes_unit: 'o', units: ['Ko','Mo','Go','To'],
       },
       it: {
@@ -139,10 +141,10 @@
         btn_pause: '⏸ Pausa', btn_resume: '▶ Riprendi',
         updated: 'agg. {s}s fa',
         loading: 'Caricamento…', empty: 'Nessun file ricevuto.', empty_history: 'Cronologia vuota.',
-        download: '⬇ Scarica',
+        download: '⬇ Scarica', archive: '🗄 Archivia', restore: '↩ Ripristina',
         err_session: 'sessione scaduta — accedi di nuovo all’admin',
         s_receiving: 'in ricezione', s_stored: 'archiviato', s_failed: 'fallito',
-        s_deleted: 'eliminato', s_missing: 'assente',
+        s_deleted: 'eliminato', s_missing: 'assente', s_archived: 'in archivio',
         bytes_unit: 'B', units: ['KB','MB','GB','TB'],
       },
     };
@@ -227,6 +229,7 @@
       if (view === 'history') {
         $('stats').innerHTML =
           `<span class="stat">${t('total')} <b>${data.history_total||0}</b></span>` +
+          `<span class="stat"><span class="badge archived">${t('s_archived')}</span> <b>${ps.archived||0}</b></span>` +
           `<span class="stat"><span class="badge deleted">${t('s_deleted')}</span> <b>${ps.deleted||0}</b></span>` +
           `<span class="stat"><span class="badge missing">${t('s_missing')}</span> <b>${ps.missing||0}</b></span>`;
       } else {
@@ -248,10 +251,17 @@
         const isNew = !firstLoad && !seen.has(r.id);
         const cls = [isNew ? 'new' : '', r.state === 'failed' ? 'row-failed' : '']
           .filter(Boolean).join(' ');
-        const dl = r.downloadable
-          ? `<a class="dl" href="/files/${r.id}/download/">${t('download')}</a>` : '';
-        // Dernière colonne : date de stockage (Live) ou d'archivage (History).
-        const lastTime = (view === 'history') ? (r.deleted_at || r.stored_at) : r.stored_at;
+        const acts = [];
+        if (r.downloadable)
+          acts.push(`<a class="dl" href="/files/${r.id}/download/">${t('download')}</a>`);
+        if (view === 'live' && r.can_archive)
+          acts.push(`<button class="act" data-act="archive" data-id="${r.id}">${t('archive')}</button>`);
+        if (view === 'history' && r.can_restore)
+          acts.push(`<button class="act" data-act="restore" data-id="${r.id}">${t('restore')}</button>`);
+        const dl = acts.join(' ');
+        // Dernière colonne « horodatage » : stockage (Live) ou archivage/suppression (History).
+        const lastTime = (view === 'history')
+          ? (r.archived_at || r.deleted_at || r.stored_at) : r.stored_at;
         return `<tr class="${cls}">
           <td><span class="badge ${esc(r.state)}">${esc(stateLabel(r.state))}</span></td>
           <td class="file" title="${esc(r.path)}">${esc(r.filename)}</td>
@@ -343,6 +353,39 @@
       localStorage.setItem('monitoring_lang', lang);
       rerender();
       tickAgo();
+    });
+
+    // --- Actions par ligne (Archive en Live / Restore en History) -------------
+    function getCookie(name) {
+      const m = document.cookie.match('(^|;)\\s*' + name + '\\s*=\\s*([^;]+)');
+      return m ? m.pop() : '';
+    }
+    async function doAction(act, id) {
+      try {
+        const res = await fetch(`/files/${id}/${act}/`, {
+          method: 'POST',
+          headers: { 'X-CSRFToken': getCookie('csrftoken') },
+          credentials: 'same-origin',
+        });
+        if (res.redirected || res.status === 403 || res.status === 302) {
+          throw new Error(t('err_session'));
+        }
+        if (!res.ok) {
+          let msg = 'HTTP ' + res.status;
+          try { const j = await res.json(); if (j.detail) msg = j.detail; } catch (_) {}
+          throw new Error(msg);
+        }
+        $('err').style.display = 'none';
+        poll();   // la ligne disparaît de Live / apparaît en History
+      } catch (e) {
+        $('err').textContent = '⚠ ' + e.message;
+        $('err').style.display = 'block';
+      }
+    }
+    // Délégation : les lignes sont re-rendues via innerHTML, on écoute le tbody.
+    $('rows').addEventListener('click', (e) => {
+      const btn = e.target.closest('button.act');
+      if (btn) doAction(btn.dataset.act, btn.dataset.id);
     });
 
     // Économie : on suspend le polling quand l'onglet n'est pas visible.
