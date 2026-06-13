@@ -51,6 +51,12 @@
     .err { background:#7f1d1d; color:#fecaca; padding:.5rem 1.5rem; font-size:.85rem;
            display:none; }
     .empty { color:var(--mut); padding:2rem; text-align:center; }
+    th.sortable { cursor:pointer; user-select:none; }
+    th.sortable:hover { color:var(--txt); }
+    th .arr { color:#7dd3fc; }
+    .stat.clickable { cursor:pointer; user-select:none; }
+    .stat.clickable:hover { border-color:var(--mut); }
+    .stat.active { border-color:#7dd3fc; background:#0c4a6e; }
   </style>
 </head>
 <body>
@@ -64,6 +70,7 @@
     <div class="spacer"></div>
     <div class="meta">
       <span><span class="dot" id="dot"></span> <span id="status"></span></span>
+      <span id="count"></span>
       <span id="updated"></span>
       <button id="toggle"></button>
       <select id="lang" aria-label="Language">
@@ -78,9 +85,16 @@
   <table>
     <thead>
       <tr id="head">
-        <th id="th-state"></th><th id="th-file"></th><th id="th-user"></th>
-        <th id="th-proto"></th><th id="th-ip"></th><th id="th-size"></th>
-        <th id="th-transfer"></th><th id="th-received"></th><th id="th-stored"></th><th></th>
+        <th id="th-state" class="sortable" data-key="state"><span class="lbl"></span><span class="arr"></span></th>
+        <th id="th-file" class="sortable" data-key="filename"><span class="lbl"></span><span class="arr"></span></th>
+        <th id="th-user" class="sortable" data-key="username"><span class="lbl"></span><span class="arr"></span></th>
+        <th id="th-proto" class="sortable" data-key="protocol"><span class="lbl"></span><span class="arr"></span></th>
+        <th id="th-ip" class="sortable" data-key="ip"><span class="lbl"></span><span class="arr"></span></th>
+        <th id="th-size" class="sortable" data-key="file_size"><span class="lbl"></span><span class="arr"></span></th>
+        <th id="th-transfer" class="sortable" data-key="elapsed_ms"><span class="lbl"></span><span class="arr"></span></th>
+        <th id="th-received" class="sortable" data-key="received_at"><span class="lbl"></span><span class="arr"></span></th>
+        <th id="th-stored" class="sortable" data-key="stored_at"><span class="lbl"></span><span class="arr"></span></th>
+        <th></th>
       </tr>
     </thead>
     <tbody id="rows"></tbody>
@@ -100,8 +114,10 @@
         st_starting: 'starting…', st_live: 'live ({s}s)', st_paused: 'paused',
         st_error: 'error',
         btn_pause: '⏸ Pause', btn_resume: '▶ Resume',
+        showing: 'showing {n} / {m}',
         updated: 'updated {s}s ago',
         loading: 'Loading…', empty: 'No files received.', empty_history: 'History is empty.',
+        empty_filter: 'No files match this filter.',
         download: '⬇ Download', archive: '🗄 Archive', restore: '↩ Restore',
         err_session: 'session expired — sign in to the admin again',
         // libellés d'état (clé stable r.state)
@@ -120,8 +136,10 @@
         st_starting: 'démarrage…', st_live: 'live ({s}s)', st_paused: 'en pause',
         st_error: 'erreur',
         btn_pause: '⏸ Pause', btn_resume: '▶ Reprendre',
+        showing: '{n} / {m} affichés',
         updated: 'màj il y a {s}s',
         loading: 'Chargement…', empty: 'Aucun fichier reçu.', empty_history: 'Historique vide.',
+        empty_filter: 'Aucun fichier ne correspond à ce filtre.',
         download: '⬇ Télécharger', archive: '🗄 Archiver', restore: '↩ Restaurer',
         err_session: 'session expirée — reconnecte-toi à l’admin',
         s_receiving: 'réception', s_stored: 'stocké', s_failed: 'échec',
@@ -139,8 +157,10 @@
         st_starting: 'avvio…', st_live: 'live ({s}s)', st_paused: 'in pausa',
         st_error: 'errore',
         btn_pause: '⏸ Pausa', btn_resume: '▶ Riprendi',
+        showing: '{n} / {m} mostrati',
         updated: 'agg. {s}s fa',
         loading: 'Caricamento…', empty: 'Nessun file ricevuto.', empty_history: 'Cronologia vuota.',
+        empty_filter: 'Nessun file corrisponde a questo filtro.',
         download: '⬇ Scarica', archive: '🗄 Archivia', restore: '↩ Ripristina',
         err_session: 'sessione scaduta — accedi di nuovo all’admin',
         s_receiving: 'in ricezione', s_stored: 'archiviato', s_failed: 'fallito',
@@ -155,6 +175,23 @@
     let firstLoad = true, paused = false, lastUpdate = null, timer = null;
     let lastData = null;               // dernier feed reçu → re-render au changement de langue
     let view = 'live';                 // 'live' | 'history'
+    let sortKey = null;                // null = ordre serveur ; sinon clé de colonne
+    let sortDir = 1;                   // 1 = asc, -1 = desc
+    let stateFilter = null;            // null = tous ; sinon un état (r.state) à isoler
+
+    // Colonnes triables : id du <th>, clé de tri (champ de la ligne), clé i18n du libellé.
+    // 'th-stored' a un libellé spécial (Stored en Live / Archivé en History) → i18n null.
+    const COLS = [
+      { id:'th-state',    key:'state',      i18n:'th_state' },
+      { id:'th-file',     key:'filename',   i18n:'th_file' },
+      { id:'th-user',     key:'username',   i18n:'th_user' },
+      { id:'th-proto',    key:'protocol',   i18n:'th_proto' },
+      { id:'th-ip',       key:'ip',         i18n:'th_ip' },
+      { id:'th-size',     key:'file_size',  i18n:'th_size' },
+      { id:'th-transfer', key:'elapsed_ms', i18n:'th_transfer' },
+      { id:'th-received', key:'received_at', i18n:'th_received' },
+      { id:'th-stored',   key:'stored_at',  i18n:null },
+    ];
 
     let lang = localStorage.getItem('monitoring_lang');
     if (!I18N[lang]) lang = 'en';      // défaut : anglais
@@ -196,21 +233,36 @@
       return t('st_live').replace('{s}', REFRESH_S);
     }
 
+    // --- Tri / filtre (côté SERVEUR, sur toute la base) ------------------------
+    // Le tri (?sort=&dir=) et le filtre par état (?state=) sont envoyés au feed ;
+    // le serveur les applique sur l'ensemble de la table puis renvoie le top-N.
+    // L'UI n'ordonne donc plus localement : elle ré-interroge à chaque changement.
+    function updateSortIndicators() {
+      COLS.forEach(c => {
+        $(c.id).querySelector('.arr').textContent =
+          (sortKey === c.key) ? (sortDir === 1 ? ' ▲' : ' ▼') : '';
+      });
+    }
+    function onSort(key) {
+      if (sortKey === key) sortDir = -sortDir;   // re-clic → inverse le sens
+      else { sortKey = key; sortDir = 1; }
+      updateSortIndicators();
+      poll();                                    // ré-interroge avec le nouveau tri
+    }
+
     // Libellés statiques (chrome) : appliqués au chargement + à chaque changement de langue/vue.
     function applyStaticText() {
       document.documentElement.lang = lang;
       document.title = 'AlfaWay — ' + t('title');
       $('t-title').textContent = t('title');
-      $('th-state').textContent = t('th_state');
-      $('th-file').textContent = t('th_file');
-      $('th-user').textContent = t('th_user');
-      $('th-proto').textContent = t('th_proto');
-      $('th-ip').textContent = t('th_ip');
-      $('th-size').textContent = t('th_size');
-      $('th-transfer').textContent = t('th_transfer');
-      $('th-received').textContent = t('th_received');
-      // En History, la dernière colonne « horodatage » devient « Archivé ».
-      $('th-stored').textContent = (view === 'history') ? t('th_archived') : t('th_stored');
+      // Libellés des colonnes (dans le span .lbl, la flèche de tri vit dans .arr).
+      COLS.forEach(c => {
+        const label = (c.id === 'th-stored')
+          ? ((view === 'history') ? t('th_archived') : t('th_stored'))
+          : t(c.i18n);
+        $(c.id).querySelector('.lbl').textContent = label;
+      });
+      updateSortIndicators();
       $('toggle').textContent = paused ? t('btn_resume') : t('btn_pause');
       $('lang').value = lang;
       $('status').textContent = lastUpdate ? statusText() : t('st_starting');
@@ -224,26 +276,33 @@
       $('tab-history').classList.toggle('active', view === 'history');
     }
 
+    // Un chip de stat. state='' → « Total » (clic = réinitialise le filtre, sans badge).
+    function statChip(state, label, count) {
+      const active = (stateFilter === state && state) ? ' active' : '';
+      const inner = state ? `<span class="badge ${esc(state)}">${esc(label)}</span>` : esc(label);
+      return `<span class="stat clickable${active}" data-state="${esc(state)}">${inner} <b>${count}</b></span>`;
+    }
     function renderStats(data) {
       const ps = data.per_state || {};
       if (view === 'history') {
         $('stats').innerHTML =
-          `<span class="stat">${t('total')} <b>${data.history_total||0}</b></span>` +
-          `<span class="stat"><span class="badge archived">${t('s_archived')}</span> <b>${ps.archived||0}</b></span>` +
-          `<span class="stat"><span class="badge deleted">${t('s_deleted')}</span> <b>${ps.deleted||0}</b></span>` +
-          `<span class="stat"><span class="badge missing">${t('s_missing')}</span> <b>${ps.missing||0}</b></span>`;
+          statChip('', t('total'), data.history_total||0) +
+          statChip('archived', t('s_archived'), ps.archived||0) +
+          statChip('deleted', t('s_deleted'), ps.deleted||0) +
+          statChip('missing', t('s_missing'), ps.missing||0);
       } else {
         $('stats').innerHTML =
-          `<span class="stat">${t('total')} <b>${data.live_total||0}</b></span>` +
-          `<span class="stat"><span class="badge receiving">${t('receiving')}</span> <b>${ps.receiving||0}</b></span>` +
-          `<span class="stat"><span class="badge stored">${t('stored')}</span> <b>${ps.stored||0}</b></span>` +
-          `<span class="stat"><span class="badge failed">${t('failed')}</span> <b>${ps.failed||0}</b></span>`;
+          statChip('', t('total'), data.live_total||0) +
+          statChip('receiving', t('receiving'), ps.receiving||0) +
+          statChip('stored', t('stored'), ps.stored||0) +
+          statChip('failed', t('failed'), ps.failed||0);
       }
     }
 
     function renderRows(rows) {
       if (!rows.length) {
-        const msg = (view === 'history') ? t('empty_history') : t('empty');
+        const msg = stateFilter ? t('empty_filter')
+          : (view === 'history') ? t('empty_history') : t('empty');
         $('rows').innerHTML = `<tr><td colspan="10" class="empty">${msg}</td></tr>`;
         return;
       }
@@ -275,23 +334,49 @@
           <td>${dl}</td>
         </tr>`;
       }).join('');
-      rows.forEach(r => seen.add(r.id));
+    }
+
+    // « affichés / total » : visible seulement quand la page tronque le résultat
+    // (matched_total > lignes renvoyées), sinon masqué pour ne pas charger l'en-tête.
+    function renderCount(data) {
+      const m = data.matched_total, n = (data.returned != null) ? data.returned
+        : (data.rows ? data.rows.length : 0);
+      if (m != null && m > n) {
+        $('count').textContent = t('showing').replace('{n}', n).replace('{m}', m);
+      } else {
+        $('count').textContent = '';
+      }
+    }
+
+    // Rendu du feed courant : stats + tabs + lignes (déjà triées/filtrées côté serveur).
+    // Le suivi `seen` porte sur toutes les lignes reçues → pas de faux « flash nouveau ».
+    function renderFeed() {
+      if (!lastData) return;
+      renderStats(lastData);
+      renderTabs(lastData);
+      renderRows(lastData.rows);
+      renderCount(lastData);
+      lastData.rows.forEach(r => seen.add(r.id));
       firstLoad = false;
     }
 
     // Re-render complet depuis le dernier feed (sans refaire d'appel réseau).
     function rerender() {
       applyStaticText();
-      renderTabs(lastData);
-      if (lastData) {
-        renderStats(lastData);
-        renderRows(lastData.rows);
-      }
+      renderFeed();
+    }
+
+    // URL du feed = vue + filtre/tri courants (appliqués côté serveur sur toute la base).
+    function feedUrl() {
+      const p = new URLSearchParams({ view });
+      if (stateFilter) p.set('state', stateFilter);
+      if (sortKey) { p.set('sort', sortKey); p.set('dir', sortDir === 1 ? 'asc' : 'desc'); }
+      return '/monitoring/feed/?' + p.toString();
     }
 
     async function poll() {
       try {
-        const res = await fetch('/monitoring/feed/?view=' + view, { credentials: 'same-origin' });
+        const res = await fetch(feedUrl(), { credentials: 'same-origin' });
         if (res.redirected || res.status === 403 || res.status === 302) {
           throw new Error(t('err_session'));
         }
@@ -300,9 +385,7 @@
         // Ignore une réponse tardive qui ne correspond plus à la vue courante.
         if (data.view && data.view !== view) return;
         lastData = data;
-        renderStats(data);
-        renderTabs(data);
-        renderRows(data.rows);
+        renderFeed();
         lastUpdate = Date.now();
         $('err').style.display = 'none';
         $('dot').className = paused ? 'dot paused' : 'dot';
@@ -318,6 +401,7 @@
     function switchView(v) {
       if (v === view) return;
       view = v;
+      stateFilter = null;                   // les états diffèrent entre Live et History
       seen.clear(); firstLoad = true;       // pas de « flash nouveau » au changement de vue
       applyStaticText();
       renderTabs(lastData);
@@ -338,6 +422,23 @@
 
     $('tab-live').addEventListener('click', () => switchView('live'));
     $('tab-history').addEventListener('click', () => switchView('history'));
+
+    // Tri : clic sur un en-tête de colonne (délégation sur la ligne d'en-têtes).
+    $('head').addEventListener('click', (e) => {
+      const th = e.target.closest('th[data-key]');
+      if (th) onSort(th.dataset.key);
+    });
+
+    // Filtre par état : clic sur un chip de stat. « Total » (data-state="") réinitialise ;
+    // re-clic sur l'état actif réinitialise aussi.
+    $('stats').addEventListener('click', (e) => {
+      const chip = e.target.closest('.stat');
+      if (!chip) return;
+      const s = chip.dataset.state || '';
+      stateFilter = (s && stateFilter !== s) ? s : null;
+      if (lastData) renderStats(lastData);   // surbrillance du chip immédiate
+      poll();                                 // ré-interroge avec le nouveau filtre
+    });
 
     $('toggle').addEventListener('click', () => {
       paused = !paused;

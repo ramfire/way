@@ -3,7 +3,11 @@ import posixpath
 
 from django.conf import settings
 from django.contrib.admin.views.decorators import staff_member_required
-from django.db.models import Case, Count, IntegerField, Value, When
+from django.db.models import (
+    Case, CharField, Count, F, FloatField, Func, IntegerField, Value, When,
+)
+from django.db.models.fields.json import KeyTextTransform
+from django.db.models.functions import Cast, Coalesce, Lower
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
@@ -244,7 +248,17 @@ def download_received_file(request, pk):
 
 # --- Monitoring temps réel (page auto-rafraîchie côté navigateur) -------------
 
-MONITORING_FEED_LIMIT = 50  # nb de lignes renvoyées par le feed
+MONITORING_FEED_LIMIT = 50   # taille de page par défaut renvoyée par le feed
+MONITORING_FEED_MAX = 500    # borne dure (?limit=) : protège le payload / la DB
+
+# Tri serveur : clés de colonnes acceptées (?sort=). Les champs *dérivés*
+# (filename, elapsed_ms, et stored_at en History) ne sont pas des colonnes brutes ;
+# ils sont calculés en base via annotations (voir `monitoring_feed`) pour que le
+# tri porte sur TOUTE la table et pas seulement sur la page renvoyée.
+SORT_KEYS = frozenset({
+    'state', 'filename', 'username', 'protocol', 'ip',
+    'file_size', 'elapsed_ms', 'received_at', 'stored_at',
+})
 
 # Vue « Live » : flux opérationnel courant (à surveiller / à traiter). Les `failed`
 # y restent visibles tant qu'ils ne sont pas traités (futures actions de remédiation).
@@ -312,10 +326,14 @@ def restore_received_file(request, pk):
 
 @staff_member_required
 def monitoring_feed(request):
-    """JSON consommé par la page monitoring : N derniers fichiers + compteurs.
+    """JSON consommé par la page monitoring : une page de fichiers + compteurs.
 
     Deux vues via ``?view=`` : ``live`` (défaut — flux courant receiving/stored/
-    failed, échecs en tête) et ``history`` (archives deleted/missing). Lecture
+    failed, échecs en tête) et ``history`` (archives deleted/missing). Le **tri**
+    (``?sort=&dir=``) et le **filtre par état** (``?state=``) sont appliqués côté
+    serveur sur TOUTE la table (et pas seulement sur la page) ; on renvoie ensuite
+    le top-N (``?limit=``, défaut 50, borné) plus ``matched_total`` (nb de lignes
+    correspondant au filtre) pour que l'UI affiche « affichés / total ». Lecture
     seule, gardée par la session staff (cookie du fetch same-origin) ; pas de CSRF
     (GET non mutant).
     """
@@ -323,17 +341,70 @@ def monitoring_feed(request):
     states = HISTORY_STATES if view == 'history' else LIVE_STATES
     base = ReceivedFile.objects.filter(state__in=states)
 
-    if view == 'live':
-        # Erreurs (failed) remontées en tête, puis les plus récents.
+    # Filtre par état (chip cliquable). On ne retient que les états valides pour la
+    # vue courante ; toute autre valeur est ignorée (= pas de filtre).
+    valid_states = {s.value for s in states}
+    state_filter = request.GET.get('state')
+    if state_filter not in valid_states:
+        state_filter = None
+    if state_filter:
+        base = base.filter(state=state_filter)
+
+    # Total des lignes correspondant au filtre, AVANT pagination (top-N).
+    matched_total = base.count()
+
+    # Taille de page (?limit=), bornée pour protéger le payload et la DB.
+    try:
+        limit = int(request.GET.get('limit', MONITORING_FEED_LIMIT))
+    except (TypeError, ValueError):
+        limit = MONITORING_FEED_LIMIT
+    limit = max(1, min(limit, MONITORING_FEED_MAX))
+
+    # Annotations pour le tri serveur des champs dérivés :
+    #  - _filename : basename de s3_key (tout après le dernier '/'), insensible à la casse ;
+    #  - _elapsed  : durée de transfert (ms) extraite du JSON `raw` et castée en nombre ;
+    #  - _stored_eff : horodatage « dernière colonne » en History (archive/suppression/stockage).
+    base = base.annotate(
+        _filename=Lower(Func(
+            F('s3_key'), Value(r'^.*/'), Value(''),
+            function='regexp_replace', output_field=CharField())),
+        _elapsed=Cast(KeyTextTransform('elapsed', 'raw'), FloatField()),
+        _stored_eff=Coalesce('archived_at', 'deleted_at', 'stored_at'),
+    )
+
+    sort = request.GET.get('sort')
+    direction = 'desc' if request.GET.get('dir') == 'desc' else 'asc'
+    if sort in SORT_KEYS:
+        source = {
+            'state': F('state'),
+            'filename': F('_filename'),
+            'username': Lower('username'),
+            'protocol': Lower('protocol'),
+            'ip': F('ip'),                # GenericIPAddressField → inet : tri numérique natif
+            'file_size': F('file_size'),
+            'elapsed_ms': F('_elapsed'),
+            'received_at': F('received_at'),
+            # stored_at : effectif (archive/suppr/stockage) en History, brut en Live.
+            'stored_at': F('_stored_eff') if view == 'history' else F('stored_at'),
+        }[sort]
+        primary = (source.desc(nulls_last=True) if direction == 'desc'
+                   else source.asc(nulls_last=True))
+        # Tri explicite : on l'honore tel quel (pas de « failed en tête »), avec un
+        # départage déterministe par récence puis id.
+        qs = list(base.order_by(primary, '-received_at', '-id')[:limit])
+    elif view == 'live':
+        # Ordre par défaut Live : erreurs (failed) en tête, puis les plus récents.
+        sort = None
         err_first = Case(
             When(state=ReceivedFile.State.FAILED, then=Value(0)),
             default=Value(1),
             output_field=IntegerField(),
         )
         qs = list(base.annotate(_err_first=err_first)
-                  .order_by('_err_first', '-received_at')[:MONITORING_FEED_LIMIT])
+                  .order_by('_err_first', '-received_at', '-id')[:limit])
     else:
-        qs = list(base.order_by('-received_at')[:MONITORING_FEED_LIMIT])
+        sort = None
+        qs = list(base.order_by('-received_at', '-id')[:limit])
 
     def to_row(rf):
         name = posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)'
@@ -372,5 +443,12 @@ def monitoring_feed(request):
         'per_state': per_state,
         'live_total': live_total,
         'history_total': history_total,
+        # Écho de la requête de tri/filtre + cardinalités (pilote « affichés / total »).
+        'state_filter': state_filter,
+        'sort': sort,
+        'dir': direction if sort else None,
+        'limit': limit,
+        'matched_total': matched_total,
+        'returned': len(qs),
         'server_time': timezone.now().isoformat(),
     })
