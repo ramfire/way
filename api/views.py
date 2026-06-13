@@ -332,10 +332,10 @@ def monitoring_feed(request):
     failed, échecs en tête) et ``history`` (archives deleted/missing). Le **tri**
     (``?sort=&dir=``) et le **filtre par état** (``?state=``) sont appliqués côté
     serveur sur TOUTE la table (et pas seulement sur la page) ; on renvoie ensuite
-    le top-N (``?limit=``, défaut 50, borné) plus ``matched_total`` (nb de lignes
-    correspondant au filtre) pour que l'UI affiche « affichés / total ». Lecture
-    seule, gardée par la session staff (cookie du fetch same-origin) ; pas de CSRF
-    (GET non mutant).
+    une **page** (``?limit=`` défaut 50 borné, ``?offset=`` pour paginer) plus
+    ``matched_total`` (nb total de lignes correspondant au filtre) pour que l'UI
+    pagine « a–b / total ». Lecture seule, gardée par la session staff (cookie du
+    fetch same-origin) ; pas de CSRF (GET non mutant).
     """
     view = 'history' if request.GET.get('view') == 'history' else 'live'
     states = HISTORY_STATES if view == 'history' else LIVE_STATES
@@ -359,6 +359,18 @@ def monitoring_feed(request):
     except (TypeError, ValueError):
         limit = MONITORING_FEED_LIMIT
     limit = max(1, min(limit, MONITORING_FEED_MAX))
+
+    # Décalage de pagination (?offset=). Borné à >= 0 ; si l'offset dépasse le
+    # total filtré (vue/tri/filtre changé, lignes passées en History entre deux
+    # polls…), on recale sur la dernière page non vide plutôt que de renvoyer une
+    # page vide. L'UI resynchronise son offset sur celui renvoyé.
+    try:
+        offset = int(request.GET.get('offset', 0))
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, offset)
+    if matched_total and offset >= matched_total:
+        offset = ((matched_total - 1) // limit) * limit
 
     # Annotations pour le tri serveur des champs dérivés :
     #  - _filename : basename de s3_key (tout après le dernier '/'), insensible à la casse ;
@@ -391,7 +403,7 @@ def monitoring_feed(request):
                    else source.asc(nulls_last=True))
         # Tri explicite : on l'honore tel quel (pas de « failed en tête »), avec un
         # départage déterministe par récence puis id.
-        qs = list(base.order_by(primary, '-received_at', '-id')[:limit])
+        qs = list(base.order_by(primary, '-received_at', '-id')[offset:offset + limit])
     elif view == 'live':
         # Ordre par défaut Live : erreurs (failed) en tête, puis les plus récents.
         sort = None
@@ -401,10 +413,10 @@ def monitoring_feed(request):
             output_field=IntegerField(),
         )
         qs = list(base.annotate(_err_first=err_first)
-                  .order_by('_err_first', '-received_at', '-id')[:limit])
+                  .order_by('_err_first', '-received_at', '-id')[offset:offset + limit])
     else:
         sort = None
-        qs = list(base.order_by('-received_at', '-id')[:limit])
+        qs = list(base.order_by('-received_at', '-id')[offset:offset + limit])
 
     def to_row(rf):
         name = posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)'
@@ -448,6 +460,7 @@ def monitoring_feed(request):
         'sort': sort,
         'dir': direction if sort else None,
         'limit': limit,
+        'offset': offset,
         'matched_total': matched_total,
         'returned': len(qs),
         'server_time': timezone.now().isoformat(),

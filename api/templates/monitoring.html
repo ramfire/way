@@ -57,6 +57,12 @@
     .stat.clickable { cursor:pointer; user-select:none; }
     .stat.clickable:hover { border-color:var(--mut); }
     .stat.active { border-color:#7dd3fc; background:#0c4a6e; }
+    .pager { display:flex; align-items:center; gap:.7rem; padding:.6rem 1.5rem;
+             color:var(--mut); font-size:.82rem; border-top:1px solid var(--line); }
+    .pager:empty { display:none; }
+    .pager button[disabled] { opacity:.4; cursor:default; }
+    .pager button[disabled]:hover { border-color:var(--line); }
+    .pager .pg-pages { margin-left:auto; }
   </style>
 </head>
 <body>
@@ -99,6 +105,7 @@
     </thead>
     <tbody id="rows"></tbody>
   </table>
+  <div class="pager" id="pager"></div>
 
   <script>
     // --- Dictionnaire de traductions (défaut : anglais) ------------------------
@@ -115,6 +122,8 @@
         st_error: 'error',
         btn_pause: '⏸ Pause', btn_resume: '▶ Resume',
         showing: 'showing {n} / {m}',
+        pg_prev: '‹ Prev', pg_next: 'Next ›',
+        pg_range: '{a}–{b} of {m}', pg_page: 'page {p} / {n}',
         updated: 'updated {s}s ago',
         loading: 'Loading…', empty: 'No files received.', empty_history: 'History is empty.',
         empty_filter: 'No files match this filter.',
@@ -137,6 +146,8 @@
         st_error: 'erreur',
         btn_pause: '⏸ Pause', btn_resume: '▶ Reprendre',
         showing: '{n} / {m} affichés',
+        pg_prev: '‹ Préc.', pg_next: 'Suiv. ›',
+        pg_range: '{a}–{b} sur {m}', pg_page: 'page {p} / {n}',
         updated: 'màj il y a {s}s',
         loading: 'Chargement…', empty: 'Aucun fichier reçu.', empty_history: 'Historique vide.',
         empty_filter: 'Aucun fichier ne correspond à ce filtre.',
@@ -158,6 +169,8 @@
         st_error: 'errore',
         btn_pause: '⏸ Pausa', btn_resume: '▶ Riprendi',
         showing: '{n} / {m} mostrati',
+        pg_prev: '‹ Prec.', pg_next: 'Succ. ›',
+        pg_range: '{a}–{b} di {m}', pg_page: 'pagina {p} / {n}',
         updated: 'agg. {s}s fa',
         loading: 'Caricamento…', empty: 'Nessun file ricevuto.', empty_history: 'Cronologia vuota.',
         empty_filter: 'Nessun file corrisponde a questo filtro.',
@@ -178,6 +191,7 @@
     let sortKey = null;                // null = ordre serveur ; sinon clé de colonne
     let sortDir = 1;                   // 1 = asc, -1 = desc
     let stateFilter = null;            // null = tous ; sinon un état (r.state) à isoler
+    let offset = 0;                    // décalage de pagination (0 = première page)
 
     // Colonnes triables : id du <th>, clé de tri (champ de la ligne), clé i18n du libellé.
     // 'th-stored' a un libellé spécial (Stored en Live / Archivé en History) → i18n null.
@@ -246,6 +260,7 @@
     function onSort(key) {
       if (sortKey === key) sortDir = -sortDir;   // re-clic → inverse le sens
       else { sortKey = key; sortDir = 1; }
+      offset = 0;                                // nouveau tri → retour page 1
       updateSortIndicators();
       poll();                                    // ré-interroge avec le nouveau tri
     }
@@ -336,16 +351,26 @@
       }).join('');
     }
 
-    // « affichés / total » : visible seulement quand la page tronque le résultat
-    // (matched_total > lignes renvoyées), sinon masqué pour ne pas charger l'en-tête.
-    function renderCount(data) {
-      const m = data.matched_total, n = (data.returned != null) ? data.returned
+    // Pagination (côté serveur via ?offset=&limit=). Le pager n'apparaît que si le
+    // total filtré dépasse une page ; sinon il est vide (donc masqué en CSS).
+    function renderPager(data) {
+      const total = data.matched_total || 0;
+      const lim = data.limit || 50;
+      const off = data.offset || 0;
+      const shown = (data.returned != null) ? data.returned
         : (data.rows ? data.rows.length : 0);
-      if (m != null && m > n) {
-        $('count').textContent = t('showing').replace('{n}', n).replace('{m}', m);
-      } else {
-        $('count').textContent = '';
-      }
+      if (total <= lim) { $('pager').innerHTML = ''; return; }
+      const from = total ? off + 1 : 0;
+      const to = off + shown;
+      const page = Math.floor(off / lim) + 1;
+      const pages = Math.max(1, Math.ceil(total / lim));
+      const prevDis = off <= 0 ? 'disabled' : '';
+      const nextDis = (off + lim) >= total ? 'disabled' : '';
+      $('pager').innerHTML =
+        `<button id="pg-prev" ${prevDis}>${esc(t('pg_prev'))}</button>` +
+        `<button id="pg-next" ${nextDis}>${esc(t('pg_next'))}</button>` +
+        `<span>${t('pg_range').replace('{a}', from).replace('{b}', to).replace('{m}', total)}</span>` +
+        `<span class="pg-pages">${t('pg_page').replace('{p}', page).replace('{n}', pages)}</span>`;
     }
 
     // Rendu du feed courant : stats + tabs + lignes (déjà triées/filtrées côté serveur).
@@ -355,7 +380,7 @@
       renderStats(lastData);
       renderTabs(lastData);
       renderRows(lastData.rows);
-      renderCount(lastData);
+      renderPager(lastData);
       lastData.rows.forEach(r => seen.add(r.id));
       firstLoad = false;
     }
@@ -371,6 +396,7 @@
       const p = new URLSearchParams({ view });
       if (stateFilter) p.set('state', stateFilter);
       if (sortKey) { p.set('sort', sortKey); p.set('dir', sortDir === 1 ? 'asc' : 'desc'); }
+      if (offset) p.set('offset', offset);
       return '/monitoring/feed/?' + p.toString();
     }
 
@@ -384,6 +410,9 @@
         const data = await res.json();
         // Ignore une réponse tardive qui ne correspond plus à la vue courante.
         if (data.view && data.view !== view) return;
+        // Resynchronise l'offset sur celui renvoyé (le serveur a pu le recaler
+        // sur la dernière page si le total a diminué entre deux polls).
+        if (typeof data.offset === 'number') offset = data.offset;
         lastData = data;
         renderFeed();
         lastUpdate = Date.now();
@@ -402,6 +431,7 @@
       if (v === view) return;
       view = v;
       stateFilter = null;                   // les états diffèrent entre Live et History
+      offset = 0;                           // nouvelle vue → retour page 1
       seen.clear(); firstLoad = true;       // pas de « flash nouveau » au changement de vue
       applyStaticText();
       renderTabs(lastData);
@@ -436,6 +466,7 @@
       if (!chip) return;
       const s = chip.dataset.state || '';
       stateFilter = (s && stateFilter !== s) ? s : null;
+      offset = 0;                             // nouveau filtre → retour page 1
       if (lastData) renderStats(lastData);   // surbrillance du chip immédiate
       poll();                                 // ré-interroge avec le nouveau filtre
     });
@@ -487,6 +518,17 @@
     $('rows').addEventListener('click', (e) => {
       const btn = e.target.closest('button.act');
       if (btn) doAction(btn.dataset.act, btn.dataset.id);
+    });
+
+    // Pagination : Préc./Suiv. (délégation, le pager est re-rendu via innerHTML).
+    $('pager').addEventListener('click', (e) => {
+      const btn = e.target.closest('button');
+      if (!btn || btn.disabled) return;
+      const lim = (lastData && lastData.limit) || 50;
+      if (btn.id === 'pg-prev') offset = Math.max(0, offset - lim);
+      else if (btn.id === 'pg-next') offset += lim;
+      seen.clear(); firstLoad = true;     // pas de « flash nouveau » au changement de page
+      poll();
     });
 
     // Économie : on suspend le polling quand l'onglet n'est pas visible.
