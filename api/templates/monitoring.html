@@ -41,12 +41,21 @@
     .deleted   { background:#374151; color:#d1d5db; }
     .missing   { background:#78350f; color:#fed7aa; }
     .archived  { background:#312e81; color:#c7d2fe; }
-    /* Verdicts d'admission : vert (admis) / orange (recycle) / rouge (quarantine).
+    /* Axe contrôles — badge « worst-wins » par classe de monitoring (générique,
+       tous stages/contrôles). Couleurs par sévérité décroissante (design §5).
        NB: distinct de .archived (axe stockage) — voir design §8. */
-    .adm-admis      { background:#14532d; color:#bbf7d0; }
-    .adm-recycle    { background:#78350f; color:#fed7aa; }
-    .adm-quarantine { background:#7f1d1d; color:#fecaca; }
-    .adm-none       { color:var(--mut); }
+    .mc-blocking         { background:#991b1b; color:#fee2e2; box-shadow:inset 2px 0 0 #ef4444; }
+    .mc-warning_action   { background:#9a3412; color:#ffedd5; }
+    .mc-recycle          { background:#854d0e; color:#fde68a; }
+    .mc-reject           { background:#7f1d1d; color:#fecaca; }
+    .mc-warning_noaction { background:#334155; color:#cbd5e1; }
+    .mc-push             { background:#14532d; color:#bbf7d0; }
+    .mc-none             { color:var(--mut); }
+    /* Barre de filtre par classe de contrôle (chips, axe contrôles). */
+    .cbar { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap;
+            padding:.55rem 1.5rem; border-bottom:1px solid var(--line); font-size:.82rem; }
+    .cbar:empty { display:none; }
+    .cbar .cbar-lbl { color:var(--mut); margin-right:.2rem; }
     button.act { padding:.2rem .55rem; font-size:.76rem; }
     a.dl { color:#7dd3fc; text-decoration:none; }
     a.dl:hover { text-decoration:underline; }
@@ -113,6 +122,7 @@
     </div>
   </header>
   <div class="err" id="err"></div>
+  <div class="cbar" id="cbar"></div>
 
   <table>
     <thead>
@@ -126,7 +136,7 @@
         <th id="th-transfer" class="sortable" data-key="elapsed_ms"><span class="lbl"></span><span class="arr"></span></th>
         <th id="th-received" class="sortable" data-key="received_at"><span class="lbl"></span><span class="arr"></span></th>
         <th id="th-stored" class="sortable" data-key="stored_at"><span class="lbl"></span><span class="arr"></span></th>
-        <th id="th-admission"><span class="lbl"></span></th>
+        <th id="th-controls" class="sortable" data-key="control"><span class="lbl"></span><span class="arr"></span></th>
         <th></th>
       </tr>
     </thead>
@@ -157,9 +167,12 @@
         total: 'Total', receiving: 'receiving', stored: 'stored', failed: 'failed',
         th_state: 'Status', th_file: 'File', th_user: 'User', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Size', th_transfer: 'Transfer', th_received: 'Received',
-        th_stored: 'Stored', th_archived: 'Archived', th_admission: 'Admission',
-        // verdicts d'admission + libellés de la modale détail (support)
-        adm_admis: 'Admitted', adm_recycle: 'Recycle', adm_quarantine: 'Quarantine', adm_none: 'pending',
+        th_stored: 'Stored', th_archived: 'Archived', th_controls: 'Controls',
+        // classes de monitoring — badge « worst-wins » de la colonne Contrôles
+        mc_blocking: 'Blocking', mc_warning_action: 'Action needed', mc_recycle: 'Recycle',
+        mc_reject: 'Rejected', mc_warning_noaction: 'Warning', mc_push: 'OK', mc_none: '—',
+        ctl_filter: 'Controls', ctl_all: 'All',
+        // libellés de la modale détail (support)
         adm_title: 'Admission checks', adm_no_events: 'No admission event for this file yet.',
         adm_c_control: 'Control', adm_c_result: 'Result', adm_c_class: 'Class',
         adm_c_detail: 'Detail', adm_c_time: 'Time',
@@ -189,8 +202,10 @@
         total: 'Total', receiving: 'réception', stored: 'stockés', failed: 'échecs',
         th_state: 'État', th_file: 'Fichier', th_user: 'Utilisateur', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Taille', th_transfer: 'Transfert', th_received: 'Reçu',
-        th_stored: 'Stocké', th_archived: 'Archivé', th_admission: 'Admission',
-        adm_admis: 'Admis', adm_recycle: 'Recyclage', adm_quarantine: 'Quarantaine', adm_none: 'en attente',
+        th_stored: 'Stocké', th_archived: 'Archivé', th_controls: 'Contrôles',
+        mc_blocking: 'Bloquant', mc_warning_action: 'Action requise', mc_recycle: 'Recyclage',
+        mc_reject: 'Rejeté', mc_warning_noaction: 'Avertissement', mc_push: 'OK', mc_none: '—',
+        ctl_filter: 'Contrôles', ctl_all: 'Tous',
         adm_title: 'Contrôles d’admission', adm_no_events: 'Aucun événement d’admission pour ce fichier.',
         adm_c_control: 'Contrôle', adm_c_result: 'Résultat', adm_c_class: 'Classe',
         adm_c_detail: 'Détail', adm_c_time: 'Heure',
@@ -219,8 +234,10 @@
         total: 'Totale', receiving: 'in ricezione', stored: 'archiviati', failed: 'falliti',
         th_state: 'Stato', th_file: 'File', th_user: 'Utente', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Dimensione', th_transfer: 'Trasferimento', th_received: 'Ricevuto',
-        th_stored: 'Archiviato', th_archived: 'Archiviato il', th_admission: 'Ammissione',
-        adm_admis: 'Ammesso', adm_recycle: 'Riciclo', adm_quarantine: 'Quarantena', adm_none: 'in attesa',
+        th_stored: 'Archiviato', th_archived: 'Archiviato il', th_controls: 'Controlli',
+        mc_blocking: 'Bloccante', mc_warning_action: 'Azione richiesta', mc_recycle: 'Riciclo',
+        mc_reject: 'Respinto', mc_warning_noaction: 'Avviso', mc_push: 'OK', mc_none: '—',
+        ctl_filter: 'Controlli', ctl_all: 'Tutti',
         adm_title: 'Controlli di ammissione', adm_no_events: 'Nessun evento di ammissione per questo file.',
         adm_c_control: 'Controllo', adm_c_result: 'Esito', adm_c_class: 'Classe',
         adm_c_detail: 'Dettaglio', adm_c_time: 'Ora',
@@ -253,6 +270,7 @@
     let sortKey = null;                // null = ordre serveur ; sinon clé de colonne
     let sortDir = 1;                   // 1 = asc, -1 = desc
     let stateFilter = null;            // null = tous ; sinon un état (r.state) à isoler
+    let controlFilter = null;          // null = toutes ; sinon une classe de monitoring
     let offset = 0;                    // décalage de pagination (0 = première page)
 
     // Colonnes triables : id du <th>, clé de tri (champ de la ligne), clé i18n du libellé.
@@ -267,7 +285,13 @@
       { id:'th-transfer', key:'elapsed_ms', i18n:'th_transfer' },
       { id:'th-received', key:'received_at', i18n:'th_received' },
       { id:'th-stored',   key:'stored_at',  i18n:null },
+      { id:'th-controls', key:'control',    i18n:'th_controls' },
     ];
+
+    // Classes de monitoring (axe contrôles), de la plus sévère à la moins (worst-wins).
+    // Ordre = échelle de sévérité décidée (design §5) ; `none` = aucun contrôle passé.
+    const CLASS_ORDER = ['blocking', 'warning_action', 'recycle', 'reject',
+                         'warning_noaction', 'push', 'none'];
 
     let lang = localStorage.getItem('monitoring_lang');
     if (!I18N[lang]) lang = 'en';      // défaut : anglais
@@ -339,8 +363,6 @@
           : t(c.i18n);
         $(c.id).querySelector('.lbl').textContent = label;
       });
-      // Colonne Admission (non triable, hors COLS) : libellé seul.
-      $('th-admission').querySelector('.lbl').textContent = t('th_admission');
       updateSortIndicators();
       $('toggle').textContent = paused ? t('btn_resume') : t('btn_pause');
       $('lang').value = lang;
@@ -378,12 +400,31 @@
       }
     }
 
-    // Badge du verdict d'admission courant (admis/recycle/quarantine), ou « en attente »
-    // si aucun verdict n'a encore été posé. Détail complet au double-clic (modale).
-    function admBadge(r) {
-      const v = r.admission_verdict;
-      if (!v) return `<span class="adm-none">${esc(t('adm_none'))}</span>`;
-      return `<span class="badge adm-${esc(v)}">${esc(t('adm_' + v) || v)}</span>`;
+    // Badge « worst-wins » de l'axe contrôles : la classe de monitoring la plus
+    // sévère parmi l'état courant des contrôles du fichier (control_class matérialisé,
+    // générique tous stages). `mc-none` = aucun contrôle encore passé. Détail complet
+    // par contrôle au double-clic (modale).
+    function controlBadge(r) {
+      const c = r.control_class;
+      if (!c) return `<span class="mc-none">${esc(t('mc_none'))}</span>`;
+      return `<span class="badge mc-${esc(c)}">${esc(t('mc_' + c) || c)}</span>`;
+    }
+
+    // Chips de filtre par classe de monitoring (axe contrôles), ordonnés du plus
+    // sévère au moins sévère ; on n'affiche que les classes présentes (count > 0).
+    function controlChip(cls, count) {
+      const active = (controlFilter === cls) ? ' active' : '';
+      const label = t('mc_' + cls) || cls;
+      const inner = (cls === 'none') ? esc(label)
+        : `<span class="badge mc-${esc(cls)}">${esc(label)}</span>`;
+      return `<span class="stat clickable${active}" data-control="${esc(cls)}">${inner} <b>${count}</b></span>`;
+    }
+    function renderControlChips(data) {
+      const pc = data.per_control_class || {};
+      const chips = CLASS_ORDER.filter(c => pc[c]).map(c => controlChip(c, pc[c]));
+      $('cbar').innerHTML = chips.length
+        ? `<span class="cbar-lbl">${esc(t('ctl_filter'))} :</span>` + chips.join('')
+        : '';
     }
 
     function renderRows(rows) {
@@ -418,7 +459,7 @@
           <td>${fmtDuration(r.elapsed_ms)}</td>
           <td>${fmtTime(r.received_at)}</td>
           <td>${fmtTime(lastTime)}</td>
-          <td>${admBadge(r)}</td>
+          <td>${controlBadge(r)}</td>
           <td>${dl}</td>
         </tr>`;
       }).join('');
@@ -451,6 +492,7 @@
     function renderFeed() {
       if (!lastData) return;
       renderStats(lastData);
+      renderControlChips(lastData);
       renderTabs(lastData);
       renderRows(lastData.rows);
       renderPager(lastData);
@@ -468,6 +510,7 @@
     function feedUrl() {
       const p = new URLSearchParams({ view });
       if (stateFilter) p.set('state', stateFilter);
+      if (controlFilter) p.set('control', controlFilter);
       if (sortKey) { p.set('sort', sortKey); p.set('dir', sortDir === 1 ? 'asc' : 'desc'); }
       if (offset) p.set('offset', offset);
       return '/monitoring/feed/?' + p.toString();
@@ -504,6 +547,7 @@
       if (v === view) return;
       view = v;
       stateFilter = null;                   // les états diffèrent entre Live et History
+      controlFilter = null;                 // repart sans filtre de classe
       offset = 0;                           // nouvelle vue → retour page 1
       seen.clear(); firstLoad = true;       // pas de « flash nouveau » au changement de vue
       applyStaticText();
@@ -542,6 +586,18 @@
       offset = 0;                             // nouveau filtre → retour page 1
       if (lastData) renderStats(lastData);   // surbrillance du chip immédiate
       poll();                                 // ré-interroge avec le nouveau filtre
+    });
+
+    // Filtre par classe de contrôle : clic sur un chip de la barre Contrôles.
+    // Re-clic sur la classe active réinitialise (toggle).
+    $('cbar').addEventListener('click', (e) => {
+      const chip = e.target.closest('.stat');
+      if (!chip) return;
+      const c = chip.dataset.control;
+      controlFilter = (controlFilter === c) ? null : c;
+      offset = 0;                             // nouveau filtre → retour page 1
+      if (lastData) renderControlChips(lastData);   // surbrillance immédiate
+      poll();
     });
 
     $('toggle').addEventListener('click', () => {

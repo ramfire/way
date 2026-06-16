@@ -60,6 +60,15 @@ class ReceivedFile(models.Model):
     # True quand la ligne provient d'un backfill `reconcile_files` (et non d'un hook).
     reconciled = models.BooleanField(default=False, db_index=True)
 
+    # Read-model matérialisé de l'axe contrôles : classe de monitoring « worst-wins »
+    # (la plus sévère parmi l'état COURANT des contrôles du fichier, tous stages
+    # confondus). Dérivé des `Event` ; rafraîchi par `refresh_control_class()` après
+    # chaque émission de contrôle (admission aujourd'hui, DORA demain). NULL = aucun
+    # contrôle encore passé. Sert le filtre/tri/agrégation côté serveur du board
+    # (cf. docs/admission-monitoring-design.md §6, étape 3). Pas de `choices` : valeur
+    # contrainte par le code (clés de MONITORING_SEVERITY / Event.MonitoringClass).
+    control_class = models.CharField(max_length=20, null=True, blank=True, db_index=True)
+
     # Filet de sécurité : payload brut complet
     raw = models.JSONField(default=dict, blank=True)
 
@@ -156,3 +165,68 @@ MONITORING_SEVERITY = {
     Event.MonitoringClass.WARNING_NOACTION: 10,
     Event.MonitoringClass.PUSH: 0,
 }
+
+
+def current_control_rollup(file_ids):
+    """Rollup « worst-wins » de l'axe contrôles, par fichier (générique).
+
+    Pour chaque fichier : on prend l'état **courant** de chacun de ses contrôles
+    (= dernier ``Event`` par couple ``(stage, control)`` — append-only/rejouable),
+    puis on retient la **classe de monitoring la plus sévère** parmi eux
+    (``MONITORING_SEVERITY``, board orienté action). Un seul signal par fichier,
+    **toutes étapes/contrôles confondus** : admission aujourd'hui, contrôles DORA
+    demain, sans câbler aucun nom de contrôle/stage.
+
+    NB : le worst-wins porte sur **tous** les contrôles, pas sur le seul ``verdict``
+    — c'est ce qui fait **remonter** un signal comme le ``warning_action``
+    « partenaire révoqué qui émet » (plus sévère que le verdict ``reject``), au lieu
+    de l'enterrer (cf. docs/admission-monitoring-design.md §5/§7).
+
+    Renvoie ``{file_id: {'monitoring_class', 'stage', 'control', 'result'}}`` ;
+    un fichier sans aucun événement est simplement absent du mapping.
+    """
+    file_ids = list(file_ids)
+    if not file_ids:
+        return {}
+    # Derniers d'abord : la 1re ligne vue pour un (file, stage, control) est l'actuelle.
+    events = (Event.objects
+              .filter(file_id__in=file_ids)
+              .order_by('file_id', 'stage', 'control', '-created_at', '-id')
+              .values('file_id', 'stage', 'control', 'monitoring_class', 'result'))
+    current = {}   # (file, stage, control) -> event courant
+    for e in events:
+        key = (e['file_id'], e['stage'], e['control'])
+        if key not in current:
+            current[key] = e
+    worst = {}
+    for (fid, _stage, _control), e in current.items():
+        sev = MONITORING_SEVERITY.get(e['monitoring_class'], -1)
+        best = worst.get(fid)
+        if best is None or sev > best['_severity']:
+            worst[fid] = {
+                '_severity': sev,
+                'monitoring_class': e['monitoring_class'],
+                'stage': e['stage'],
+                'control': e['control'],
+                'result': e['result'],
+            }
+    return worst
+
+
+def refresh_control_class(file_ids):
+    """(Re)matérialise ``ReceivedFile.control_class`` depuis les événements.
+
+    À appeler **après toute émission de contrôle** pour un fichier (l'admission le
+    fait en fin de passage). Idempotent ; un fichier sans événement repasse à NULL.
+    Écrit en lots par classe (≤ 6 UPDATE) — efficace même en backfill massif.
+    """
+    file_ids = list(file_ids)
+    if not file_ids:
+        return
+    rollup = current_control_rollup(file_ids)
+    by_class = {}
+    for fid in file_ids:
+        roll = rollup.get(fid)
+        by_class.setdefault(roll['monitoring_class'] if roll else None, []).append(fid)
+    for cls, ids in by_class.items():
+        ReceivedFile.objects.filter(pk__in=ids).update(control_class=cls)

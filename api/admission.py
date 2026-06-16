@@ -18,7 +18,7 @@ import logging
 
 from django.conf import settings
 
-from .models import Event, Partner, ReceivedFile
+from .models import Event, Partner, ReceivedFile, refresh_control_class
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +187,11 @@ def file_admission(file_id):
     verdict (``admis`` / ``recycle`` / ``quarantine``) ou ``None`` en cas d'erreur.
     """
     try:
-        return _run(file_id)
+        verdict = _run(file_id)
+        # Rematérialise le rollup worst-wins de l'axe contrôles pour ce fichier
+        # (read-model du board). Source de vérité = les Event qu'on vient d'émettre.
+        refresh_control_class([file_id])
+        return verdict
     except Exception:
         logger.exception('Admission: erreur inattendue pour file %s', file_id)
         return None

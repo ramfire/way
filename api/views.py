@@ -4,8 +4,7 @@ import posixpath
 from django.conf import settings
 from django.contrib.admin.views.decorators import staff_member_required
 from django.db.models import (
-    Case, CharField, Count, F, FloatField, Func, IntegerField, OuterRef,
-    Subquery, Value, When,
+    Case, CharField, Count, F, FloatField, Func, IntegerField, Value, When,
 )
 from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Cast, Coalesce, Lower
@@ -277,6 +276,7 @@ MONITORING_FEED_MAX = 500    # borne dure (?limit=) : protège le payload / la D
 SORT_KEYS = frozenset({
     'state', 'filename', 'username', 'protocol', 'ip',
     'file_size', 'elapsed_ms', 'received_at', 'stored_at',
+    'control',   # colonne « Contrôles » : tri par SÉVÉRITÉ (pas alphabétique)
 })
 
 # Vue « Live » : flux opérationnel courant (à surveiller / à traiter). Les `failed`
@@ -343,51 +343,6 @@ def restore_received_file(request, pk):
     return JsonResponse({'ok': True, 'id': pk, 'state': rf.state})
 
 
-def current_control_rollup(file_ids):
-    """Rollup « worst-wins » de l'axe contrôles, par fichier (générique).
-
-    Pour chaque fichier : on prend l'état **courant** de chacun de ses contrôles
-    (= dernier ``Event`` par couple ``(stage, control)`` — append-only/rejouable),
-    puis on retient la **classe de monitoring la plus sévère** parmi eux
-    (``MONITORING_SEVERITY``, board orienté action). Un seul signal par fichier,
-    **toutes étapes/contrôles confondus** : admission aujourd'hui, contrôles DORA
-    demain, sans retoucher le board (on ne câble aucun nom de contrôle/stage ici).
-
-    NB important : le worst-wins porte sur **tous** les contrôles, pas sur le seul
-    ``verdict`` — c'est ce qui fait **remonter** un signal comme le
-    ``warning_action`` « partenaire révoqué qui émet » (plus sévère que le verdict
-    ``reject``), au lieu de l'enterrer (cf. design §5/§7).
-
-    Renvoie ``{file_id: {'monitoring_class', 'stage', 'control', 'result'}}`` ;
-    un fichier sans aucun événement est simplement absent du mapping.
-    """
-    if not file_ids:
-        return {}
-    # Derniers d'abord : la 1re ligne vue pour un (file, stage, control) est l'actuelle.
-    events = (Event.objects
-              .filter(file_id__in=file_ids)
-              .order_by('file_id', 'stage', 'control', '-created_at', '-id')
-              .values('file_id', 'stage', 'control', 'monitoring_class', 'result'))
-    current = {}   # (file, stage, control) -> event courant
-    for e in events:
-        key = (e['file_id'], e['stage'], e['control'])
-        if key not in current:
-            current[key] = e
-    worst = {}
-    for (fid, _stage, _control), e in current.items():
-        sev = MONITORING_SEVERITY.get(e['monitoring_class'], -1)
-        best = worst.get(fid)
-        if best is None or sev > best['_severity']:
-            worst[fid] = {
-                '_severity': sev,
-                'monitoring_class': e['monitoring_class'],
-                'stage': e['stage'],
-                'control': e['control'],
-                'result': e['result'],
-            }
-    return worst
-
-
 @staff_member_required
 def monitoring_feed(request):
     """JSON consommé par la page monitoring : une page de fichiers + compteurs.
@@ -414,7 +369,26 @@ def monitoring_feed(request):
     if state_filter:
         base = base.filter(state=state_filter)
 
-    # Total des lignes correspondant au filtre, AVANT pagination (top-N).
+    # Compteurs par classe de monitoring (axe contrôles, read-model matérialisé),
+    # sur la vue courante AVANT le filtre par classe → pilotent les chips. `none` =
+    # aucun contrôle encore passé (control_class NULL).
+    per_control_class = {}
+    for row in (ReceivedFile.objects.filter(state__in=states)
+                .values('control_class').annotate(n=Count('id'))):
+        per_control_class[row['control_class'] or 'none'] = row['n']
+
+    # Filtre par classe de monitoring (chip cliquable). Valeurs valides = les 6
+    # classes + `none` (NULL). Toute autre valeur est ignorée (= pas de filtre).
+    valid_classes = set(Event.MonitoringClass.values)
+    control_filter = request.GET.get('control')
+    if control_filter == 'none':
+        base = base.filter(control_class__isnull=True)
+    elif control_filter in valid_classes:
+        base = base.filter(control_class=control_filter)
+    else:
+        control_filter = None
+
+    # Total des lignes correspondant au(x) filtre(s), AVANT pagination (top-N).
     matched_total = base.count()
 
     # Taille de page (?limit=), bornée pour protéger le payload et la DB.
@@ -439,23 +413,22 @@ def monitoring_feed(request):
     # Annotations pour le tri serveur des champs dérivés :
     #  - _filename : basename de s3_key (tout après le dernier '/'), insensible à la casse ;
     #  - _elapsed  : durée de transfert (ms) extraite du JSON `raw` et castée en nombre ;
-    #  - _stored_eff : horodatage « dernière colonne » en History (archive/suppression/stockage).
-    # Dernier événement d'admission par fichier (lecture seule) : surface le
-    # verdict courant (classe de monitoring + résultat + verdict) au board. Le
-    # « courant » = le plus récent (Subquery, pas de N+1).
-    latest_adm = (Event.objects
-                  .filter(file=OuterRef('pk'), stage=ADMISSION_STAGE,
-                          control='verdict')
-                  .order_by('-created_at', '-id'))
+    #  - _stored_eff : horodatage « dernière colonne » en History (archive/suppression/stockage) ;
+    #  - _ctrl_sev : sévérité de la classe de monitoring matérialisée (control_class),
+    #    pour trier la colonne « Contrôles » par GRAVITÉ et non alphabétiquement
+    #    (NULL/inconnu → -1, le moins sévère). Worst-wins déjà matérialisé en amont.
+    ctrl_sev = Case(
+        *[When(control_class=cls, then=Value(sev))
+          for cls, sev in MONITORING_SEVERITY.items()],
+        default=Value(-1), output_field=IntegerField(),
+    )
     base = base.annotate(
         _filename=Lower(Func(
             F('s3_key'), Value(r'^.*/'), Value(''),
             function='regexp_replace', output_field=CharField())),
         _elapsed=Cast(KeyTextTransform('elapsed', 'raw'), FloatField()),
         _stored_eff=Coalesce('archived_at', 'deleted_at', 'stored_at'),
-        _adm_class=Subquery(latest_adm.values('monitoring_class')[:1]),
-        _adm_result=Subquery(latest_adm.values('result')[:1]),
-        _adm_verdict=Subquery(latest_adm.values('detail__verdict')[:1]),
+        _ctrl_sev=ctrl_sev,
     )
 
     sort = request.GET.get('sort')
@@ -472,6 +445,8 @@ def monitoring_feed(request):
             'received_at': F('received_at'),
             # stored_at : effectif (archive/suppr/stockage) en History, brut en Live.
             'stored_at': F('_stored_eff') if view == 'history' else F('stored_at'),
+            # control : tri par sévérité de la classe (desc = le plus grave en tête).
+            'control': F('_ctrl_sev'),
         }[sort]
         primary = (source.desc(nulls_last=True) if direction == 'desc'
                    else source.asc(nulls_last=True))
@@ -492,15 +467,10 @@ def monitoring_feed(request):
         sort = None
         qs = list(base.order_by('-received_at', '-id')[offset:offset + limit])
 
-    # Rollup « worst-wins » de l'axe contrôles pour les seules lignes de la page
-    # (≤ limit). Générique sur tous les stages/contrôles — voir current_control_rollup.
-    rollup = current_control_rollup([rf.pk for rf in qs])
-
     def to_row(rf):
         name = posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)'
         # Durée de transfert : SFTPGo la fournit dans le payload (`elapsed`, ms).
         elapsed = rf.raw.get('elapsed') if isinstance(rf.raw, dict) else None
-        roll = rollup.get(rf.pk)   # rollup worst-wins de l'axe contrôles (ou None)
         return {
             'id': rf.pk,
             'state': rf.state,
@@ -516,17 +486,9 @@ def monitoring_feed(request):
             'deleted_at': rf.deleted_at.isoformat() if rf.deleted_at else None,
             'archived_at': rf.archived_at.isoformat() if rf.archived_at else None,
             'downloadable': rf.state == ReceivedFile.State.STORED,
-            # Verdict d'admission courant (lecture seule, surface au board).
-            'admission_class': getattr(rf, '_adm_class', None),
-            'admission_result': getattr(rf, '_adm_result', None),
-            'admission_verdict': getattr(rf, '_adm_verdict', None),
-            # Rollup « worst-wins » de l'axe contrôles (générique, tous stages) :
-            # classe la plus sévère parmi l'état courant des contrôles du fichier,
-            # + d'où elle vient (stage/contrôle) pour le libellé/tooltip du board.
-            'control_class': roll['monitoring_class'] if roll else None,
-            'control_stage': roll['stage'] if roll else None,
-            'control_name': roll['control'] if roll else None,
-            'control_result': roll['result'] if roll else None,
+            # Axe contrôles : classe « worst-wins » matérialisée (read-model). Badge
+            # générique du board ; le détail par contrôle est dans la modale (dbl-clic).
+            'control_class': rf.control_class,
             # Actions disponibles côté UI (gardées aussi côté serveur).
             'can_archive': rf.state == ReceivedFile.State.FAILED,
             'can_restore': rf.state == ReceivedFile.State.ARCHIVED,
@@ -543,10 +505,12 @@ def monitoring_feed(request):
         'view': view,
         'rows': [to_row(rf) for rf in qs],
         'per_state': per_state,
+        'per_control_class': per_control_class,
         'live_total': live_total,
         'history_total': history_total,
         # Écho de la requête de tri/filtre + cardinalités (pilote « affichés / total »).
         'state_filter': state_filter,
+        'control_filter': control_filter,
         'sort': sort,
         'dir': direction if sort else None,
         'limit': limit,

@@ -4,8 +4,9 @@ from .admission import (
     STAGE, VERDICT_ADMIS, VERDICT_QUARANTINE, VERDICT_RECYCLE, file_admission,
     latest_admission_event,
 )
-from .models import Event, Partner, ReceivedFile
-from .views import current_control_rollup
+from .models import (
+    Event, Partner, ReceivedFile, current_control_rollup, refresh_control_class,
+)
 
 
 def make_file(username='acme', s3_key='in/acme/file.csv', **kw):
@@ -177,3 +178,23 @@ class ControlRollupTests(TestCase):
 
         roll = current_control_rollup([rf.pk])[rf.pk]
         self.assertEqual(roll['monitoring_class'], Event.MonitoringClass.PUSH)
+
+    def test_admission_materialises_control_class(self):
+        # file_admission rematérialise ReceivedFile.control_class (read-model board).
+        Partner.objects.create(username='old', status=Partner.Status.REVOKED)
+        rf = make_file(username='old')
+        file_admission(rf.pk)
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.WARNING_ACTION)
+
+    def test_refresh_handles_bulk_and_null(self):
+        rf_none = make_file(s3_key='in/x/none.csv')        # aucun contrôle → NULL
+        Partner.objects.create(username='acme', status=Partner.Status.ACTIVE)
+        rf_admis = make_file(username='acme', s3_key='in/acme/a.csv')
+        file_admission(rf_admis.pk)
+
+        refresh_control_class([rf_none.pk, rf_admis.pk])   # idempotent
+        rf_none.refresh_from_db()
+        rf_admis.refresh_from_db()
+        self.assertIsNone(rf_none.control_class)
+        self.assertEqual(rf_admis.control_class, Event.MonitoringClass.PUSH)

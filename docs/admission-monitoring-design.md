@@ -156,11 +156,19 @@ Portée du renommage :
 
 ## 10. Plan par étapes (par valeur croissante de design / risque)
 
-1. **Désambiguïser « archive »** (renommage) — petite dette, à solder vite (§8).
-2. **Feed générique axe B** : exposer par fichier le rollup *worst-wins*
-   (`monitoring_class` + stage le plus sévère) au lieu du seul `verdict` admission.
-3. **Filtre par classe** sur le board fichier (chips) — **c'est la vue de triage
-   principale** (unité = fichier) ; règle le besoin immédiat (§6.2).
+1. ✅ **FAIT (commit `4393e87`)** — **Désambiguïser « archive »** : verdict
+   `archive` → `quarantine` (§8). Events réémis par rejeu.
+2. ✅ **FAIT (commit `24dcc29`)** — **Feed générique axe B** : `current_control_rollup`
+   expose par fichier le rollup *worst-wins* (`control_class` + stage/contrôle
+   d'origine), générique sur tous les contrôles. Surface le `warning_action`
+   enterré. *UI board encore câblée sur le verdict (basculée à l'étape 3).*
+3. ✅ **FAIT (commit à venir)** — colonne générique **« Contrôles »** (`control_class`,
+   badge par classe, **tri par sévérité**) + **chips de filtre par classe** côté
+   serveur (`?control=`, comptes `per_control_class`). Read-model **matérialisé** :
+   champ `ReceivedFile.control_class` (worst-wins), rafraîchi par
+   `refresh_control_class()` à chaque passage d'admission → filtre/tri/agrégation en
+   SQL indexé sur TOUTE la table (pas de recalcul par poll). Contrat : tout futur
+   émetteur de contrôle (DORA…) doit appeler `refresh_control_class` après émission.
 4. **Vue agrégée par cause** (§7) — **complément** (insight/signaux), second niveau.
 5. **(Optionnel, plus tard)** modèle de **triage** mutable (statut traité/en
    attente + propriétaire) si on veut un workflow ops, en read-model séparé (§9.2).
