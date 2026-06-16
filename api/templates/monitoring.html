@@ -61,6 +61,8 @@
     .tr-in_progress { background:#1e3a8a; color:#bfdbfe; }
     .tr-resolved    { background:#14532d; color:#bbf7d0; }
     .tr-owner { color:var(--mut); font-size:.74rem; margin-left:.3rem; }
+    .chk { font-size:.8rem; color:var(--mut); display:flex; align-items:center;
+           gap:.3rem; cursor:pointer; user-select:none; }
     button.act, button.tri-act { padding:.2rem .55rem; font-size:.76rem; }
     a.dl { color:#7dd3fc; text-decoration:none; }
     a.dl:hover { text-decoration:underline; }
@@ -118,6 +120,7 @@
       <span><span class="dot" id="dot"></span> <span id="status"></span></span>
       <span id="count"></span>
       <span id="updated"></span>
+      <label class="chk"><input type="checkbox" id="hide-handled"> <span id="t-hide-handled"></span></label>
       <button id="btn-causes"></button>
       <button id="toggle"></button>
       <select id="lang" aria-label="Language">
@@ -187,6 +190,7 @@
         tr_open: 'Open', tr_in_progress: 'In progress', tr_resolved: 'Resolved',
         tr_claim: 'Claim', tr_resolve: 'Resolve', tr_reopen: 'Reopen',
         tr_mark: '✓ Handle', tr_unmark: '↩ Reopen', tr_handled: '✓ handled',
+        hide_handled: 'Hide handled',
         // libellés de la modale détail (support)
         adm_title: 'Admission checks', adm_no_events: 'No admission event for this file yet.',
         adm_c_control: 'Control', adm_c_result: 'Result', adm_c_class: 'Class',
@@ -228,6 +232,7 @@
         tr_open: 'Ouvert', tr_in_progress: 'En cours', tr_resolved: 'Résolu',
         tr_claim: 'Prendre', tr_resolve: 'Résoudre', tr_reopen: 'Rouvrir',
         tr_mark: '✓ Traiter', tr_unmark: '↩ Rouvrir', tr_handled: '✓ traité',
+        hide_handled: 'Masquer traités',
         adm_title: 'Contrôles d’admission', adm_no_events: 'Aucun événement d’admission pour ce fichier.',
         adm_c_control: 'Contrôle', adm_c_result: 'Résultat', adm_c_class: 'Classe',
         adm_c_detail: 'Détail', adm_c_time: 'Heure',
@@ -267,6 +272,7 @@
         tr_open: 'Aperto', tr_in_progress: 'In corso', tr_resolved: 'Risolto',
         tr_claim: 'Prendi', tr_resolve: 'Risolvi', tr_reopen: 'Riapri',
         tr_mark: '✓ Gestisci', tr_unmark: '↩ Riapri', tr_handled: '✓ gestito',
+        hide_handled: 'Nascondi gestiti',
         adm_title: 'Controlli di ammissione', adm_no_events: 'Nessun evento di ammissione per questo file.',
         adm_c_control: 'Controllo', adm_c_result: 'Esito', adm_c_class: 'Classe',
         adm_c_detail: 'Dettaglio', adm_c_time: 'Ora',
@@ -300,6 +306,7 @@
     let sortDir = 1;                   // 1 = asc, -1 = desc
     let stateFilter = null;            // null = tous ; sinon un état (r.state) à isoler
     let controlFilter = null;          // null = toutes ; sinon une classe de monitoring
+    let hideHandled = localStorage.getItem('monitoring_hide_handled') !== '0';  // défaut: masquer
     let offset = 0;                    // décalage de pagination (0 = première page)
 
     // Colonnes triables : id du <th>, clé de tri (champ de la ligne), clé i18n du libellé.
@@ -394,6 +401,8 @@
       });
       updateSortIndicators();
       $('btn-causes').textContent = t('causes_btn');
+      $('t-hide-handled').textContent = t('hide_handled');
+      $('hide-handled').checked = hideHandled;
       $('toggle').textContent = paused ? t('btn_resume') : t('btn_pause');
       $('lang').value = lang;
       $('status').textContent = lastUpdate ? statusText() : t('st_starting');
@@ -560,6 +569,7 @@
       const p = new URLSearchParams({ view });
       if (stateFilter) p.set('state', stateFilter);
       if (controlFilter) p.set('control', controlFilter);
+      if (!hideHandled) p.set('show_handled', '1');   // défaut serveur = masquer
       if (sortKey) { p.set('sort', sortKey); p.set('dir', sortDir === 1 ? 'asc' : 'desc'); }
       if (offset) p.set('offset', offset);
       return '/monitoring/feed/?' + p.toString();
@@ -656,6 +666,13 @@
       $('status').textContent = statusText();
       schedule();
       if (!paused) poll();
+    });
+
+    $('hide-handled').addEventListener('change', (e) => {
+      hideHandled = e.target.checked;
+      localStorage.setItem('monitoring_hide_handled', hideHandled ? '1' : '0');
+      offset = 0;                              // le total change → retour page 1
+      poll();
     });
 
     $('lang').addEventListener('change', (e) => {

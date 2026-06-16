@@ -183,6 +183,8 @@ Portée du renommage :
    `resolved` ; l'override fichier prime. `files_open` = fichiers à traiter après
    réconciliation (un fichier reste ouvert tant qu'**une** de ses causes non résolues
    le couvre). UI : workflow dans la modale Causes + action par ligne sur le board.
+   **Fichiers traités masqués par défaut** sur le board (toggle « Masquer traités » /
+   `?show_handled=1`) → le board ne montre que ce qui reste à faire.
 
 ## 11. Questions ouvertes à trancher
 

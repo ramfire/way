@@ -391,6 +391,13 @@ def monitoring_feed(request):
     else:
         control_filter = None
 
+    # Triage (étape 5) : par défaut on MASQUE les fichiers marqués « traités »
+    # (override fichier `resolved`) → le board ne montre que ce qui reste à faire.
+    # `?show_handled=1` les réaffiche (toggle UI).
+    show_handled = request.GET.get('show_handled') == '1'
+    if not show_handled:
+        base = base.exclude(triage__status=FileTriage.Status.RESOLVED)
+
     # Total des lignes correspondant au(x) filtre(s), AVANT pagination (top-N).
     matched_total = base.count()
 
@@ -522,6 +529,7 @@ def monitoring_feed(request):
         # Écho de la requête de tri/filtre + cardinalités (pilote « affichés / total »).
         'state_filter': state_filter,
         'control_filter': control_filter,
+        'show_handled': show_handled,
         'sort': sort,
         'dir': direction if sort else None,
         'limit': limit,

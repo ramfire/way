@@ -264,6 +264,19 @@ class TriageTests(TestCase):
         self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'reopen'})
         self.assertEqual(self._causes()['partner_status']['file_resolved_count'], 0)
 
+    def test_resolved_file_excluded_from_default_view(self):
+        # Reproduit l'exclusion appliquée par monitoring_feed (le feed lui-même
+        # n'est pas testable sur SQLite : il utilise regexp_replace de PostgreSQL).
+        from api.models import FileTriage
+        default = lambda: set(ReceivedFile.objects
+                              .exclude(triage__status=FileTriage.Status.RESOLVED)
+                              .values_list('id', flat=True))
+        self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'resolve'})
+        self.assertNotIn(self.files[0].pk, default())   # masqué (resolved)
+        self.assertIn(self.files[1].pk, default())      # les autres restent
+        self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'reopen'})
+        self.assertIn(self.files[0].pk, default())      # réapparaît après reopen
+
     def test_files_open_drops_when_all_covering_causes_resolved(self):
         self.assertEqual(self.client.get('/monitoring/causes/').json()['files_open'], 3)
         for sig in (self._WARN, {'stage': 'admission', 'control': 'verdict',
