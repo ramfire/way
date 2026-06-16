@@ -283,3 +283,43 @@ class TriageTests(TestCase):
                                  'monitoring_class': 'reject', 'reason': 'partner_revoked'}):
             self.client.post('/monitoring/triage/cause/', {**sig, 'action': 'resolve'})
         self.assertEqual(self.client.get('/monitoring/causes/').json()['files_open'], 0)
+
+
+class ReplayAdmissionEndpointTests(TestCase):
+    """Bouton « Rejouer l'admission » de la modale (déclencheur du recycle)."""
+
+    def setUp(self):
+        self.staff = get_user_model().objects.create_user('staff', is_staff=True)
+
+    def test_replay_admits_after_enrolment(self):
+        # recycle (partenaire non mappé) → enrôlement → rejeu via l'endpoint → admis.
+        rf = make_file(username='newcomer')
+        self.assertEqual(file_admission(rf.pk), VERDICT_RECYCLE)
+        Partner.objects.create(username='newcomer', status=Partner.Status.ACTIVE)
+
+        self.client.force_login(self.staff)
+        r = self.client.post(f'/monitoring/admission/{rf.pk}/replay/')
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body['ok'])
+        self.assertEqual(body['verdict'], VERDICT_ADMIS)
+        # Verdict courant admis ; board (control_class) rematérialisé en push.
+        self.assertEqual(latest_admission_event(rf).detail['verdict'], VERDICT_ADMIS)
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
+        # Audit append-only : les deux verdicts conservés.
+        self.assertEqual(verdict_events(rf).count(), 2)
+
+    def test_replay_requires_staff(self):
+        rf = make_file(username='ghost')
+        # Anonyme : redirigé vers le login admin (pas de rejeu).
+        r = self.client.post(f'/monitoring/admission/{rf.pk}/replay/')
+        self.assertIn(r.status_code, (302, 403))
+        self.assertFalse(Event.objects.filter(file=rf).exists())
+
+    def test_replay_rejects_get(self):
+        # Action mutante : POST only (require_POST).
+        rf = make_file(username='ghost')
+        self.client.force_login(self.staff)
+        self.assertEqual(
+            self.client.get(f'/monitoring/admission/{rf.pk}/replay/').status_code, 405)

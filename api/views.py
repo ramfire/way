@@ -716,20 +716,14 @@ def triage_file(request, pk):
     return JsonResponse({'detail': 'action invalide'}, status=400)
 
 
-@staff_member_required
-def admission_detail(request, pk):
-    """Détail des contrôles d'admission d'un fichier (pour le support).
-
-    Lecture seule, gardée par la session staff. Renvoie TOUS les événements de
-    stage ``admission`` du fichier (chaque contrôle + le verdict), du plus ancien
-    au plus récent — c'est exactement la trace que le support déroule au
-    double-clic sur une ligne du board. N'altère rien (events append-only).
-    """
-    rf = get_object_or_404(ReceivedFile, pk=pk)
+def _admission_payload(rf):
+    """Trace d'admission d'un fichier : tous les événements de stage ``admission``
+    (chaque contrôle + le verdict), du plus ancien au plus récent. Forme partagée
+    par ``admission_detail`` (lecture) et ``replay_admission`` (rejeu)."""
     events = (Event.objects
               .filter(file=rf, stage=ADMISSION_STAGE)
               .order_by('created_at', 'id'))
-    return JsonResponse({
+    return {
         'id': rf.pk,
         'filename': posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)',
         'username': rf.username,
@@ -741,4 +735,45 @@ def admission_detail(request, pk):
             'detail': e.detail if isinstance(e.detail, dict) else {},
             'created_at': e.created_at.isoformat() if e.created_at else None,
         } for e in events],
-    })
+    }
+
+
+@staff_member_required
+def admission_detail(request, pk):
+    """Détail des contrôles d'admission d'un fichier (pour le support).
+
+    Lecture seule, gardée par la session staff. Renvoie TOUS les événements de
+    stage ``admission`` du fichier (chaque contrôle + le verdict), du plus ancien
+    au plus récent — c'est exactement la trace que le support déroule au
+    double-clic sur une ligne du board. N'altère rien (events append-only).
+    """
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    return JsonResponse(_admission_payload(rf))
+
+
+@require_POST
+@staff_member_required
+def replay_admission(request, pk):
+    """Action UI : **rejouer** l'admission d'un fichier (le mécanisme « recycle »).
+
+    Après enrôlement d'un partenaire / autorisation d'un canal au référentiel,
+    l'opérateur rejoue l'admission depuis la modale ; ``file_admission`` réémet un
+    verdict (append-only) et rematérialise le rollup du board. Idempotent et sans
+    effet sur ``ReceivedFile.state`` (cf. api/admission.py). Renvoie le détail
+    d'admission rafraîchi (forme de ``admission_detail``) + le verdict obtenu, pour
+    ré-afficher la modale et laisser le board repoller.
+    """
+    from .admission import file_admission
+
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    verdict = file_admission(rf.pk)
+    if verdict is None:
+        # file_admission avale ses exceptions et renvoie None ; voir django.log.
+        return JsonResponse({'detail': 'rejeu impossible (voir les logs)'}, status=502)
+    logger.info('Replay admission ReceivedFile %s (%s) -> %s par %s',
+                pk, rf.s3_key, verdict, request.user)
+    rf.refresh_from_db()
+    payload = _admission_payload(rf)
+    payload['ok'] = True
+    payload['verdict'] = verdict
+    return JsonResponse(payload)

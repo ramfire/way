@@ -196,6 +196,8 @@
         adm_c_control: 'Control', adm_c_result: 'Result', adm_c_class: 'Class',
         adm_c_detail: 'Detail', adm_c_time: 'Time',
         adm_r_passed: 'passed', adm_r_failed: 'failed',
+        adm_replay: '↻ Replay admission', adm_replaying: 'Replaying…',
+        adm_replayed: 'Replayed → {v}',
         ctrl_partner_recognised: 'Partner recognised', ctrl_partner_status: 'Partner status',
         ctrl_channel_authorised: 'Channel authorised', ctrl_verdict: 'Verdict',
         st_starting: 'starting…', st_live: 'live ({s}s)', st_paused: 'paused',
@@ -237,6 +239,8 @@
         adm_c_control: 'Contrôle', adm_c_result: 'Résultat', adm_c_class: 'Classe',
         adm_c_detail: 'Détail', adm_c_time: 'Heure',
         adm_r_passed: 'réussi', adm_r_failed: 'échoué',
+        adm_replay: '↻ Rejouer l’admission', adm_replaying: 'Rejeu…',
+        adm_replayed: 'Rejoué → {v}',
         ctrl_partner_recognised: 'Partenaire reconnu', ctrl_partner_status: 'Statut partenaire',
         ctrl_channel_authorised: 'Canal autorisé', ctrl_verdict: 'Verdict',
         st_starting: 'démarrage…', st_live: 'live ({s}s)', st_paused: 'en pause',
@@ -277,6 +281,8 @@
         adm_c_control: 'Controllo', adm_c_result: 'Esito', adm_c_class: 'Classe',
         adm_c_detail: 'Dettaglio', adm_c_time: 'Ora',
         adm_r_passed: 'riuscito', adm_r_failed: 'fallito',
+        adm_replay: '↻ Rigioca ammissione', adm_replaying: 'In corso…',
+        adm_replayed: 'Rigiocata → {v}',
         ctrl_partner_recognised: 'Partner riconosciuto', ctrl_partner_status: 'Stato partner',
         ctrl_channel_authorised: 'Canale autorizzato', ctrl_verdict: 'Verdetto',
         st_starting: 'avvio…', st_live: 'live ({s}s)', st_paused: 'in pausa',
@@ -756,9 +762,13 @@
       $('modal-title').textContent = t('adm_title');
       $('modal-sub').textContent = (data.filename || '') +
         (data.username ? ' — ' + data.username : '');
+      // Bouton « Rejouer l'admission » (mécanisme recycle) : après enrôlement du
+      // partenaire / canal, l'opérateur relance file_admission depuis ici.
+      const replay = `<div style="margin-bottom:.6rem">`
+        + `<button class="act" id="adm-replay" data-id="${esc(String(data.id))}">${esc(t('adm_replay'))}</button></div>`;
       const ev = data.events || [];
       if (!ev.length) {
-        $('modal-body').innerHTML = `<div class="empty">${esc(t('adm_no_events'))}</div>`;
+        $('modal-body').innerHTML = replay + `<div class="empty">${esc(t('adm_no_events'))}</div>`;
         return;
       }
       const rows = ev.map(e => `
@@ -769,11 +779,39 @@
           <td class="det">${esc(admDetailText(e.detail))}</td>
           <td>${esc(fmtTime(e.created_at))}</td>
         </tr>`).join('');
-      $('modal-body').innerHTML = `<table><thead><tr>
+      $('modal-body').innerHTML = replay + `<table><thead><tr>
           <th>${esc(t('adm_c_control'))}</th><th>${esc(t('adm_c_result'))}</th>
           <th>${esc(t('adm_c_class'))}</th><th>${esc(t('adm_c_detail'))}</th>
           <th>${esc(t('adm_c_time'))}</th>
         </tr></thead><tbody>${rows}</tbody></table>`;
+    }
+    // Rejeu de l'admission depuis la modale (POST). Réémet un verdict (append-only,
+    // idempotent, n'altère pas `state`), ré-affiche les contrôles à jour et fait
+    // repoller le board (le fichier quitte « recycle » s'il est désormais admis).
+    async function replayAdmission(id) {
+      const btn = $('adm-replay');
+      if (btn) { btn.disabled = true; btn.textContent = t('adm_replaying'); }
+      try {
+        const res = await fetch(`/monitoring/admission/${id}/replay/`, {
+          method: 'POST',
+          headers: { 'X-CSRFToken': getCookie('csrftoken') },
+          credentials: 'same-origin',
+        });
+        if (res.redirected || res.status === 403 || res.status === 302) throw new Error(t('err_session'));
+        if (!res.ok) {
+          let msg = 'HTTP ' + res.status;
+          try { const j = await res.json(); if (j.detail) msg = j.detail; } catch (_) {}
+          throw new Error(msg);
+        }
+        const data = await res.json();
+        renderAdmission(data);   // re-render avec le nouveau verdict en tête
+        $('modal-body').insertAdjacentHTML('afterbegin',
+          `<div class="empty">${esc(t('adm_replayed').replace('{v}', data.verdict))}</div>`);
+        poll();                  // rafraîchit le board (worst-wins rematérialisé)
+      } catch (e) {
+        $('modal-body').insertAdjacentHTML('afterbegin', `<div class="empty">⚠ ${esc(e.message)}</div>`);
+        const b = $('adm-replay'); if (b) { b.disabled = false; b.textContent = t('adm_replay'); }
+      }
     }
     async function openAdmission(id) {
       $('modal-title').textContent = t('adm_title');
@@ -796,6 +834,11 @@
     $('rows').addEventListener('dblclick', (e) => {
       const tr = e.target.closest('tr[data-id]');
       if (tr) openAdmission(tr.dataset.id);
+    });
+    // Délégation : modal-body est re-rendu via innerHTML (le bouton est recréé).
+    $('modal-body').addEventListener('click', (e) => {
+      const rb = e.target.closest('#adm-replay');
+      if (rb) replayAdmission(rb.dataset.id);
     });
     $('modal-close').addEventListener('click', closeModal);
     $('modal-bg').addEventListener('click', (e) => {   // clic hors carte = fermeture
