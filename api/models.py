@@ -141,3 +141,18 @@ class Event(models.Model):
 
     def __str__(self):
         return f'{self.stage}/{self.control}={self.result} (file {self.file_id})'
+
+
+# Sévérité des classes de monitoring pour le rollup « worst-wins » du board (un
+# seul signal par fichier, toutes étapes/contrôles confondus). Board orienté
+# ACTION : l'actionnable (`recycle`) prime sur le terminal (`reject`).
+# Décision design 2026-06-16 — docs/admission-monitoring-design.md §5.
+# Plus le nombre est grand, plus c'est sévère (remonte en tête).
+MONITORING_SEVERITY = {
+    Event.MonitoringClass.BLOCKING: 50,
+    Event.MonitoringClass.WARNING_ACTION: 40,
+    Event.MonitoringClass.RECYCLE: 30,
+    Event.MonitoringClass.REJECT: 20,
+    Event.MonitoringClass.WARNING_NOACTION: 10,
+    Event.MonitoringClass.PUSH: 0,
+}

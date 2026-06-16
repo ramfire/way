@@ -5,6 +5,7 @@ from .admission import (
     latest_admission_event,
 )
 from .models import Event, Partner, ReceivedFile
+from .views import current_control_rollup
 
 
 def make_file(username='acme', s3_key='in/acme/file.csv', **kw):
@@ -135,3 +136,44 @@ class AdmissionNeverRaisesTests(TestCase):
     def test_unknown_file_id_returns_none_not_raises(self):
         # ReceivedFile.DoesNotExist doit être avalé : jamais propagé à l'appelant.
         self.assertIsNone(file_admission(999999))
+
+
+class ControlRollupTests(TestCase):
+    """Rollup « worst-wins » générique de l'axe contrôles (board, étape 2)."""
+
+    def test_empty_for_file_without_events(self):
+        rf = make_file()
+        self.assertNotIn(rf.pk, current_control_rollup([rf.pk]))
+
+    def test_admis_rolls_up_to_push(self):
+        Partner.objects.create(username='acme', status=Partner.Status.ACTIVE)
+        rf = make_file(username='acme')
+        file_admission(rf.pk)
+
+        roll = current_control_rollup([rf.pk])[rf.pk]
+        self.assertEqual(roll['monitoring_class'], Event.MonitoringClass.PUSH)
+
+    def test_quarantine_surfaces_warning_action_over_reject(self):
+        # Un fichier quarantine porte un verdict `reject` ET un `warning_action`
+        # (révoqué qui émet). Le worst-wins doit remonter le warning_action (plus
+        # sévère / actionnable), PAS le verdict reject — c'est le signal à surfacer.
+        Partner.objects.create(username='old', status=Partner.Status.REVOKED)
+        rf = make_file(username='old')
+        result = file_admission(rf.pk)
+        self.assertEqual(result, VERDICT_QUARANTINE)
+
+        roll = current_control_rollup([rf.pk])[rf.pk]
+        self.assertEqual(roll['monitoring_class'],
+                         Event.MonitoringClass.WARNING_ACTION)
+        self.assertEqual(roll['control'], 'partner_status')
+
+    def test_uses_current_state_after_rerun_not_stale(self):
+        # recycle puis (enrôlement) admis : le rollup reflète l'état COURANT (push),
+        # pas l'ancien recycle resté dans le journal append-only.
+        rf = make_file(username='newcomer')
+        file_admission(rf.pk)                       # recycle
+        Partner.objects.create(username='newcomer', status=Partner.Status.ACTIVE)
+        file_admission(rf.pk)                       # admis
+
+        roll = current_control_rollup([rf.pk])[rf.pk]
+        self.assertEqual(roll['monitoring_class'], Event.MonitoringClass.PUSH)

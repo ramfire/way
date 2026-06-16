@@ -18,7 +18,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 
 from .admission import STAGE as ADMISSION_STAGE
-from .models import Event, ReceivedFile
+from .models import MONITORING_SEVERITY, Event, ReceivedFile
 from .s3 import PRESIGN_DEFAULT_EXPIRY, presigned_get_url
 
 logger = logging.getLogger(__name__)
@@ -343,6 +343,51 @@ def restore_received_file(request, pk):
     return JsonResponse({'ok': True, 'id': pk, 'state': rf.state})
 
 
+def current_control_rollup(file_ids):
+    """Rollup « worst-wins » de l'axe contrôles, par fichier (générique).
+
+    Pour chaque fichier : on prend l'état **courant** de chacun de ses contrôles
+    (= dernier ``Event`` par couple ``(stage, control)`` — append-only/rejouable),
+    puis on retient la **classe de monitoring la plus sévère** parmi eux
+    (``MONITORING_SEVERITY``, board orienté action). Un seul signal par fichier,
+    **toutes étapes/contrôles confondus** : admission aujourd'hui, contrôles DORA
+    demain, sans retoucher le board (on ne câble aucun nom de contrôle/stage ici).
+
+    NB important : le worst-wins porte sur **tous** les contrôles, pas sur le seul
+    ``verdict`` — c'est ce qui fait **remonter** un signal comme le
+    ``warning_action`` « partenaire révoqué qui émet » (plus sévère que le verdict
+    ``reject``), au lieu de l'enterrer (cf. design §5/§7).
+
+    Renvoie ``{file_id: {'monitoring_class', 'stage', 'control', 'result'}}`` ;
+    un fichier sans aucun événement est simplement absent du mapping.
+    """
+    if not file_ids:
+        return {}
+    # Derniers d'abord : la 1re ligne vue pour un (file, stage, control) est l'actuelle.
+    events = (Event.objects
+              .filter(file_id__in=file_ids)
+              .order_by('file_id', 'stage', 'control', '-created_at', '-id')
+              .values('file_id', 'stage', 'control', 'monitoring_class', 'result'))
+    current = {}   # (file, stage, control) -> event courant
+    for e in events:
+        key = (e['file_id'], e['stage'], e['control'])
+        if key not in current:
+            current[key] = e
+    worst = {}
+    for (fid, _stage, _control), e in current.items():
+        sev = MONITORING_SEVERITY.get(e['monitoring_class'], -1)
+        best = worst.get(fid)
+        if best is None or sev > best['_severity']:
+            worst[fid] = {
+                '_severity': sev,
+                'monitoring_class': e['monitoring_class'],
+                'stage': e['stage'],
+                'control': e['control'],
+                'result': e['result'],
+            }
+    return worst
+
+
 @staff_member_required
 def monitoring_feed(request):
     """JSON consommé par la page monitoring : une page de fichiers + compteurs.
@@ -447,10 +492,15 @@ def monitoring_feed(request):
         sort = None
         qs = list(base.order_by('-received_at', '-id')[offset:offset + limit])
 
+    # Rollup « worst-wins » de l'axe contrôles pour les seules lignes de la page
+    # (≤ limit). Générique sur tous les stages/contrôles — voir current_control_rollup.
+    rollup = current_control_rollup([rf.pk for rf in qs])
+
     def to_row(rf):
         name = posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)'
         # Durée de transfert : SFTPGo la fournit dans le payload (`elapsed`, ms).
         elapsed = rf.raw.get('elapsed') if isinstance(rf.raw, dict) else None
+        roll = rollup.get(rf.pk)   # rollup worst-wins de l'axe contrôles (ou None)
         return {
             'id': rf.pk,
             'state': rf.state,
@@ -470,6 +520,13 @@ def monitoring_feed(request):
             'admission_class': getattr(rf, '_adm_class', None),
             'admission_result': getattr(rf, '_adm_result', None),
             'admission_verdict': getattr(rf, '_adm_verdict', None),
+            # Rollup « worst-wins » de l'axe contrôles (générique, tous stages) :
+            # classe la plus sévère parmi l'état courant des contrôles du fichier,
+            # + d'où elle vient (stage/contrôle) pour le libellé/tooltip du board.
+            'control_class': roll['monitoring_class'] if roll else None,
+            'control_stage': roll['stage'] if roll else None,
+            'control_name': roll['control'] if roll else None,
+            'control_result': roll['result'] if roll else None,
             # Actions disponibles côté UI (gardées aussi côté serveur).
             'can_archive': rf.state == ReceivedFile.State.FAILED,
             'can_restore': rf.state == ReceivedFile.State.ARCHIVED,
