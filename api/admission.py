@@ -31,9 +31,12 @@ CTRL_CHANNEL_AUTHORISED = 'channel_authorised'
 CTRL_VERDICT = 'verdict'
 
 # Verdicts (posés dans detail['verdict'] de l'événement final).
+# NB: `quarantine` = flux non reconnu, gardé pour audit, NON retraité. Distinct de
+# l'état de stockage `ReceivedFile.State.ARCHIVED` (axe stockage, bouton manuel) —
+# voir docs/admission-monitoring-design.md §8 (collision « archive » levée).
 VERDICT_ADMIS = 'admis'
 VERDICT_RECYCLE = 'recycle'
-VERDICT_ARCHIVE = 'archive'
+VERDICT_QUARANTINE = 'quarantine'
 
 # Version du référentiel/règles au moment de la décision (traçabilité).
 REFERENTIAL_VERSION = 1
@@ -112,20 +115,20 @@ def _recycle(rf, reason, extra=None):
     return VERDICT_RECYCLE
 
 
-def _archive(rf, reason, extra=None):
-    """Verdict **archive** : conservé pour audit, **non retraité**.
+def _quarantine(rf, reason, extra=None):
+    """Verdict **quarantine** : conservé pour audit, **non retraité**.
 
     On ne supprime JAMAIS l'objet S3 ; ``state`` reste inchangé (stored).
     """
-    detail = _ref({'verdict': VERDICT_ARCHIVE, 'reason': reason,
+    detail = _ref({'verdict': VERDICT_QUARANTINE, 'reason': reason,
                    'username': rf.username})
     if extra:
         detail.update(extra)
     _emit(rf, CTRL_VERDICT, Event.Result.FAILED,
           Event.MonitoringClass.REJECT, detail=detail)
-    logger.info('Admission ARCHIVE file=%s user=%s reason=%s',
+    logger.info('Admission QUARANTINE file=%s user=%s reason=%s',
                 rf.pk, rf.username, reason)
-    return VERDICT_ARCHIVE
+    return VERDICT_QUARANTINE
 
 
 def _run(file_id):
@@ -149,14 +152,14 @@ def _run(file_id):
     if partner.status == Partner.Status.REVOKED:
         # Partenaire révoqué qui émet encore → la suspension SFTP n'est pas
         # effective (ou les creds n'ont jamais été coupés). AlfaWay ne suspend
-        # rien lui-même : on **alerte** (action ops requise) puis on archive.
+        # rien lui-même : on **alerte** (action ops requise) puis on met en quarantaine.
         _emit(rf, CTRL_PARTNER_STATUS, Event.Result.FAILED,
               Event.MonitoringClass.WARNING_ACTION,
               detail=_ref({'reason': 'revoked_partner_still_emitting',
                            'partner_status': partner.status,
                            'username': username}))
-        return _archive(rf, 'partner_revoked',
-                        extra={'partner_status': partner.status})
+        return _quarantine(rf, 'partner_revoked',
+                           extra={'partner_status': partner.status})
     _emit(rf, CTRL_PARTNER_STATUS, Event.Result.PASSED,
           Event.MonitoringClass.PUSH,
           detail=_ref({'partner_status': partner.status}))
@@ -181,7 +184,7 @@ def file_admission(file_id):
     **Indépendante** (id seul), **rejouable** (aucun court-circuit sur l'existence
     d'événements : re-jouer est précisément le mécanisme « recycle »), et **ne lève
     jamais** vers l'appelant (garde englobante : on log et on avale). Renvoie le
-    verdict (``admis`` / ``recycle`` / ``archive``) ou ``None`` en cas d'erreur.
+    verdict (``admis`` / ``recycle`` / ``quarantine``) ou ``None`` en cas d'erreur.
     """
     try:
         return _run(file_id)

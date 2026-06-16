@@ -1,7 +1,7 @@
 from django.test import TestCase, override_settings
 
 from .admission import (
-    STAGE, VERDICT_ADMIS, VERDICT_ARCHIVE, VERDICT_RECYCLE, file_admission,
+    STAGE, VERDICT_ADMIS, VERDICT_QUARANTINE, VERDICT_RECYCLE, file_admission,
     latest_admission_event,
 )
 from .models import Event, Partner, ReceivedFile
@@ -53,13 +53,13 @@ class AdmissionVerdictTests(TestCase):
         rf.refresh_from_db()
         self.assertEqual(rf.state, ReceivedFile.State.STORED)
 
-    def test_archive_and_warning_when_revoked(self):
+    def test_quarantine_and_warning_when_revoked(self):
         Partner.objects.create(username='old', status=Partner.Status.REVOKED)
         rf = make_file(username='old')
 
         result = file_admission(rf.pk)
 
-        self.assertEqual(result, VERDICT_ARCHIVE)
+        self.assertEqual(result, VERDICT_QUARANTINE)
         ev = latest_admission_event(rf)
         self.assertEqual(ev.result, Event.Result.FAILED)
         self.assertEqual(ev.monitoring_class, Event.MonitoringClass.REJECT)

@@ -41,11 +41,12 @@
     .deleted   { background:#374151; color:#d1d5db; }
     .missing   { background:#78350f; color:#fed7aa; }
     .archived  { background:#312e81; color:#c7d2fe; }
-    /* Verdicts d'admission : vert (admis) / orange (recycle) / rouge (archive). */
-    .adm-admis   { background:#14532d; color:#bbf7d0; }
-    .adm-recycle { background:#78350f; color:#fed7aa; }
-    .adm-archive { background:#7f1d1d; color:#fecaca; }
-    .adm-none    { color:var(--mut); }
+    /* Verdicts d'admission : vert (admis) / orange (recycle) / rouge (quarantine).
+       NB: distinct de .archived (axe stockage) — voir design §8. */
+    .adm-admis      { background:#14532d; color:#bbf7d0; }
+    .adm-recycle    { background:#78350f; color:#fed7aa; }
+    .adm-quarantine { background:#7f1d1d; color:#fecaca; }
+    .adm-none       { color:var(--mut); }
     button.act { padding:.2rem .55rem; font-size:.76rem; }
     a.dl { color:#7dd3fc; text-decoration:none; }
     a.dl:hover { text-decoration:underline; }
@@ -158,7 +159,7 @@
         th_ip: 'IP', th_size: 'Size', th_transfer: 'Transfer', th_received: 'Received',
         th_stored: 'Stored', th_archived: 'Archived', th_admission: 'Admission',
         // verdicts d'admission + libellés de la modale détail (support)
-        adm_admis: 'Admitted', adm_recycle: 'Recycle', adm_archive: 'Archived', adm_none: 'pending',
+        adm_admis: 'Admitted', adm_recycle: 'Recycle', adm_quarantine: 'Quarantine', adm_none: 'pending',
         adm_title: 'Admission checks', adm_no_events: 'No admission event for this file yet.',
         adm_c_control: 'Control', adm_c_result: 'Result', adm_c_class: 'Class',
         adm_c_detail: 'Detail', adm_c_time: 'Time',
@@ -189,7 +190,7 @@
         th_state: 'État', th_file: 'Fichier', th_user: 'Utilisateur', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Taille', th_transfer: 'Transfert', th_received: 'Reçu',
         th_stored: 'Stocké', th_archived: 'Archivé', th_admission: 'Admission',
-        adm_admis: 'Admis', adm_recycle: 'Recyclage', adm_archive: 'Archivé', adm_none: 'en attente',
+        adm_admis: 'Admis', adm_recycle: 'Recyclage', adm_quarantine: 'Quarantaine', adm_none: 'en attente',
         adm_title: 'Contrôles d’admission', adm_no_events: 'Aucun événement d’admission pour ce fichier.',
         adm_c_control: 'Contrôle', adm_c_result: 'Résultat', adm_c_class: 'Classe',
         adm_c_detail: 'Détail', adm_c_time: 'Heure',
@@ -219,7 +220,7 @@
         th_state: 'Stato', th_file: 'File', th_user: 'Utente', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Dimensione', th_transfer: 'Trasferimento', th_received: 'Ricevuto',
         th_stored: 'Archiviato', th_archived: 'Archiviato il', th_admission: 'Ammissione',
-        adm_admis: 'Ammesso', adm_recycle: 'Riciclo', adm_archive: 'Archiviato', adm_none: 'in attesa',
+        adm_admis: 'Ammesso', adm_recycle: 'Riciclo', adm_quarantine: 'Quarantena', adm_none: 'in attesa',
         adm_title: 'Controlli di ammissione', adm_no_events: 'Nessun evento di ammissione per questo file.',
         adm_c_control: 'Controllo', adm_c_result: 'Esito', adm_c_class: 'Classe',
         adm_c_detail: 'Dettaglio', adm_c_time: 'Ora',
@@ -377,7 +378,7 @@
       }
     }
 
-    // Badge du verdict d'admission courant (admis/recycle/archive), ou « en attente »
+    // Badge du verdict d'admission courant (admis/recycle/quarantine), ou « en attente »
     // si aucun verdict n'a encore été posé. Détail complet au double-clic (modale).
     function admBadge(r) {
       const v = r.admission_verdict;
