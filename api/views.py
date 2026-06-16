@@ -372,11 +372,24 @@ def monitoring_feed(request):
     if state_filter:
         base = base.filter(state=state_filter)
 
+    # Triage (étape 5) : par défaut on MASQUE les fichiers marqués « traités »
+    # (override fichier `resolved`) → le board ne montre que ce qui reste à faire.
+    # `?show_handled=1` les réaffiche (toggle UI). Le masquage s'applique AUSSI aux
+    # compteurs par classe ci-dessous, pour que les chips/badge « Causes (N) » se
+    # rafraîchissent quand on traite un fichier (sinon le compteur ne bouge pas).
+    show_handled = request.GET.get('show_handled') == '1'
+
+    def _hide_handled(qs):
+        return qs if show_handled else qs.exclude(
+            triage__status=FileTriage.Status.RESOLVED)
+
+    base = _hide_handled(base)
+
     # Compteurs par classe de monitoring (axe contrôles, read-model matérialisé),
     # sur la vue courante AVANT le filtre par classe → pilotent les chips. `none` =
     # aucun contrôle encore passé (control_class NULL).
     per_control_class = {}
-    for row in (ReceivedFile.objects.filter(state__in=states)
+    for row in (_hide_handled(ReceivedFile.objects.filter(state__in=states))
                 .values('control_class').annotate(n=Count('id'))):
         per_control_class[row['control_class'] or 'none'] = row['n']
 
@@ -390,13 +403,6 @@ def monitoring_feed(request):
         base = base.filter(control_class=control_filter)
     else:
         control_filter = None
-
-    # Triage (étape 5) : par défaut on MASQUE les fichiers marqués « traités »
-    # (override fichier `resolved`) → le board ne montre que ce qui reste à faire.
-    # `?show_handled=1` les réaffiche (toggle UI).
-    show_handled = request.GET.get('show_handled') == '1'
-    if not show_handled:
-        base = base.exclude(triage__status=FileTriage.Status.RESOLVED)
 
     # Total des lignes correspondant au(x) filtre(s), AVANT pagination (top-N).
     matched_total = base.count()
@@ -513,8 +519,9 @@ def monitoring_feed(request):
         }
 
     # Compteurs globaux par état (indexés) : pilotent les chips + le badge History.
+    # Respectent le masquage des traités (cohérence avec les lignes/compteurs visibles).
     per_state = {s.value: 0 for s in ReceivedFile.State}
-    for row in ReceivedFile.objects.values('state').annotate(n=Count('id')):
+    for row in _hide_handled(ReceivedFile.objects.all()).values('state').annotate(n=Count('id')):
         per_state[row['state']] = row['n']
     live_total = sum(per_state[s.value] for s in LIVE_STATES)
     history_total = sum(per_state[s.value] for s in HISTORY_STATES)
