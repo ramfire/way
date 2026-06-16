@@ -29,6 +29,8 @@ from api.views import (
     monitoring_feed,
     monitoring_page,
     restore_received_file,
+    triage_cause,
+    triage_file,
 )
 
 urlpatterns = [
@@ -42,6 +44,8 @@ urlpatterns = [
     path('monitoring/', monitoring_page, name='monitoring'),
     path('monitoring/feed/', monitoring_feed, name='monitoring-feed'),
     path('monitoring/causes/', monitoring_causes, name='monitoring-causes'),
+    path('monitoring/triage/cause/', triage_cause, name='monitoring-triage-cause'),
+    path('monitoring/triage/file/<int:pk>/', triage_file, name='monitoring-triage-file'),
     path('monitoring/admission/<int:pk>/', admission_detail, name='monitoring-admission'),
     path('healthz/', lambda r: JsonResponse({'status': 'ok'})),
 ]

@@ -18,7 +18,9 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 
 from .admission import STAGE as ADMISSION_STAGE
-from .models import MONITORING_SEVERITY, Event, ReceivedFile
+from .models import (
+    MONITORING_SEVERITY, Event, FileTriage, ReceivedFile, TriageAck,
+)
 from .s3 import PRESIGN_DEFAULT_EXPIRY, presigned_get_url
 
 logger = logging.getLogger(__name__)
@@ -468,6 +470,11 @@ def monitoring_feed(request):
         sort = None
         qs = list(base.order_by('-received_at', '-id')[offset:offset + limit])
 
+    # Override de triage par fichier (sparse) pour les lignes de la page (étape 5).
+    file_triage = dict(
+        FileTriage.objects.filter(file_id__in=[rf.pk for rf in qs])
+        .values_list('file_id', 'status'))
+
     def to_row(rf):
         name = posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)'
         # Durée de transfert : SFTPGo la fournit dans le payload (`elapsed`, ms).
@@ -490,6 +497,9 @@ def monitoring_feed(request):
             # Axe contrôles : classe « worst-wins » matérialisée (read-model). Badge
             # générique du board ; le détail par contrôle est dans la modale (dbl-clic).
             'control_class': rf.control_class,
+            # Triage (étape 5) : override AU NIVEAU FICHIER (None = aucun → suit la
+            # cause). Pilote le badge « traité » + l'action ligne.
+            'triage': file_triage.get(rf.pk),
             # Actions disponibles côté UI (gardées aussi côté serveur).
             'can_archive': rf.state == ReceivedFile.State.FAILED,
             'can_restore': rf.state == ReceivedFile.State.ARCHIVED,
@@ -564,9 +574,10 @@ def monitoring_causes(request):
             agg = causes[key] = {
                 'stage': e['stage'], 'control': e['control'],
                 'monitoring_class': e['monitoring_class'], 'reason': reason,
-                'count': 0, '_users': Counter(), '_examples': [],
+                'count': 0, '_users': Counter(), '_examples': [], '_files': [],
             }
         agg['count'] += 1
+        agg['_files'].append(e['file_id'])
         # On compte aussi l'username vide ('' = partenaire « vide » bien réel ici) ;
         # l'UI l'affiche « ∅ ». most_common surface le(s) partenaire(s) dominant(s).
         agg['_users'][detail.get('username') or ''] += 1
@@ -582,13 +593,42 @@ def monitoring_causes(request):
             names[rf['id']] = posixpath.basename(
                 rf['s3_key'] or rf['path'] or '') or '(sans nom)'
 
-    rows = [{
-        'stage': c['stage'], 'control': c['control'],
-        'monitoring_class': c['monitoring_class'], 'reason': c['reason'],
-        'count': c['count'],
-        'top_users': [{'username': u, 'count': n} for u, n in c['_users'].most_common(3)],
-        'examples': [names.get(fid, str(fid)) for fid in c['_examples']],
-    } for c in causes.values()]
+    # Triage (étape 5) — réconciliation cause × fichier.
+    # Acks de cause existants, indexés par signature.
+    acks = {(a.stage, a.control, a.monitoring_class, a.reason): a
+            for a in TriageAck.objects.filter(stage=ADMISSION_STAGE)}
+    # Overrides fichier `resolved` parmi les fichiers concernés (sparse).
+    resolved_files = set(
+        FileTriage.objects.filter(file_id__in=affected,
+                                  status=FileTriage.Status.RESOLVED)
+        .values_list('file_id', flat=True))
+
+    open_files = set()   # fichiers « à traiter » après réconciliation (distincts)
+    rows = []
+    for key, c in causes.items():
+        ack = acks.get(key)
+        cause_resolved = bool(ack and ack.status == TriageAck.Status.RESOLVED)
+        files = c['_files']
+        n_file_resolved = sum(1 for fid in files if fid in resolved_files)
+        # « À traiter » dans cette cause : 0 si la cause est résolue, sinon les
+        # fichiers sans override `resolved`. Règle : override fichier OU ack de cause.
+        n_open = 0 if cause_resolved else (c['count'] - n_file_resolved)
+        if not cause_resolved:
+            open_files.update(fid for fid in files if fid not in resolved_files)
+        rows.append({
+            'stage': c['stage'], 'control': c['control'],
+            'monitoring_class': c['monitoring_class'], 'reason': c['reason'],
+            'count': c['count'],
+            'open_count': n_open,
+            'file_resolved_count': n_file_resolved,
+            'top_users': [{'username': u, 'count': n} for u, n in c['_users'].most_common(3)],
+            'examples': [names.get(fid, str(fid)) for fid in c['_examples']],
+            'triage': {
+                'status': ack.status if ack else TriageAck.Status.OPEN,
+                'owner': ack.owner if ack else '',
+                'note': ack.note if ack else '',
+            },
+        })
     # Tri : le plus sévère d'abord, puis le plus gros volume.
     rows.sort(key=lambda r: (-MONITORING_SEVERITY.get(r['monitoring_class'], -1), -r['count']))
 
@@ -597,8 +637,68 @@ def monitoring_causes(request):
         'causes': rows,
         'cause_total': len(rows),
         'files_affected': len(affected),
+        'files_open': len(open_files),   # après réconciliation triage (cause × fichier)
         'server_time': timezone.now().isoformat(),
     })
+
+
+@require_POST
+@staff_member_required
+def triage_cause(request):
+    """Upsert le triage d'une CAUSE : ``claim`` (→ en cours) / ``resolve`` (→ résolu)
+    / ``reopen`` (→ ouvert). Propriétaire = utilisateur courant. Clé = signature de
+    cause passée en POST. Mutable ; n'altère ni les ``Event`` ni le ``state``.
+    """
+    p = request.POST
+    sig = dict(
+        stage=(p.get('stage') or '')[:32],
+        control=(p.get('control') or '')[:64],
+        monitoring_class=(p.get('monitoring_class') or '')[:20],
+        reason=(p.get('reason') or '')[:255],
+    )
+    status = {
+        'claim': TriageAck.Status.IN_PROGRESS,
+        'resolve': TriageAck.Status.RESOLVED,
+        'reopen': TriageAck.Status.OPEN,
+    }.get(p.get('action'))
+    if status is None or not sig['stage'] or not sig['control']:
+        return JsonResponse({'detail': 'requête de triage invalide'}, status=400)
+
+    ack, _ = TriageAck.objects.get_or_create(**sig)
+    ack.status = status
+    # `open` = désassigné ; claim/resolve s'attribuent à l'utilisateur courant.
+    ack.owner = '' if status == TriageAck.Status.OPEN else request.user.get_username()
+    if 'note' in p:
+        ack.note = (p.get('note') or '')[:2000]
+    ack.save()
+    logger.info('Triage cause %s/%s:%s -> %s par %s', sig['stage'], sig['control'],
+                sig['reason'], status, request.user)
+    return JsonResponse({'ok': True, 'status': ack.status,
+                         'owner': ack.owner, 'note': ack.note})
+
+
+@require_POST
+@staff_member_required
+def triage_file(request, pk):
+    """Override de triage AU NIVEAU FICHIER : ``resolve`` (marque traité, prime sur
+    l'ack de cause) ou ``reopen`` (retire l'override → le fichier suit sa cause).
+    """
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    action = request.POST.get('action')
+    if action == 'resolve':
+        t, _ = FileTriage.objects.get_or_create(file=rf)
+        t.status = FileTriage.Status.RESOLVED
+        t.owner = request.user.get_username()
+        if 'note' in request.POST:
+            t.note = (request.POST.get('note') or '')[:2000]
+        t.save()
+        logger.info('Triage file %s -> resolved par %s', pk, request.user)
+        return JsonResponse({'ok': True, 'status': t.status, 'owner': t.owner})
+    if action == 'reopen':
+        FileTriage.objects.filter(file=rf).delete()
+        logger.info('Triage file %s -> reopen (override retiré) par %s', pk, request.user)
+        return JsonResponse({'ok': True, 'status': None})
+    return JsonResponse({'detail': 'action invalide'}, status=400)
 
 
 @staff_member_required

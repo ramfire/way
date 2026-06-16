@@ -175,8 +175,14 @@ Portée du renommage :
    par sévérité) + bouton « ⚠ Causes (N) » → modale. **Complément** (second niveau,
    lecture seule) ; l'unité de travail reste le fichier. Transforme « 2092 lignes »
    en « 1 cause » et surface le signal `revoked_partner_still_emitting`.
-5. **(Optionnel, plus tard)** modèle de **triage** mutable (statut traité/en
-   attente + propriétaire) si on veut un workflow ops, en read-model séparé (§9.2).
+5. ✅ **FAIT (commit à venir)** — modèle de **triage mutable** « les deux » niveaux
+   (décision 2026-06-16) : `TriageAck` (par **cause**, claim/resolve/reopen + owner +
+   note) et `FileTriage` (override par **fichier**, sparse). Mutables, **distincts**
+   du journal append-only. **Règle de réconciliation** : un contrôle en échec est « à
+   traiter » sauf si son fichier a un override `resolved` **OU** sa cause un ack
+   `resolved` ; l'override fichier prime. `files_open` = fichiers à traiter après
+   réconciliation (un fichier reste ouvert tant qu'**une** de ses causes non résolues
+   le couvre). UI : workflow dans la modale Causes + action par ligne sur le board.
 
 ## 11. Questions ouvertes à trancher
 

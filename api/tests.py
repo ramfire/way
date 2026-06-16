@@ -224,3 +224,49 @@ class MonitoringCausesTests(TestCase):
         # Tri : le plus sévère (warning_action) avant reject.
         self.assertEqual(data['causes'][0]['monitoring_class'],
                          Event.MonitoringClass.WARNING_ACTION)
+
+
+class TriageTests(TestCase):
+    """Triage mutable cause × fichier + réconciliation (étape 5)."""
+
+    def setUp(self):
+        Partner.objects.create(username='old', status=Partner.Status.REVOKED)
+        self.files = [make_file(username='old', s3_key=f'in/old/{i}.csv') for i in range(3)]
+        for f in self.files:
+            file_admission(f.pk)
+        self.staff = get_user_model().objects.create_user('staff', is_staff=True)
+        self.client.force_login(self.staff)
+
+    def _causes(self):
+        return {c['control']: c for c in self.client.get('/monitoring/causes/').json()['causes']}
+
+    _WARN = {'stage': 'admission', 'control': 'partner_status',
+             'monitoring_class': 'warning_action', 'reason': 'revoked_partner_still_emitting'}
+
+    def test_cause_claim_resolve_reopen(self):
+        r = self.client.post('/monitoring/triage/cause/', {**self._WARN, 'action': 'claim'}).json()
+        self.assertEqual((r['status'], r['owner']), ('in_progress', 'staff'))
+
+        self.client.post('/monitoring/triage/cause/', {**self._WARN, 'action': 'resolve'})
+        c = self._causes()['partner_status']
+        self.assertEqual(c['triage']['status'], 'resolved')
+        self.assertEqual(c['open_count'], 0)            # cause résolue → plus rien à traiter
+
+        rr = self.client.post('/monitoring/triage/cause/', {**self._WARN, 'action': 'reopen'}).json()
+        self.assertEqual((rr['status'], rr['owner']), ('open', ''))   # désassigné
+
+    def test_file_override_reconciliation(self):
+        self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'resolve'})
+        c = self._causes()['partner_status']
+        self.assertEqual(c['file_resolved_count'], 1)
+        self.assertEqual(c['open_count'], 2)           # 3 - 1 override
+
+        self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'reopen'})
+        self.assertEqual(self._causes()['partner_status']['file_resolved_count'], 0)
+
+    def test_files_open_drops_when_all_covering_causes_resolved(self):
+        self.assertEqual(self.client.get('/monitoring/causes/').json()['files_open'], 3)
+        for sig in (self._WARN, {'stage': 'admission', 'control': 'verdict',
+                                 'monitoring_class': 'reject', 'reason': 'partner_revoked'}):
+            self.client.post('/monitoring/triage/cause/', {**sig, 'action': 'resolve'})
+        self.assertEqual(self.client.get('/monitoring/causes/').json()['files_open'], 0)

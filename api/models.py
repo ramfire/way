@@ -152,6 +152,65 @@ class Event(models.Model):
         return f'{self.stage}/{self.control}={self.result} (file {self.file_id})'
 
 
+class TriageAck(models.Model):
+    """Triage humain d'une **cause** (cf. ``monitoring_causes``) : statut +
+    propriétaire + note. **Mutable**, et délibérément **distinct** du journal
+    append-only ``Event`` (qui n'est QUE de l'observation) — c'est une décision
+    humaine, pas une observation. Clé = **signature de cause**
+    ``(stage, control, monitoring_class, reason)``. On traite la cause (corrige le
+    partenaire/canal, rejoue) → les fichiers quittent l'ensemble « en échec » seuls.
+    """
+
+    class Status(models.TextChoices):
+        OPEN = 'open', 'Ouvert'
+        IN_PROGRESS = 'in_progress', 'En cours'
+        RESOLVED = 'resolved', 'Résolu'
+
+    stage = models.CharField(max_length=32)
+    control = models.CharField(max_length=64)
+    monitoring_class = models.CharField(max_length=20)
+    reason = models.CharField(max_length=255, blank=True, default='')
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.OPEN, db_index=True)
+    owner = models.CharField(max_length=255, blank=True, default='')
+    note = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['stage', 'control', 'monitoring_class', 'reason'],
+                name='uniq_triage_cause'),
+        ]
+
+    def __str__(self):
+        return f'{self.stage}/{self.control}:{self.reason}={self.status}'
+
+
+class FileTriage(models.Model):
+    """Override de triage **au niveau fichier** (exception) : prime sur l'ack de la
+    cause du fichier (cf. règle de réconciliation, docs §9). **Sparse** : une ligne
+    seulement pour les fichiers explicitement triés à la main.
+    """
+
+    class Status(models.TextChoices):
+        OPEN = 'open', 'Ouvert'
+        RESOLVED = 'resolved', 'Traité'
+
+    file = models.OneToOneField(
+        ReceivedFile, on_delete=models.CASCADE, related_name='triage')
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.RESOLVED, db_index=True)
+    owner = models.CharField(max_length=255, blank=True, default='')
+    note = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'file {self.file_id} triage={self.status}'
+
+
 # Sévérité des classes de monitoring pour le rollup « worst-wins » du board (un
 # seul signal par fichier, toutes étapes/contrôles confondus). Board orienté
 # ACTION : l'actionnable (`recycle`) prime sur le terminal (`reject`).
