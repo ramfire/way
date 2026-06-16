@@ -18,6 +18,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
+from api.admission import file_admission
 from api.models import ReceivedFile
 from api.s3 import get_s3_client
 
@@ -119,10 +120,26 @@ class Command(BaseCommand):
                     rf.deleted_at = timezone.now()
                     rf.save(update_fields=['state', 'deleted_at'])
 
+        # 5) Filet admission : toute ligne `stored` SANS aucun événement
+        #    d'admission n'a jamais été classée (webhook perdu, gunicorn down au
+        #    moment de l'upload, backfill ci-dessus, etc.). On (re)lance
+        #    file_admission — même rôle que rattraper un hook perdu. Idempotent et
+        #    rejouable ; --dry-run n'écrit rien.
+        admitted = 0
+        need_admission = list(
+            ReceivedFile.objects
+            .filter(state=ReceivedFile.State.STORED)
+            .exclude(events__stage='admission'))
+        for rf in need_admission:
+            admitted += 1
+            self.stdout.write(f'  [admission] {object_key(rf)} (stored sans event admission)')
+            if not dry:
+                file_admission(rf.pk)
+
         tag = 'DRY-RUN — ' if dry else ''
         self.stdout.write(self.style.SUCCESS(
             f'{tag}backfill={backfilled} promote={promoted} '
-            f'missing={marked_missing} déjà-ok={in_sync}'))
+            f'missing={marked_missing} admission={admitted} déjà-ok={in_sync}'))
 
     def _default_bucket(self):
         """Bucket réel : l'unique bucket des lignes, sinon SCW_BUCKET_PREFIX."""

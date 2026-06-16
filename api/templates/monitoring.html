@@ -41,6 +41,11 @@
     .deleted   { background:#374151; color:#d1d5db; }
     .missing   { background:#78350f; color:#fed7aa; }
     .archived  { background:#312e81; color:#c7d2fe; }
+    /* Verdicts d'admission : vert (admis) / orange (recycle) / rouge (archive). */
+    .adm-admis   { background:#14532d; color:#bbf7d0; }
+    .adm-recycle { background:#78350f; color:#fed7aa; }
+    .adm-archive { background:#7f1d1d; color:#fecaca; }
+    .adm-none    { color:var(--mut); }
     button.act { padding:.2rem .55rem; font-size:.76rem; }
     a.dl { color:#7dd3fc; text-decoration:none; }
     a.dl:hover { text-decoration:underline; }
@@ -63,6 +68,26 @@
     .pager button[disabled] { opacity:.4; cursor:default; }
     .pager button[disabled]:hover { border-color:var(--line); }
     .pager .pg-pages { margin-left:auto; }
+    /* Lignes du board : cliquables (double-clic → détail d'admission). */
+    tbody tr[data-id] { cursor:pointer; }
+    /* Modale détail d'admission (ouverte au double-clic, pour le support). */
+    .modal-bg { display:none; position:fixed; inset:0; background:rgba(0,0,0,.62);
+                align-items:flex-start; justify-content:center; z-index:50; }
+    .modal-bg.open { display:flex; }
+    .modal { background:var(--card); border:1px solid var(--line); border-radius:10px;
+             margin-top:6vh; min-width:540px; max-width:92vw; max-height:84vh; overflow:auto; }
+    .modal-head { display:flex; align-items:center; gap:1rem; padding:.75rem 1.1rem;
+                  border-bottom:1px solid var(--line); position:sticky; top:0;
+                  background:var(--card); }
+    .modal-head .m-title { font-weight:600; }
+    .modal-head .m-sub { color:var(--mut); font-size:.8rem; font-family:ui-monospace,monospace; }
+    .modal-head button { margin-left:auto; padding:.2rem .55rem; }
+    .modal table { font-size:.82rem; }
+    .modal td.det { color:var(--mut); font-family:ui-monospace,monospace;
+                    white-space:normal; max-width:32rem; }
+    .modal .res-passed { color:#4ade80; font-weight:600; }
+    .modal .res-failed { color:#f87171; font-weight:600; }
+    .modal .mclass { color:var(--mut); text-transform:uppercase; font-size:.72rem; }
   </style>
 </head>
 <body>
@@ -100,12 +125,26 @@
         <th id="th-transfer" class="sortable" data-key="elapsed_ms"><span class="lbl"></span><span class="arr"></span></th>
         <th id="th-received" class="sortable" data-key="received_at"><span class="lbl"></span><span class="arr"></span></th>
         <th id="th-stored" class="sortable" data-key="stored_at"><span class="lbl"></span><span class="arr"></span></th>
+        <th id="th-admission"><span class="lbl"></span></th>
         <th></th>
       </tr>
     </thead>
     <tbody id="rows"></tbody>
   </table>
   <div class="pager" id="pager"></div>
+
+  <div class="modal-bg" id="modal-bg">
+    <div class="modal">
+      <div class="modal-head">
+        <span>
+          <span class="m-title" id="modal-title"></span>
+          <span class="m-sub" id="modal-sub"></span>
+        </span>
+        <button id="modal-close">✕</button>
+      </div>
+      <div id="modal-body"></div>
+    </div>
+  </div>
 
   <script>
     // --- Dictionnaire de traductions (défaut : anglais) ------------------------
@@ -117,7 +156,15 @@
         total: 'Total', receiving: 'receiving', stored: 'stored', failed: 'failed',
         th_state: 'Status', th_file: 'File', th_user: 'User', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Size', th_transfer: 'Transfer', th_received: 'Received',
-        th_stored: 'Stored', th_archived: 'Archived',
+        th_stored: 'Stored', th_archived: 'Archived', th_admission: 'Admission',
+        // verdicts d'admission + libellés de la modale détail (support)
+        adm_admis: 'Admitted', adm_recycle: 'Recycle', adm_archive: 'Archived', adm_none: 'pending',
+        adm_title: 'Admission checks', adm_no_events: 'No admission event for this file yet.',
+        adm_c_control: 'Control', adm_c_result: 'Result', adm_c_class: 'Class',
+        adm_c_detail: 'Detail', adm_c_time: 'Time',
+        adm_r_passed: 'passed', adm_r_failed: 'failed',
+        ctrl_partner_recognised: 'Partner recognised', ctrl_partner_status: 'Partner status',
+        ctrl_channel_authorised: 'Channel authorised', ctrl_verdict: 'Verdict',
         st_starting: 'starting…', st_live: 'live ({s}s)', st_paused: 'paused',
         st_error: 'error',
         btn_pause: '⏸ Pause', btn_resume: '▶ Resume',
@@ -141,7 +188,14 @@
         total: 'Total', receiving: 'réception', stored: 'stockés', failed: 'échecs',
         th_state: 'État', th_file: 'Fichier', th_user: 'Utilisateur', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Taille', th_transfer: 'Transfert', th_received: 'Reçu',
-        th_stored: 'Stocké', th_archived: 'Archivé',
+        th_stored: 'Stocké', th_archived: 'Archivé', th_admission: 'Admission',
+        adm_admis: 'Admis', adm_recycle: 'Recyclage', adm_archive: 'Archivé', adm_none: 'en attente',
+        adm_title: 'Contrôles d’admission', adm_no_events: 'Aucun événement d’admission pour ce fichier.',
+        adm_c_control: 'Contrôle', adm_c_result: 'Résultat', adm_c_class: 'Classe',
+        adm_c_detail: 'Détail', adm_c_time: 'Heure',
+        adm_r_passed: 'réussi', adm_r_failed: 'échoué',
+        ctrl_partner_recognised: 'Partenaire reconnu', ctrl_partner_status: 'Statut partenaire',
+        ctrl_channel_authorised: 'Canal autorisé', ctrl_verdict: 'Verdict',
         st_starting: 'démarrage…', st_live: 'live ({s}s)', st_paused: 'en pause',
         st_error: 'erreur',
         btn_pause: '⏸ Pause', btn_resume: '▶ Reprendre',
@@ -164,7 +218,14 @@
         total: 'Totale', receiving: 'in ricezione', stored: 'archiviati', failed: 'falliti',
         th_state: 'Stato', th_file: 'File', th_user: 'Utente', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Dimensione', th_transfer: 'Trasferimento', th_received: 'Ricevuto',
-        th_stored: 'Archiviato', th_archived: 'Archiviato il',
+        th_stored: 'Archiviato', th_archived: 'Archiviato il', th_admission: 'Ammissione',
+        adm_admis: 'Ammesso', adm_recycle: 'Riciclo', adm_archive: 'Archiviato', adm_none: 'in attesa',
+        adm_title: 'Controlli di ammissione', adm_no_events: 'Nessun evento di ammissione per questo file.',
+        adm_c_control: 'Controllo', adm_c_result: 'Esito', adm_c_class: 'Classe',
+        adm_c_detail: 'Dettaglio', adm_c_time: 'Ora',
+        adm_r_passed: 'riuscito', adm_r_failed: 'fallito',
+        ctrl_partner_recognised: 'Partner riconosciuto', ctrl_partner_status: 'Stato partner',
+        ctrl_channel_authorised: 'Canale autorizzato', ctrl_verdict: 'Verdetto',
         st_starting: 'avvio…', st_live: 'live ({s}s)', st_paused: 'in pausa',
         st_error: 'errore',
         btn_pause: '⏸ Pausa', btn_resume: '▶ Riprendi',
@@ -277,6 +338,8 @@
           : t(c.i18n);
         $(c.id).querySelector('.lbl').textContent = label;
       });
+      // Colonne Admission (non triable, hors COLS) : libellé seul.
+      $('th-admission').querySelector('.lbl').textContent = t('th_admission');
       updateSortIndicators();
       $('toggle').textContent = paused ? t('btn_resume') : t('btn_pause');
       $('lang').value = lang;
@@ -314,11 +377,19 @@
       }
     }
 
+    // Badge du verdict d'admission courant (admis/recycle/archive), ou « en attente »
+    // si aucun verdict n'a encore été posé. Détail complet au double-clic (modale).
+    function admBadge(r) {
+      const v = r.admission_verdict;
+      if (!v) return `<span class="adm-none">${esc(t('adm_none'))}</span>`;
+      return `<span class="badge adm-${esc(v)}">${esc(t('adm_' + v) || v)}</span>`;
+    }
+
     function renderRows(rows) {
       if (!rows.length) {
         const msg = stateFilter ? t('empty_filter')
           : (view === 'history') ? t('empty_history') : t('empty');
-        $('rows').innerHTML = `<tr><td colspan="10" class="empty">${msg}</td></tr>`;
+        $('rows').innerHTML = `<tr><td colspan="11" class="empty">${msg}</td></tr>`;
         return;
       }
       $('rows').innerHTML = rows.map(r => {
@@ -336,7 +407,7 @@
         // Dernière colonne « horodatage » : stockage (Live) ou archivage/suppression (History).
         const lastTime = (view === 'history')
           ? (r.archived_at || r.deleted_at || r.stored_at) : r.stored_at;
-        return `<tr class="${cls}">
+        return `<tr class="${cls}" data-id="${r.id}">
           <td><span class="badge ${esc(r.state)}">${esc(stateLabel(r.state))}</span></td>
           <td class="file" title="${esc(r.path)}">${esc(r.filename)}</td>
           <td>${esc(r.username)}</td>
@@ -346,6 +417,7 @@
           <td>${fmtDuration(r.elapsed_ms)}</td>
           <td>${fmtTime(r.received_at)}</td>
           <td>${fmtTime(lastTime)}</td>
+          <td>${admBadge(r)}</td>
           <td>${dl}</td>
         </tr>`;
       }).join('');
@@ -435,7 +507,7 @@
       seen.clear(); firstLoad = true;       // pas de « flash nouveau » au changement de vue
       applyStaticText();
       renderTabs(lastData);
-      $('rows').innerHTML = `<tr><td colspan="10" class="empty">${t('loading')}</td></tr>`;
+      $('rows').innerHTML = `<tr><td colspan="11" class="empty">${t('loading')}</td></tr>`;
       poll();
     }
 
@@ -520,6 +592,76 @@
       if (btn) doAction(btn.dataset.act, btn.dataset.id);
     });
 
+    // --- Détail d'admission (modale, double-clic sur une ligne) ----------------
+    // Pour le support : déroule tous les contrôles d'admission du fichier (chaque
+    // contrôle + verdict, du plus ancien au plus récent). Lecture seule.
+    function ctrlLabel(c) { return t('ctrl_' + c) || c; }
+    // Résumé lisible du `detail` JSON d'un événement (raison + champs utiles).
+    function admDetailText(d) {
+      if (!d || typeof d !== 'object') return '—';
+      const bits = [];
+      if (d.reason) bits.push(d.reason);
+      if (d.verdict) bits.push('verdict=' + d.verdict);
+      if (d.partner_status) bits.push('status=' + d.partner_status);
+      if (d.username) bits.push('user=' + d.username);
+      if (d.path) bits.push('path=' + d.path);
+      if (Array.isArray(d.allowed_prefixes)) bits.push('allowed=' + d.allowed_prefixes.join(','));
+      if (d.first) bits.push('first');
+      return bits.length ? bits.join(' · ') : '—';
+    }
+    function renderAdmission(data) {
+      $('modal-title').textContent = t('adm_title');
+      $('modal-sub').textContent = (data.filename || '') +
+        (data.username ? ' — ' + data.username : '');
+      const ev = data.events || [];
+      if (!ev.length) {
+        $('modal-body').innerHTML = `<div class="empty">${esc(t('adm_no_events'))}</div>`;
+        return;
+      }
+      const rows = ev.map(e => `
+        <tr>
+          <td>${esc(ctrlLabel(e.control))}</td>
+          <td class="res-${esc(e.result)}">${esc(t('adm_r_' + e.result) || e.result)}</td>
+          <td class="mclass">${esc(e.monitoring_class)}</td>
+          <td class="det">${esc(admDetailText(e.detail))}</td>
+          <td>${esc(fmtTime(e.created_at))}</td>
+        </tr>`).join('');
+      $('modal-body').innerHTML = `<table><thead><tr>
+          <th>${esc(t('adm_c_control'))}</th><th>${esc(t('adm_c_result'))}</th>
+          <th>${esc(t('adm_c_class'))}</th><th>${esc(t('adm_c_detail'))}</th>
+          <th>${esc(t('adm_c_time'))}</th>
+        </tr></thead><tbody>${rows}</tbody></table>`;
+    }
+    async function openAdmission(id) {
+      $('modal-title').textContent = t('adm_title');
+      $('modal-sub').textContent = '';
+      $('modal-body').innerHTML = `<div class="empty">${esc(t('loading'))}</div>`;
+      $('modal-bg').classList.add('open');
+      try {
+        const res = await fetch(`/monitoring/admission/${id}/`, { credentials: 'same-origin' });
+        if (res.redirected || res.status === 403 || res.status === 302) {
+          throw new Error(t('err_session'));
+        }
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        renderAdmission(await res.json());
+      } catch (e) {
+        $('modal-body').innerHTML = `<div class="empty">⚠ ${esc(e.message)}</div>`;
+      }
+    }
+    function closeModal() { $('modal-bg').classList.remove('open'); }
+    // Double-clic sur une ligne (délégation : tbody re-rendu via innerHTML).
+    $('rows').addEventListener('dblclick', (e) => {
+      const tr = e.target.closest('tr[data-id]');
+      if (tr) openAdmission(tr.dataset.id);
+    });
+    $('modal-close').addEventListener('click', closeModal);
+    $('modal-bg').addEventListener('click', (e) => {   // clic hors carte = fermeture
+      if (e.target === $('modal-bg')) closeModal();
+    });
+    document.addEventListener('keydown', (e) => {       // Échap = fermeture
+      if (e.key === 'Escape') closeModal();
+    });
+
     // Pagination : Préc./Suiv. (délégation, le pager est re-rendu via innerHTML).
     $('pager').addEventListener('click', (e) => {
       const btn = e.target.closest('button');
@@ -539,7 +681,7 @@
 
     applyStaticText();
     renderTabs(null);
-    $('rows').innerHTML = `<tr><td colspan="10" class="empty">${t('loading')}</td></tr>`;
+    $('rows').innerHTML = `<tr><td colspan="11" class="empty">${t('loading')}</td></tr>`;
     poll();
     schedule();
     setInterval(tickAgo, 1000);

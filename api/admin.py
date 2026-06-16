@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.urls import reverse
 from django.utils.html import format_html
 
-from .models import ReceivedFile
+from .models import Event, Partner, ReceivedFile
 
 
 @admin.register(ReceivedFile)
@@ -26,3 +26,36 @@ class ReceivedFileAdmin(admin.ModelAdmin):
         return format_html(
             '<a href="{}">⬇ Télécharger</a>', reverse('download-file', args=[obj.pk]),
         )
+
+
+@admin.register(Partner)
+class PartnerAdmin(admin.ModelAdmin):
+    """Référentiel partenaires : c'est ici qu'un humain **enrôle**/déclare un
+    partenaire (modèle discovery), puis re-lance l'admission du fichier en attente.
+    """
+    list_display = ('username', 'status')
+    list_filter = ('status',)
+    search_fields = ('username',)
+    ordering = ('username',)
+
+
+@admin.register(Event)
+class EventAdmin(admin.ModelAdmin):
+    """Journal d'audit append-only : **lecture seule** (aucun ajout/modif/suppr)."""
+    list_display = (
+        'created_at', 'file', 'stage', 'control', 'result', 'monitoring_class',
+    )
+    list_filter = ('stage', 'result', 'monitoring_class', 'control')
+    search_fields = ('file__s3_key', 'file__username')
+    date_hierarchy = 'created_at'
+    ordering = ('-created_at', '-id')
+    readonly_fields = [f.name for f in Event._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

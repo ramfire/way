@@ -4,7 +4,8 @@ import posixpath
 from django.conf import settings
 from django.contrib.admin.views.decorators import staff_member_required
 from django.db.models import (
-    Case, CharField, Count, F, FloatField, Func, IntegerField, Value, When,
+    Case, CharField, Count, F, FloatField, Func, IntegerField, OuterRef,
+    Subquery, Value, When,
 )
 from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Cast, Coalesce, Lower
@@ -16,7 +17,8 @@ from django.views.decorators.http import require_POST
 from rest_framework.views import APIView
 from rest_framework.response import Response
 
-from .models import ReceivedFile
+from .admission import STAGE as ADMISSION_STAGE
+from .models import Event, ReceivedFile
 from .s3 import PRESIGN_DEFAULT_EXPIRY, presigned_get_url
 
 logger = logging.getLogger(__name__)
@@ -156,14 +158,31 @@ class SFTPWebhookView(APIView):
             rf.stored_at = timezone.now() if success else None
             rf.save()
         else:
-            ReceivedFile.objects.create(
+            rf = ReceivedFile.objects.create(
                 s3_key=s3_key,
                 stored_at=timezone.now() if success else None,
                 **fields,
             )
+        rf_id = rf.pk
         logger.info('SFTP upload %s: %s by %s',
                     'stored' if success else 'FAILED', s3_key, username)
         # TODO: déclencher DORA checks (futur worker via flag `processed`)
+
+        # Admission (post-stockage) : observation/classification, JAMAIS bloquante.
+        # Lancée seulement après que la ligne est `stored` et la 200 est acquise.
+        # Garde dédiée en plus du try/except de post() : l'admission ne peut EN
+        # AUCUN CAS affecter la réponse webhook ni l'upload (invariant 1).
+        if success and rf_id is not None:
+            self._run_admission(rf_id)
+
+    @staticmethod
+    def _run_admission(file_id):
+        """Appel d'admission garanti non bloquant (log + avale toute erreur)."""
+        try:
+            from .admission import file_admission
+            file_admission(file_id)
+        except Exception:
+            logger.exception('Admission: échec non bloquant pour file %s', file_id)
 
     def _on_delete(self, p):
         """Fichier supprimé via SFTP : marquer les lignes ``stored`` en ``deleted``.
@@ -376,12 +395,22 @@ def monitoring_feed(request):
     #  - _filename : basename de s3_key (tout après le dernier '/'), insensible à la casse ;
     #  - _elapsed  : durée de transfert (ms) extraite du JSON `raw` et castée en nombre ;
     #  - _stored_eff : horodatage « dernière colonne » en History (archive/suppression/stockage).
+    # Dernier événement d'admission par fichier (lecture seule) : surface le
+    # verdict courant (classe de monitoring + résultat + verdict) au board. Le
+    # « courant » = le plus récent (Subquery, pas de N+1).
+    latest_adm = (Event.objects
+                  .filter(file=OuterRef('pk'), stage=ADMISSION_STAGE,
+                          control='verdict')
+                  .order_by('-created_at', '-id'))
     base = base.annotate(
         _filename=Lower(Func(
             F('s3_key'), Value(r'^.*/'), Value(''),
             function='regexp_replace', output_field=CharField())),
         _elapsed=Cast(KeyTextTransform('elapsed', 'raw'), FloatField()),
         _stored_eff=Coalesce('archived_at', 'deleted_at', 'stored_at'),
+        _adm_class=Subquery(latest_adm.values('monitoring_class')[:1]),
+        _adm_result=Subquery(latest_adm.values('result')[:1]),
+        _adm_verdict=Subquery(latest_adm.values('detail__verdict')[:1]),
     )
 
     sort = request.GET.get('sort')
@@ -437,6 +466,10 @@ def monitoring_feed(request):
             'deleted_at': rf.deleted_at.isoformat() if rf.deleted_at else None,
             'archived_at': rf.archived_at.isoformat() if rf.archived_at else None,
             'downloadable': rf.state == ReceivedFile.State.STORED,
+            # Verdict d'admission courant (lecture seule, surface au board).
+            'admission_class': getattr(rf, '_adm_class', None),
+            'admission_result': getattr(rf, '_adm_result', None),
+            'admission_verdict': getattr(rf, '_adm_verdict', None),
             # Actions disponibles côté UI (gardées aussi côté serveur).
             'can_archive': rf.state == ReceivedFile.State.FAILED,
             'can_restore': rf.state == ReceivedFile.State.ARCHIVED,
@@ -464,4 +497,32 @@ def monitoring_feed(request):
         'matched_total': matched_total,
         'returned': len(qs),
         'server_time': timezone.now().isoformat(),
+    })
+
+
+@staff_member_required
+def admission_detail(request, pk):
+    """Détail des contrôles d'admission d'un fichier (pour le support).
+
+    Lecture seule, gardée par la session staff. Renvoie TOUS les événements de
+    stage ``admission`` du fichier (chaque contrôle + le verdict), du plus ancien
+    au plus récent — c'est exactement la trace que le support déroule au
+    double-clic sur une ligne du board. N'altère rien (events append-only).
+    """
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    events = (Event.objects
+              .filter(file=rf, stage=ADMISSION_STAGE)
+              .order_by('created_at', 'id'))
+    return JsonResponse({
+        'id': rf.pk,
+        'filename': posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)',
+        'username': rf.username,
+        'state': rf.state,
+        'events': [{
+            'control': e.control,
+            'result': e.result,
+            'monitoring_class': e.monitoring_class,
+            'detail': e.detail if isinstance(e.detail, dict) else {},
+            'created_at': e.created_at.isoformat() if e.created_at else None,
+        } for e in events],
     })

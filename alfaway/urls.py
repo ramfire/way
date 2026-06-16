@@ -17,10 +17,12 @@ Including another URLconf
 from django.contrib import admin
 from django.http import JsonResponse
 from django.urls import path
+from django.views.generic import RedirectView
 
 from api.views import (
     PresignedDownloadView,
     SFTPWebhookView,
+    admission_detail,
     archive_received_file,
     download_received_file,
     monitoring_feed,
@@ -29,6 +31,7 @@ from api.views import (
 )
 
 urlpatterns = [
+    path('', RedirectView.as_view(url='/monitoring/', permanent=False), name='home'),
     path('admin/', admin.site.urls),
     path('api/internal/sftp-webhook/', SFTPWebhookView.as_view()),
     path('api/internal/files/<int:pk>/download-url/', PresignedDownloadView.as_view()),
@@ -37,5 +40,6 @@ urlpatterns = [
     path('files/<int:pk>/restore/', restore_received_file, name='restore-file'),
     path('monitoring/', monitoring_page, name='monitoring'),
     path('monitoring/feed/', monitoring_feed, name='monitoring-feed'),
+    path('monitoring/admission/<int:pk>/', admission_detail, name='monitoring-admission'),
     path('healthz/', lambda r: JsonResponse({'status': 'ok'})),
 ]
