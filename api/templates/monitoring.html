@@ -113,6 +113,7 @@
       <span><span class="dot" id="dot"></span> <span id="status"></span></span>
       <span id="count"></span>
       <span id="updated"></span>
+      <button id="btn-causes"></button>
       <button id="toggle"></button>
       <select id="lang" aria-label="Language">
         <option value="en">English</option>
@@ -172,6 +173,11 @@
         mc_blocking: 'Blocking', mc_warning_action: 'Action needed', mc_recycle: 'Recycle',
         mc_reject: 'Rejected', mc_warning_noaction: 'Warning', mc_push: 'OK', mc_none: '—',
         ctl_filter: 'Controls', ctl_all: 'All',
+        // vue agrégée « par cause » (complément, modale)
+        causes_btn: '⚠ Causes', causes_title: 'Causes — current failing controls',
+        causes_sub: '{n} files affected', causes_empty: 'No failing control. 🎉',
+        cz_cause: 'Cause', cz_class: 'Class', cz_files: 'Files',
+        cz_partners: 'Partners', cz_examples: 'Examples',
         // libellés de la modale détail (support)
         adm_title: 'Admission checks', adm_no_events: 'No admission event for this file yet.',
         adm_c_control: 'Control', adm_c_result: 'Result', adm_c_class: 'Class',
@@ -206,6 +212,10 @@
         mc_blocking: 'Bloquant', mc_warning_action: 'Action requise', mc_recycle: 'Recyclage',
         mc_reject: 'Rejeté', mc_warning_noaction: 'Avertissement', mc_push: 'OK', mc_none: '—',
         ctl_filter: 'Contrôles', ctl_all: 'Tous',
+        causes_btn: '⚠ Causes', causes_title: 'Causes — contrôles en échec courants',
+        causes_sub: '{n} fichiers concernés', causes_empty: 'Aucun contrôle en échec. 🎉',
+        cz_cause: 'Cause', cz_class: 'Classe', cz_files: 'Fichiers',
+        cz_partners: 'Partenaires', cz_examples: 'Exemples',
         adm_title: 'Contrôles d’admission', adm_no_events: 'Aucun événement d’admission pour ce fichier.',
         adm_c_control: 'Contrôle', adm_c_result: 'Résultat', adm_c_class: 'Classe',
         adm_c_detail: 'Détail', adm_c_time: 'Heure',
@@ -238,6 +248,10 @@
         mc_blocking: 'Bloccante', mc_warning_action: 'Azione richiesta', mc_recycle: 'Riciclo',
         mc_reject: 'Respinto', mc_warning_noaction: 'Avviso', mc_push: 'OK', mc_none: '—',
         ctl_filter: 'Controlli', ctl_all: 'Tutti',
+        causes_btn: '⚠ Cause', causes_title: 'Cause — controlli falliti correnti',
+        causes_sub: '{n} file interessati', causes_empty: 'Nessun controllo fallito. 🎉',
+        cz_cause: 'Causa', cz_class: 'Classe', cz_files: 'File',
+        cz_partners: 'Partner', cz_examples: 'Esempi',
         adm_title: 'Controlli di ammissione', adm_no_events: 'Nessun evento di ammissione per questo file.',
         adm_c_control: 'Controllo', adm_c_result: 'Esito', adm_c_class: 'Classe',
         adm_c_detail: 'Dettaglio', adm_c_time: 'Ora',
@@ -364,6 +378,7 @@
         $(c.id).querySelector('.lbl').textContent = label;
       });
       updateSortIndicators();
+      $('btn-causes').textContent = t('causes_btn');
       $('toggle').textContent = paused ? t('btn_resume') : t('btn_pause');
       $('lang').value = lang;
       $('status').textContent = lastUpdate ? statusText() : t('st_starting');
@@ -425,6 +440,15 @@
       $('cbar').innerHTML = chips.length
         ? `<span class="cbar-lbl">${esc(t('ctl_filter'))} :</span>` + chips.join('')
         : '';
+    }
+
+    // Bouton « Causes » : compteur des fichiers « à attention » (classe ≠ push/none),
+    // dérivé des compteurs déjà renvoyés par le feed (pas d'appel réseau).
+    function updateCausesBtn(data) {
+      const pc = data.per_control_class || {};
+      const n = ['blocking', 'warning_action', 'recycle', 'reject', 'warning_noaction']
+        .reduce((s, k) => s + (pc[k] || 0), 0);
+      $('btn-causes').textContent = t('causes_btn') + (n ? ` (${n})` : '');
     }
 
     function renderRows(rows) {
@@ -493,6 +517,7 @@
       if (!lastData) return;
       renderStats(lastData);
       renderControlChips(lastData);
+      updateCausesBtn(lastData);
       renderTabs(lastData);
       renderRows(lastData.rows);
       renderPager(lastData);
@@ -718,6 +743,50 @@
     document.addEventListener('keydown', (e) => {       // Échap = fermeture
       if (e.key === 'Escape') closeModal();
     });
+
+    // --- Vue agrégée « par cause » (complément, réutilise la modale) -----------
+    function renderCauses(data) {
+      $('modal-title').textContent = t('causes_title');
+      $('modal-sub').textContent = t('causes_sub').replace('{n}', data.files_affected || 0);
+      const cz = data.causes || [];
+      if (!cz.length) {
+        $('modal-body').innerHTML = `<div class="empty">${esc(t('causes_empty'))}</div>`;
+        return;
+      }
+      const rows = cz.map(c => {
+        const cause = `${esc(c.stage)} / ${esc(ctrlLabel(c.control))}`
+          + (c.reason && c.reason !== '—' ? ` · <span class="det">${esc(c.reason)}</span>` : '');
+        const partners = c.top_users.map(u => `${esc(u.username || '∅')} (${u.count})`).join(', ') || '—';
+        return `<tr>
+          <td>${cause}</td>
+          <td><span class="badge mc-${esc(c.monitoring_class)}">${esc(t('mc_' + c.monitoring_class) || c.monitoring_class)}</span></td>
+          <td><b>${c.count}</b></td>
+          <td>${partners}</td>
+          <td class="det">${c.examples.map(esc).join(', ')}</td>
+        </tr>`;
+      }).join('');
+      $('modal-body').innerHTML = `<table><thead><tr>
+          <th>${esc(t('cz_cause'))}</th><th>${esc(t('cz_class'))}</th><th>${esc(t('cz_files'))}</th>
+          <th>${esc(t('cz_partners'))}</th><th>${esc(t('cz_examples'))}</th>
+        </tr></thead><tbody>${rows}</tbody></table>`;
+    }
+    async function openCauses() {
+      $('modal-title').textContent = t('causes_title');
+      $('modal-sub').textContent = '';
+      $('modal-body').innerHTML = `<div class="empty">${esc(t('loading'))}</div>`;
+      $('modal-bg').classList.add('open');
+      try {
+        const res = await fetch(`/monitoring/causes/?view=${view}`, { credentials: 'same-origin' });
+        if (res.redirected || res.status === 403 || res.status === 302) {
+          throw new Error(t('err_session'));
+        }
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        renderCauses(await res.json());
+      } catch (e) {
+        $('modal-body').innerHTML = `<div class="empty">⚠ ${esc(e.message)}</div>`;
+      }
+    }
+    $('btn-causes').addEventListener('click', openCauses);
 
     // Pagination : Préc./Suiv. (délégation, le pager est re-rendu via innerHTML).
     $('pager').addEventListener('click', (e) => {

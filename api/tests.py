@@ -1,3 +1,4 @@
+from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
 
 from .admission import (
@@ -198,3 +199,28 @@ class ControlRollupTests(TestCase):
         rf_admis.refresh_from_db()
         self.assertIsNone(rf_none.control_class)
         self.assertEqual(rf_admis.control_class, Event.MonitoringClass.PUSH)
+
+
+class MonitoringCausesTests(TestCase):
+    """Vue agrégée « par cause » (complément, étape 4)."""
+
+    def test_aggregates_current_failing_controls_by_cause(self):
+        Partner.objects.create(username='old', status=Partner.Status.REVOKED)
+        for i in range(3):
+            file_admission(make_file(username='old', s3_key=f'in/old/{i}.csv').pk)
+
+        staff = get_user_model().objects.create_user('staff', is_staff=True)
+        self.client.force_login(staff)
+        data = self.client.get('/monitoring/causes/').json()
+
+        # 3 fichiers concernés (distincts), chacun : partner_status (warning_action)
+        # + verdict (reject). partner_recognised est PASSED → exclu.
+        self.assertEqual(data['files_affected'], 3)
+        by = {(c['control'], c['monitoring_class']): c for c in data['causes']}
+        self.assertEqual(by[('partner_status', 'warning_action')]['count'], 3)
+        self.assertEqual(by[('verdict', 'reject')]['count'], 3)
+        self.assertEqual(by[('partner_status', 'warning_action')]['top_users'],
+                         [{'username': 'old', 'count': 3}])
+        # Tri : le plus sévère (warning_action) avant reject.
+        self.assertEqual(data['causes'][0]['monitoring_class'],
+                         Event.MonitoringClass.WARNING_ACTION)

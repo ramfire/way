@@ -169,7 +169,12 @@ Portée du renommage :
    `refresh_control_class()` à chaque passage d'admission → filtre/tri/agrégation en
    SQL indexé sur TOUTE la table (pas de recalcul par poll). Contrat : tout futur
    émetteur de contrôle (DORA…) doit appeler `refresh_control_class` après émission.
-4. **Vue agrégée par cause** (§7) — **complément** (insight/signaux), second niveau.
+4. ✅ **FAIT (commit à venir)** — **Vue agrégée par cause** (§7) : endpoint
+   `monitoring_causes` (groupe l'état courant des contrôles en échec par
+   `(stage, control, classe, raison)` → nb fichiers + partenaires + exemples, trié
+   par sévérité) + bouton « ⚠ Causes (N) » → modale. **Complément** (second niveau,
+   lecture seule) ; l'unité de travail reste le fichier. Transforme « 2092 lignes »
+   en « 1 cause » et surface le signal `revoked_partner_still_emitting`.
 5. **(Optionnel, plus tard)** modèle de **triage** mutable (statut traité/en
    attente + propriétaire) si on veut un workflow ops, en read-model séparé (§9.2).
 

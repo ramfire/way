@@ -25,6 +25,7 @@ from api.views import (
     admission_detail,
     archive_received_file,
     download_received_file,
+    monitoring_causes,
     monitoring_feed,
     monitoring_page,
     restore_received_file,
@@ -40,6 +41,7 @@ urlpatterns = [
     path('files/<int:pk>/restore/', restore_received_file, name='restore-file'),
     path('monitoring/', monitoring_page, name='monitoring'),
     path('monitoring/feed/', monitoring_feed, name='monitoring-feed'),
+    path('monitoring/causes/', monitoring_causes, name='monitoring-causes'),
     path('monitoring/admission/<int:pk>/', admission_detail, name='monitoring-admission'),
     path('healthz/', lambda r: JsonResponse({'status': 'ok'})),
 ]

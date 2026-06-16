@@ -1,5 +1,6 @@
 import logging
 import posixpath
+from collections import Counter
 
 from django.conf import settings
 from django.contrib.admin.views.decorators import staff_member_required
@@ -517,6 +518,85 @@ def monitoring_feed(request):
         'offset': offset,
         'matched_total': matched_total,
         'returned': len(qs),
+        'server_time': timezone.now().isoformat(),
+    })
+
+
+@staff_member_required
+def monitoring_causes(request):
+    """Agrégation « par cause » des contrôles en échec courants (complément).
+
+    Vue de **second niveau** (unité de travail = le fichier, cf. design §7) : regroupe
+    l'état **courant** des contrôles en échec (dernier ``Event`` par
+    ``(file, stage, control)``, ``result=failed``) par **cause** =
+    ``(stage, control, monitoring_class, reason)``. Pour chaque cause : nombre de
+    fichiers, partenaires dominants, quelques exemples. Sert à voir que « N lignes
+    partagent une cause » et à **surfacer les signaux** (un même ``warning_action``
+    sur 2092 fichiers = une action). Lecture seule, gardée staff ; ne modifie rien.
+    """
+    view = 'history' if request.GET.get('view') == 'history' else 'live'
+    states = HISTORY_STATES if view == 'history' else LIVE_STATES
+    file_ids = list(ReceivedFile.objects.filter(state__in=states)
+                    .values_list('id', flat=True))
+
+    # État courant de chaque contrôle (dernier event par (file, stage, control)).
+    events = (Event.objects.filter(file_id__in=file_ids)
+              .order_by('file_id', 'stage', 'control', '-created_at', '-id')
+              .values('file_id', 'stage', 'control', 'monitoring_class', 'result', 'detail'))
+    current = {}
+    for e in events:
+        key = (e['file_id'], e['stage'], e['control'])
+        if key not in current:
+            current[key] = e
+
+    # Regrouper les contrôles COURANTS en échec par cause.
+    causes = {}
+    affected = set()
+    for e in current.values():
+        if e['result'] != Event.Result.FAILED:
+            continue
+        affected.add(e['file_id'])
+        detail = e['detail'] if isinstance(e['detail'], dict) else {}
+        reason = detail.get('reason') or '—'
+        key = (e['stage'], e['control'], e['monitoring_class'], reason)
+        agg = causes.get(key)
+        if agg is None:
+            agg = causes[key] = {
+                'stage': e['stage'], 'control': e['control'],
+                'monitoring_class': e['monitoring_class'], 'reason': reason,
+                'count': 0, '_users': Counter(), '_examples': [],
+            }
+        agg['count'] += 1
+        # On compte aussi l'username vide ('' = partenaire « vide » bien réel ici) ;
+        # l'UI l'affiche « ∅ ». most_common surface le(s) partenaire(s) dominant(s).
+        agg['_users'][detail.get('username') or ''] += 1
+        if len(agg['_examples']) < 5:
+            agg['_examples'].append(e['file_id'])
+
+    # Résoudre les noms d'exemples (une seule requête).
+    ex_ids = {fid for c in causes.values() for fid in c['_examples']}
+    names = {}
+    if ex_ids:
+        for rf in (ReceivedFile.objects.filter(id__in=ex_ids)
+                   .values('id', 's3_key', 'path')):
+            names[rf['id']] = posixpath.basename(
+                rf['s3_key'] or rf['path'] or '') or '(sans nom)'
+
+    rows = [{
+        'stage': c['stage'], 'control': c['control'],
+        'monitoring_class': c['monitoring_class'], 'reason': c['reason'],
+        'count': c['count'],
+        'top_users': [{'username': u, 'count': n} for u, n in c['_users'].most_common(3)],
+        'examples': [names.get(fid, str(fid)) for fid in c['_examples']],
+    } for c in causes.values()]
+    # Tri : le plus sévère d'abord, puis le plus gros volume.
+    rows.sort(key=lambda r: (-MONITORING_SEVERITY.get(r['monitoring_class'], -1), -r['count']))
+
+    return JsonResponse({
+        'view': view,
+        'causes': rows,
+        'cause_total': len(rows),
+        'files_affected': len(affected),
         'server_time': timezone.now().isoformat(),
     })
 
