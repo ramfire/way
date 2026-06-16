@@ -332,8 +332,10 @@
 
     // Classes de monitoring (axe contrôles), de la plus sévère à la moins (worst-wins).
     // Ordre = échelle de sévérité décidée (design §5) ; `none` = aucun contrôle passé.
+    // `handled` = clé synthétique du feed (fichiers traités) → chip vert dédié,
+    // hors classes de problème ; `none` = aucun contrôle passé.
     const CLASS_ORDER = ['blocking', 'warning_action', 'recycle', 'reject',
-                         'warning_noaction', 'push', 'none'];
+                         'warning_noaction', 'push', 'handled', 'none'];
 
     let lang = localStorage.getItem('monitoring_lang');
     if (!I18N[lang]) lang = 'en';      // défaut : anglais
@@ -464,8 +466,10 @@
     // sévère au moins sévère ; on n'affiche que les classes présentes (count > 0).
     function controlChip(cls, count) {
       const active = (controlFilter === cls) ? ' active' : '';
-      const label = t('mc_' + cls) || cls;
+      // `handled` : libellé + badge vert « traité » (réutilise tr-resolved).
+      const label = (cls === 'handled') ? t('tr_handled') : (t('mc_' + cls) || cls);
       const inner = (cls === 'none') ? esc(label)
+        : (cls === 'handled') ? `<span class="badge tr-resolved">${esc(label)}</span>`
         : `<span class="badge mc-${esc(cls)}">${esc(label)}</span>`;
       return `<span class="stat clickable${active}" data-control="${esc(cls)}">${inner} <b>${count}</b></span>`;
     }

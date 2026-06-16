@@ -290,12 +290,17 @@ class TriageTests(TestCase):
                       .values('control_class').annotate(n=Count('id')))}
         # 3 fichiers révoqués → control_class worst-wins = warning_action.
         self.assertEqual(counts().get('warning_action'), 3)
-        # On en traite un → il sort du compteur de sa classe.
+        handled = lambda: (ReceivedFile.objects
+                           .filter(triage__status=FileTriage.Status.RESOLVED).count())
+        self.assertEqual(handled(), 0)
+        # On en traite un → il sort du compteur de sa classe et alimente `handled`.
         self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'resolve'})
         self.assertEqual(counts().get('warning_action'), 2)
-        # Rouvrir → il y revient.
+        self.assertEqual(handled(), 1)
+        # Rouvrir → il y revient (et quitte `handled`).
         self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'reopen'})
         self.assertEqual(counts().get('warning_action'), 3)
+        self.assertEqual(handled(), 0)
 
     def test_files_open_drops_when_all_covering_causes_resolved(self):
         self.assertEqual(self.client.get('/monitoring/causes/').json()['files_open'], 3)

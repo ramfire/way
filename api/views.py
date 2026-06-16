@@ -383,34 +383,44 @@ def monitoring_feed(request):
         return qs if show_handled else qs.exclude(
             triage__status=FileTriage.Status.RESOLVED)
 
-    base = _hide_handled(base)
-
     # Compteurs par classe de monitoring (axe contrôles, read-model matérialisé),
     # sur la vue courante AVANT le filtre par classe → pilotent les chips. `none` =
     # aucun contrôle encore passé (control_class NULL). On exclut TOUJOURS les
-    # fichiers traités (triage resolved), même quand on les affiche : un fichier
-    # traité n'est plus un problème → il sort des chips (recycle/reject/…) et de
-    # Causes(N). Il reste visible dans la liste (badge vert « traité »).
+    # fichiers traités (triage resolved) des classes de problème : un fichier traité
+    # n'est plus un problème → il sort des chips (recycle/reject/…) et de Causes(N).
+    # On les compte à part sous la clé synthétique `handled` (chip vert dédié,
+    # cliquable pour les revoir, indépendant du toggle « afficher les traités »).
     per_control_class = {}
     for row in (ReceivedFile.objects.filter(state__in=states)
                 .exclude(triage__status=FileTriage.Status.RESOLVED)
                 .values('control_class').annotate(n=Count('id'))):
         per_control_class[row['control_class'] or 'none'] = row['n']
+    handled_count = (ReceivedFile.objects
+                     .filter(state__in=states,
+                             triage__status=FileTriage.Status.RESOLVED).count())
+    if handled_count:
+        per_control_class['handled'] = handled_count
 
     # Filtre par classe de monitoring (chip cliquable). Valeurs valides = les 6
-    # classes + `none` (NULL). Toute autre valeur est ignorée (= pas de filtre).
+    # classes + `none` (NULL) + `handled` (chip vert dédié). Autre → pas de filtre.
     valid_classes = set(Event.MonitoringClass.values)
     control_filter = request.GET.get('control')
-    if control_filter == 'none':
-        base = base.filter(control_class__isnull=True)
-    elif control_filter in valid_classes:
-        # Cohérent avec les chips : un fichier traité n'est plus compté dans sa
-        # classe d'origine, on l'exclut donc aussi du filtrage par classe (même
-        # quand les traités sont affichés).
-        base = base.filter(control_class=control_filter).exclude(
-            triage__status=FileTriage.Status.RESOLVED)
+    if control_filter == 'handled':
+        # Chip « Traité » : on n'affiche QUE les traités (override du masquage par
+        # défaut — sinon il n'y aurait rien à voir).
+        base = base.filter(triage__status=FileTriage.Status.RESOLVED)
     else:
-        control_filter = None
+        base = _hide_handled(base)
+        if control_filter == 'none':
+            base = base.filter(control_class__isnull=True)
+        elif control_filter in valid_classes:
+            # Cohérent avec les chips : un fichier traité n'est plus compté dans sa
+            # classe d'origine, on l'exclut donc aussi du filtrage par classe.
+            base = base.exclude(
+                triage__status=FileTriage.Status.RESOLVED).filter(
+                control_class=control_filter)
+        else:
+            control_filter = None
 
     # Total des lignes correspondant au(x) filtre(s), AVANT pagination (top-N).
     matched_total = base.count()
