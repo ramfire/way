@@ -709,8 +709,8 @@ def triage_cause(request):
 @require_POST
 @staff_member_required
 def triage_file(request, pk):
-    """Override de triage AU NIVEAU FICHIER : ``resolve`` (marque traité, prime sur
-    l'ack de cause) ou ``reopen`` (retire l'override → le fichier suit sa cause).
+    """Override de triage AU NIVEAU FICHIER : ``resolve`` (marque traité **et
+    re-contrôle**) ou ``reopen`` (retire l'override → le fichier suit sa cause).
     """
     rf = get_object_or_404(ReceivedFile, pk=pk)
     action = request.POST.get('action')
@@ -721,8 +721,17 @@ def triage_file(request, pk):
         if 'note' in request.POST:
             t.note = (request.POST.get('note') or '')[:2000]
         t.save()
-        logger.info('Triage file %s -> resolved par %s', pk, request.user)
-        return JsonResponse({'ok': True, 'status': t.status, 'owner': t.owner})
+        # « Traiter » pose le flag ET re-contrôle (rejoue l'admission) : si la cause
+        # a été corrigée (partenaire enrôlé, canal autorisé…), le verdict repasse à
+        # admis → control_class OK (badge Recyclage → OK). Sinon il reste en échec,
+        # avec le flag traité. Idempotent et append-only (cf. api/admission.py).
+        from .admission import file_admission
+        verdict = file_admission(rf.pk)
+        rf.refresh_from_db()
+        logger.info('Triage file %s -> resolved (re-contrôle: %s) par %s',
+                    pk, verdict, request.user)
+        return JsonResponse({'ok': True, 'status': t.status, 'owner': t.owner,
+                             'verdict': verdict, 'control_class': rf.control_class})
     if action == 'reopen':
         FileTriage.objects.filter(file=rf).delete()
         logger.info('Triage file %s -> reopen (override retiré) par %s', pk, request.user)

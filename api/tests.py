@@ -303,6 +303,35 @@ class TriageTests(TestCase):
         self.assertEqual(counts().get('warning_action'), 3)
         self.assertEqual(handled(), 0)
 
+    def test_resolve_recontrols_and_flips_to_ok_when_cause_fixed(self):
+        # « Traiter » pose le flag ET re-contrôle : cause corrigée → badge Recycle → OK.
+        from api.models import FileTriage
+        rf = make_file(username='newcomer')        # non mappé → recycle
+        file_admission(rf.pk)
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
+        # On enrôle le partenaire (cause corrigée), puis on traite.
+        Partner.objects.create(username='newcomer', status=Partner.Status.ACTIVE)
+        r = self.client.post(f'/monitoring/triage/file/{rf.pk}/',
+                             {'action': 'resolve'}).json()
+        self.assertEqual(r['verdict'], VERDICT_ADMIS)
+        self.assertEqual(r['control_class'], Event.MonitoringClass.PUSH)
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)   # OK
+        self.assertEqual(rf.triage.status, FileTriage.Status.RESOLVED)   # flag persiste
+
+    def test_resolve_recontrols_but_stays_failing_if_cause_unfixed(self):
+        # Traiter sans corriger la cause : re-contrôle → reste recycle, flag posé.
+        from api.models import FileTriage
+        rf = make_file(username='stranger')        # jamais enrôlé
+        file_admission(rf.pk)
+        r = self.client.post(f'/monitoring/triage/file/{rf.pk}/',
+                             {'action': 'resolve'}).json()
+        self.assertEqual(r['verdict'], VERDICT_RECYCLE)
+        self.assertEqual(r['control_class'], Event.MonitoringClass.RECYCLE)
+        rf.refresh_from_db()
+        self.assertEqual(rf.triage.status, FileTriage.Status.RESOLVED)
+
     def test_files_open_drops_when_all_covering_causes_resolved(self):
         self.assertEqual(self.client.get('/monitoring/causes/').json()['files_open'], 3)
         for sig in (self._WARN, {'stage': 'admission', 'control': 'verdict',

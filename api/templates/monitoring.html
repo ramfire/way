@@ -315,7 +315,7 @@
     let sortDir = 1;                   // 1 = asc, -1 = desc
     let stateFilter = null;            // null = tous ; sinon un état (r.state) à isoler
     let controlFilter = null;          // null = toutes ; sinon une classe de monitoring
-    let hideHandled = localStorage.getItem('monitoring_hide_handled') !== '0';  // défaut: masquer
+    let hideHandled = localStorage.getItem('monitoring_hide_handled') === '1';  // défaut: afficher
     let offset = 0;                    // décalage de pagination (0 = première page)
 
     // Colonnes triables : id du <th>, clé de tri (champ de la ligne), clé i18n du libellé.
