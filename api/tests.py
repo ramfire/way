@@ -277,10 +277,11 @@ class TriageTests(TestCase):
         self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'reopen'})
         self.assertIn(self.files[0].pk, default())      # réapparaît après reopen
 
-    def test_handled_file_excluded_from_control_class_counts(self):
-        # Les chips par classe (per_control_class) excluent TOUJOURS les traités,
-        # même affichés : un fichier traité n'est plus compté comme un problème.
-        # Reproduit la requête du feed (non testable sur SQLite : regexp_replace).
+    def test_handled_file_counts_respect_hide_and_handled_bucket(self):
+        # per_control_class compte par VRAIE classe en respectant le masquage des
+        # traités (défaut : masqués → exclus de leur classe), et les traités sont
+        # comptés à part dans le bucket `handled`. Reproduit la requête du feed en
+        # vue masquée (non testable sur SQLite : regexp_replace).
         from django.db.models import Count
         from api.models import FileTriage
         counts = lambda: {

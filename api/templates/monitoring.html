@@ -61,6 +61,9 @@
     .tr-in_progress { background:#1e3a8a; color:#bfdbfe; }
     .tr-resolved    { background:#14532d; color:#bbf7d0; }
     .tr-owner { color:var(--mut); font-size:.74rem; margin-left:.3rem; }
+    /* Flag « traité » : marqueur orthogonal au résultat (à côté du badge de classe). */
+    .flag-handled { font-size:.7rem; font-weight:600; color:#bbf7d0;
+      border:1px solid #14532d; border-radius:999px; padding:.05rem .4rem; white-space:nowrap; }
     .chk { font-size:.8rem; color:var(--mut); display:flex; align-items:center;
            gap:.3rem; cursor:pointer; user-select:none; }
     button.act, button.tri-act { padding:.2rem .55rem; font-size:.76rem; }
@@ -453,13 +456,17 @@
     // par contrôle au double-clic (modale).
     function controlBadge(r) {
       const c = r.control_class;
-      // Fichier traité (triage resolved) : le contrôle est résolu → badge vert,
-      // quelle que soit sa classe d'origine (recycle/reject/…). Le verdict réel
-      // (modale) reste inchangé ; « Rouvrir » rétablit la classe d'origine.
-      if (r.triage === 'resolved' && c && c !== 'push')
-        return `<span class="badge tr-resolved">${esc(t('tr_handled'))}</span>`;
-      if (!c) return `<span class="mc-none">${esc(t('mc_none'))}</span>`;
-      return `<span class="badge mc-${esc(c)}">${esc(t('mc_' + c) || c)}</span>`;
+      // Le badge montre TOUJOURS le vrai résultat courant (recycle/reject orange
+      // tant que pas re-contrôlé, push/OK vert une fois re-contrôlé et passé). Le
+      // « traité » est un FLAG orthogonal qui persiste à côté (acquittement humain).
+      // Le re-contrôle réel se fait via « Rejouer l'admission » (modale).
+      const flag = (r.triage === 'resolved')
+        ? ` <span class="flag-handled" title="${esc(t('tr_handled'))}">${esc(t('tr_handled'))}</span>`
+        : '';
+      const main = c
+        ? `<span class="badge mc-${esc(c)}">${esc(t('mc_' + c) || c)}</span>`
+        : `<span class="mc-none">${esc(t('mc_none'))}</span>`;
+      return main + flag;
     }
 
     // Chips de filtre par classe de monitoring (axe contrôles), ordonnés du plus

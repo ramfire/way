@@ -385,14 +385,14 @@ def monitoring_feed(request):
 
     # Compteurs par classe de monitoring (axe contrôles, read-model matérialisé),
     # sur la vue courante AVANT le filtre par classe → pilotent les chips. `none` =
-    # aucun contrôle encore passé (control_class NULL). On exclut TOUJOURS les
-    # fichiers traités (triage resolved) des classes de problème : un fichier traité
-    # n'est plus un problème → il sort des chips (recycle/reject/…) et de Causes(N).
-    # On les compte à part sous la clé synthétique `handled` (chip vert dédié,
-    # cliquable pour les revoir, indépendant du toggle « afficher les traités »).
+    # aucun contrôle encore passé (control_class NULL). On compte par **vraie
+    # classe** (le flag « traité » est orthogonal au verdict) : un fichier traité
+    # mais encore en échec reste compté dans sa classe de problème (recycle/…) tant
+    # qu'il n'a pas été re-contrôlé OK. Le masquage des traités s'applique comme à
+    # la liste (chip ↔ liste cohérents). Les traités sont AUSSI comptés à part sous
+    # la clé `handled` (chip vert dédié, cliquable, indépendant du toggle).
     per_control_class = {}
-    for row in (ReceivedFile.objects.filter(state__in=states)
-                .exclude(triage__status=FileTriage.Status.RESOLVED)
+    for row in (_hide_handled(ReceivedFile.objects.filter(state__in=states))
                 .values('control_class').annotate(n=Count('id'))):
         per_control_class[row['control_class'] or 'none'] = row['n']
     handled_count = (ReceivedFile.objects
@@ -414,11 +414,7 @@ def monitoring_feed(request):
         if control_filter == 'none':
             base = base.filter(control_class__isnull=True)
         elif control_filter in valid_classes:
-            # Cohérent avec les chips : un fichier traité n'est plus compté dans sa
-            # classe d'origine, on l'exclut donc aussi du filtrage par classe.
-            base = base.exclude(
-                triage__status=FileTriage.Status.RESOLVED).filter(
-                control_class=control_filter)
+            base = base.filter(control_class=control_filter)
         else:
             control_filter = None
 
