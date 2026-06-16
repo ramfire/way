@@ -451,6 +451,11 @@
     // par contrôle au double-clic (modale).
     function controlBadge(r) {
       const c = r.control_class;
+      // Fichier traité (triage resolved) : le contrôle est résolu → badge vert,
+      // quelle que soit sa classe d'origine (recycle/reject/…). Le verdict réel
+      // (modale) reste inchangé ; « Rouvrir » rétablit la classe d'origine.
+      if (r.triage === 'resolved' && c && c !== 'push')
+        return `<span class="badge tr-resolved">${esc(t('tr_handled'))}</span>`;
       if (!c) return `<span class="mc-none">${esc(t('mc_none'))}</span>`;
       return `<span class="badge mc-${esc(c)}">${esc(t('mc_' + c) || c)}</span>`;
     }
@@ -500,11 +505,11 @@
         if (view === 'history' && r.can_restore)
           acts.push(`<button class="act" data-act="restore" data-id="${r.id}">${t('restore')}</button>`);
         // Triage fichier (étape 5) : seulement pour les fichiers à classe non-OK.
-        // Override `resolved` → badge « traité » + Rouvrir ; sinon → Traiter.
+        // Le badge « traité » vit désormais dans la colonne Contrôles (vert) ;
+        // ici on ne garde que l'action : Rouvrir (si traité) ou Traiter.
         if (r.control_class && r.control_class !== 'push') {
           if (r.triage === 'resolved')
-            acts.push(`<span class="badge tr-resolved">${t('tr_handled')}</span>`
-              + ` <button class="tri-act" data-tri="reopen" data-id="${r.id}">${t('tr_unmark')}</button>`);
+            acts.push(`<button class="tri-act" data-tri="reopen" data-id="${r.id}">${t('tr_unmark')}</button>`);
           else
             acts.push(`<button class="tri-act" data-tri="resolve" data-id="${r.id}">${t('tr_mark')}</button>`);
         }

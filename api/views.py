@@ -387,9 +387,13 @@ def monitoring_feed(request):
 
     # Compteurs par classe de monitoring (axe contrôles, read-model matérialisé),
     # sur la vue courante AVANT le filtre par classe → pilotent les chips. `none` =
-    # aucun contrôle encore passé (control_class NULL).
+    # aucun contrôle encore passé (control_class NULL). On exclut TOUJOURS les
+    # fichiers traités (triage resolved), même quand on les affiche : un fichier
+    # traité n'est plus un problème → il sort des chips (recycle/reject/…) et de
+    # Causes(N). Il reste visible dans la liste (badge vert « traité »).
     per_control_class = {}
-    for row in (_hide_handled(ReceivedFile.objects.filter(state__in=states))
+    for row in (ReceivedFile.objects.filter(state__in=states)
+                .exclude(triage__status=FileTriage.Status.RESOLVED)
                 .values('control_class').annotate(n=Count('id'))):
         per_control_class[row['control_class'] or 'none'] = row['n']
 
@@ -400,7 +404,11 @@ def monitoring_feed(request):
     if control_filter == 'none':
         base = base.filter(control_class__isnull=True)
     elif control_filter in valid_classes:
-        base = base.filter(control_class=control_filter)
+        # Cohérent avec les chips : un fichier traité n'est plus compté dans sa
+        # classe d'origine, on l'exclut donc aussi du filtrage par classe (même
+        # quand les traités sont affichés).
+        base = base.filter(control_class=control_filter).exclude(
+            triage__status=FileTriage.Status.RESOLVED)
     else:
         control_filter = None
 

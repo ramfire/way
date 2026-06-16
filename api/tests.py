@@ -277,6 +277,26 @@ class TriageTests(TestCase):
         self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'reopen'})
         self.assertIn(self.files[0].pk, default())      # réapparaît après reopen
 
+    def test_handled_file_excluded_from_control_class_counts(self):
+        # Les chips par classe (per_control_class) excluent TOUJOURS les traités,
+        # même affichés : un fichier traité n'est plus compté comme un problème.
+        # Reproduit la requête du feed (non testable sur SQLite : regexp_replace).
+        from django.db.models import Count
+        from api.models import FileTriage
+        counts = lambda: {
+            (r['control_class'] or 'none'): r['n']
+            for r in (ReceivedFile.objects
+                      .exclude(triage__status=FileTriage.Status.RESOLVED)
+                      .values('control_class').annotate(n=Count('id')))}
+        # 3 fichiers révoqués → control_class worst-wins = warning_action.
+        self.assertEqual(counts().get('warning_action'), 3)
+        # On en traite un → il sort du compteur de sa classe.
+        self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'resolve'})
+        self.assertEqual(counts().get('warning_action'), 2)
+        # Rouvrir → il y revient.
+        self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'reopen'})
+        self.assertEqual(counts().get('warning_action'), 3)
+
     def test_files_open_drops_when_all_covering_causes_resolved(self):
         self.assertEqual(self.client.get('/monitoring/causes/').json()['files_open'], 3)
         for sig in (self._WARN, {'stage': 'admission', 'control': 'verdict',
