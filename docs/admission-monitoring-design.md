@@ -198,3 +198,51 @@ Portée du renommage :
 - ~~**Unité de travail** opérateur : le fichier, ou la cause/partenaire~~ —
   **TRANCHÉ (2026-06-16) : le FICHIER.** Board fichier = vue principale ; agrégat
   par cause = complément de second niveau (§7).
+
+## 12. Qualification (§1.3) — spec (2026-06-19)
+
+> Deuxième producteur de l'axe B après l'admission. **Observation/classification
+> pure**, même contrat que l'admission (§9) : append-only, rejouable, ne touche
+> jamais `state`, ne lève jamais. Le board reste **générique** (§4/§5) — la
+> qualification n'ajoute qu'un `stage` et des `control`, aucun recâblage UI.
+
+**Modèle (déjà migré, 7 entités).** `Nomenclature(channel, sub_tenant, subfolder,
+grammar JSON, mandatory JSON list, active)`, `UniqueConstraint(channel, subfolder)`.
+`Event.stage` accepte `qualification` ; `Event.cause_code` porte la cause normalisée.
+
+**Sélecteur.** `subfolder = dirname(s3_key)` (le dossier SFTP, dépouillé des `/` de
+bord) ; le **nom de fichier** = `basename(s3_key)`.
+
+**Grammaire.** `grammar = {"filename": "<regex>"}`. Match = `re.fullmatch(regex,
+basename)`. `grammar` sans clé `filename` ⇒ **aucune contrainte de nom** (on ne
+bloque pas par défaut). Regex invalide ⇒ erreur de **config** → `recycle`
+(`cause_code=grammar_invalid`), corrigeable puis rejeu.
+
+**`mandatory` : différé.** Concept de complétude d'un *dossier* (N fichiers
+attendus) — incompatible avec la granularité *par fichier* retenue ici. Colonne
+conservée, **non câblée** dans cet incrément (futur stage « complétude/batch »).
+
+**Déclenchement.** Chaînée dans `file_admission`, **uniquement** après un verdict
+admission `admis` (donc canal/partenaire résolus). Rejouable : le rejeu d'admission
+(modale « Rejouer », action « Handle ») ré-exécute admission **puis** qualification.
+Un seul `refresh_control_class` en fin de chaîne couvre les deux stages.
+
+**Contrôles → verdicts (par fichier).**
+
+| Contrôle | Condition d'échec | Verdict | `monitoring_class` | `cause_code` |
+|---|---|---|---|---|
+| `nomenclature_recognised` | pas de `Nomenclature(channel, subfolder, active)` | **recycle** | `recycle` | `nomenclature_not_found` |
+| `filename_grammar` | `basename` ne matche pas la regex | **quarantine** | `reject` | `filename_grammar_mismatch` |
+| `filename_grammar` | regex de config invalide | **recycle** | `recycle` | `grammar_invalid` |
+| `verdict` | tout passe | **qualified** | `push` | — |
+
+> **Discovery (recycle) vs non-conforme (quarantine).** Pas de nomenclature = trou
+> d'enrôlement, **retraitable** : un humain crée la `Nomenclature` puis rejoue
+> (miroir de `partner_not_mapped`). Nom non conforme = le fichier lui-même est
+> mauvais, **non retraité** : gardé pour audit (miroir de `partner_revoked`).
+
+**Board.** `current_control_rollup` (worst-wins, tous stages) gère seul la
+combinaison admission×qualification : un fichier `admis`+`quarantine` remonte en
+`reject`, `admis`+`recycle` en `recycle`, `admis`+`qualified` en `push`. « Handle »
+ne pose le flag « traité » que si le rollup redevient `push` (donc admis **et**
+qualifié) — inchangé.

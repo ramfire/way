@@ -5,8 +5,9 @@ from .admission import (
     STAGE, VERDICT_ADMIS, VERDICT_QUARANTINE, VERDICT_RECYCLE, file_admission,
     latest_admission_event,
 )
+from . import qualification as qual
 from .models import (
-    Channel, Event, Handled, Partner, ReceivedFile, SubTenant,
+    Channel, Event, Handled, Nomenclature, Partner, ReceivedFile, SubTenant,
     current_control_rollup, refresh_control_class,
 )
 
@@ -39,6 +40,17 @@ def enrol(username, status=Partner.Status.ACTIVE, sub_tenant=None):
         kind=Channel.Kind.SFTP, identifier=username, partner=p,
         sub_tenant=st, active=(status == Partner.Status.ACTIVE))
     return p
+
+
+def add_nomenclature(username, subfolder, filename_regex=None):
+    """Enrôle une Nomenclature pour le canal SFTP de ``username``.
+
+    ``filename_regex=None`` ⇒ grammaire vide (aucune contrainte de nom).
+    """
+    ch = Channel.objects.get(kind=Channel.Kind.SFTP, identifier=username)
+    grammar = {'filename': filename_regex} if filename_regex is not None else {}
+    return Nomenclature.objects.create(
+        channel=ch, sub_tenant=ch.sub_tenant, subfolder=subfolder, grammar=grammar)
 
 
 def verdict_events(rf):
@@ -177,6 +189,7 @@ class ControlRollupTests(TestCase):
 
     def test_admis_rolls_up_to_push(self):
         enrol('acme')
+        add_nomenclature('acme', 'in/acme', r'.+')   # qualifie aussi → push
         rf = make_file(username='acme')
         file_admission(rf.pk)
 
@@ -200,9 +213,10 @@ class ControlRollupTests(TestCase):
     def test_uses_current_state_after_rerun_not_stale(self):
         # recycle puis (enrôlement) admis : le rollup reflète l'état COURANT (push),
         # pas l'ancien recycle resté dans le journal append-only.
-        rf = make_file(username='newcomer')
+        rf = make_file(username='newcomer')         # subfolder par défaut 'in/acme'
         file_admission(rf.pk)                       # recycle
         enrol('newcomer')
+        add_nomenclature('newcomer', 'in/acme', r'.+')   # admis + qualifié → push
         file_admission(rf.pk)                       # admis
 
         roll = current_control_rollup([rf.pk])[rf.pk]
@@ -219,6 +233,7 @@ class ControlRollupTests(TestCase):
     def test_refresh_handles_bulk_and_null(self):
         rf_none = make_file(s3_key='in/x/none.csv')        # aucun contrôle → NULL
         enrol('acme')
+        add_nomenclature('acme', 'in/acme', r'.+')         # admis + qualifié → push
         rf_admis = make_file(username='acme', s3_key='in/acme/a.csv')
         file_admission(rf_admis.pk)
 
@@ -264,6 +279,9 @@ class HandledTests(TestCase):
 
     def setUp(self):
         enrol('old', status=Partner.Status.REVOKED)
+        # Nomenclature permissive : une fois le partenaire ré-activé, le « Handle »
+        # peut atteindre push (admis ET qualifié).
+        add_nomenclature('old', 'in/old', r'.+')
         self.files = [make_file(username='old', s3_key=f'in/old/{i}.csv') for i in range(3)]
         for f in self.files:
             file_admission(f.pk)
@@ -333,8 +351,9 @@ class HandledTests(TestCase):
         file_admission(rf.pk)
         rf.refresh_from_db()
         self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
-        # On enrôle le partenaire (cause corrigée), puis on traite.
+        # On enrôle le partenaire (+ nomenclature : qualifie aussi), puis on traite.
         enrol('newcomer')
+        add_nomenclature('newcomer', 'in/acme', r'.+')   # subfolder par défaut
         r = self._handle(rf)
         self.assertEqual(r['control_class'], Event.MonitoringClass.PUSH)
         self.assertTrue(r['handled'])
@@ -361,9 +380,10 @@ class ReplayAdmissionEndpointTests(TestCase):
 
     def test_replay_admits_after_enrolment(self):
         # recycle (partenaire non mappé) → enrôlement → rejeu via l'endpoint → admis.
-        rf = make_file(username='newcomer')
+        rf = make_file(username='newcomer')         # subfolder par défaut 'in/acme'
         self.assertEqual(file_admission(rf.pk), VERDICT_RECYCLE)
         enrol('newcomer')
+        add_nomenclature('newcomer', 'in/acme', r'.+')   # admis + qualifié → push
 
         self.client.force_login(self.staff)
         r = self.client.post(f'/monitoring/admission/{rf.pk}/replay/')
@@ -391,3 +411,91 @@ class ReplayAdmissionEndpointTests(TestCase):
         self.client.force_login(self.staff)
         self.assertEqual(
             self.client.get(f'/monitoring/admission/{rf.pk}/replay/').status_code, 405)
+
+
+class QualificationTests(TestCase):
+    """Étape qualification (§1.3) : chaînée après un admis, par fichier."""
+
+    def _admit(self, s3_key='in/way/sub/f.csv', username='way'):
+        """Enrôle le partenaire et lance l'admission (qui chaîne la qualification)."""
+        if not Partner.objects.filter(code=username).exists():
+            enrol(username)
+        rf = make_file(username=username, s3_key=s3_key)
+        from .admission import file_admission
+        file_admission(rf.pk)
+        rf.refresh_from_db()
+        return rf
+
+    def test_no_nomenclature_recycles(self):
+        # Admis mais aucune Nomenclature pour (canal, sous-dossier) → recycle.
+        rf = self._admit(s3_key='in/way/x.csv')   # subfolder 'in/way', non enrôlé
+        ev = qual.latest_qualification_event(rf)
+        self.assertEqual(ev.detail['verdict'], qual.VERDICT_RECYCLE)
+        self.assertEqual(ev.cause_code, qual.CAUSE_NOMENCLATURE_NOT_FOUND)
+        # worst-wins : recycle (30) prime sur les push de l'admission.
+        self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
+
+    def test_matching_filename_qualifies(self):
+        enrol('way')
+        add_nomenclature('way', 'in/way', r'.+\.csv')
+        rf = self._admit(s3_key='in/way/data.csv')
+        ev = qual.latest_qualification_event(rf)
+        self.assertEqual(ev.detail['verdict'], qual.VERDICT_QUALIFIED)
+        # admis + qualifié → tout push → board push.
+        self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
+
+    def test_mismatching_filename_quarantines(self):
+        enrol('way')
+        add_nomenclature('way', 'in/way', r'\d+\.csv')   # n'accepte que des chiffres
+        rf = self._admit(s3_key='in/way/abc.csv')
+        ev = qual.latest_qualification_event(rf)
+        self.assertEqual(ev.detail['verdict'], qual.VERDICT_QUARANTINE)
+        self.assertEqual(ev.cause_code, qual.CAUSE_GRAMMAR_MISMATCH)
+        # quarantine (reject=20) prime sur les push → board reject.
+        self.assertEqual(rf.control_class, Event.MonitoringClass.REJECT)
+
+    def test_no_filename_constraint_qualifies(self):
+        enrol('way')
+        add_nomenclature('way', 'in/way')   # grammaire vide → pas de contrainte
+        rf = self._admit(s3_key='in/way/anything.bin')
+        self.assertEqual(qual.latest_qualification_event(rf).detail['verdict'],
+                         qual.VERDICT_QUALIFIED)
+
+    def test_invalid_regex_recycles(self):
+        enrol('way')
+        add_nomenclature('way', 'in/way', '[')   # regex invalide (config)
+        rf = self._admit(s3_key='in/way/data.csv')
+        ev = qual.latest_qualification_event(rf)
+        self.assertEqual(ev.detail['verdict'], qual.VERDICT_RECYCLE)
+        self.assertEqual(ev.cause_code, qual.CAUSE_GRAMMAR_INVALID)
+
+    def test_not_run_when_admission_not_admis(self):
+        # Compte non mappé → admission recycle → AUCUN événement de qualification.
+        rf = make_file(username='ghost', s3_key='in/ghost/x.csv')
+        from .admission import file_admission
+        file_admission(rf.pk)
+        self.assertFalse(
+            Event.objects.filter(file=rf, stage=qual.STAGE).exists())
+
+    def test_replay_requalifies_after_nomenclature_enrolled(self):
+        # 1er passage : admis mais pas de nomenclature → recycle. On enrôle, rejeu → qualifié.
+        rf = self._admit(s3_key='in/way/data.csv')
+        self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
+        add_nomenclature('way', 'in/way', r'.+\.csv')
+        from .admission import file_admission
+        file_admission(rf.pk)                     # rejeu : admission + qualification
+        rf.refresh_from_db()
+        self.assertEqual(qual.latest_qualification_event(rf).detail['verdict'],
+                         qual.VERDICT_QUALIFIED)
+        self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
+
+    def test_file_qualification_never_raises(self):
+        self.assertIsNone(qual.file_qualification(999999))
+
+    def test_subfolder_is_dirname_of_s3_key(self):
+        enrol('way')
+        # Nomenclature sur le BON sous-dossier (dirname) → trouvée.
+        add_nomenclature('way', 'in/way/deep', r'.+')
+        rf = self._admit(s3_key='in/way/deep/f.txt')
+        self.assertEqual(qual.latest_qualification_event(rf).detail['verdict'],
+                         qual.VERDICT_QUALIFIED)

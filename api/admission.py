@@ -208,13 +208,31 @@ def file_admission(file_id):
     """
     try:
         verdict = _run(file_id)
+        # Chaînage qualification : seulement si admis (canal/partenaire résolus).
+        # Garde dédiée → un échec de qualification n'affecte JAMAIS le verdict
+        # d'admission qu'on renvoie. Le refresh ci-dessous couvre les deux stages.
+        if verdict == VERDICT_ADMIS:
+            _run_qualification(file_id)
         # Rematérialise le rollup worst-wins de l'axe contrôles pour ce fichier
-        # (read-model du board). Source de vérité = les Event qu'on vient d'émettre.
+        # (read-model du board), tous stages confondus. Source de vérité = les Event.
         refresh_control_class([file_id])
         return verdict
     except Exception:
         logger.exception('Admission: erreur inattendue pour file %s', file_id)
         return None
+
+
+def _run_qualification(file_id):
+    """Chaîne la qualification, garantie non bloquante (log + avale toute erreur).
+
+    Le ``refresh_control_class`` est laissé à l'appelant (admission) pour n'en faire
+    qu'un seul, couvrant admission + qualification.
+    """
+    try:
+        from .qualification import qualify_no_refresh
+        qualify_no_refresh(file_id)
+    except Exception:
+        logger.exception('Qualification (chaînée): échec non bloquant file %s', file_id)
 
 
 def latest_admission_event(rf_or_id):
