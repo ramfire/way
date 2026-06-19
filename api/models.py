@@ -13,6 +13,36 @@ def now_ms():
     return t.replace(microsecond=(t.microsecond // 1000) * 1000)
 
 
+class SubTenant(models.Model):
+    """Locataire de premier niveau (entité cliente d'AlfaWay).
+
+    Racine de l'isolation multi-tenant : Partner, Channel, Nomenclature,
+    ReceivedFile, Event et Handled portent tous une FK ``sub_tenant``. ``code``
+    est l'identifiant stable (court, unique) utilisé en référence ; ``name`` est
+    le libellé humain. Un SubTenant par défaut (``GIL``) sert de cible de backfill
+    pour les données antérieures au modèle multi-tenant.
+    """
+
+    code = models.CharField(max_length=32, unique=True, db_index=True)
+    name = models.CharField(max_length=255, blank=True, default='')
+
+    def __str__(self):
+        return self.code
+
+
+# Locataire par défaut : tampon d'**ingest**. Au moment où un fichier arrive (hook
+# pre-upload/upload) ou est rattrapé par la réconciliation, on ne connaît pas encore
+# son locataire — on l'estampille ``GIL`` puis l'admission le re-pointe vers le
+# locataire du canal résolu. ``sub_tenant`` étant NOT NULL, tout insert DOIT en poser
+# un (sinon IntegrityError silencieuse côté webhook, cf. CLAUDE.md « Déploiement »).
+DEFAULT_SUB_TENANT_CODE = 'GIL'
+
+
+def default_sub_tenant_id():
+    """PK du SubTenant par défaut (``GIL``), pour estampiller un fichier à l'ingest."""
+    return SubTenant.objects.get(code=DEFAULT_SUB_TENANT_CODE).pk
+
+
 class ReceivedFile(models.Model):
     """Métadonnées d'un fichier reçu via les hooks SFTPGo (direct-S3, option C).
 
@@ -32,6 +62,21 @@ class ReceivedFile(models.Model):
 
     state = models.CharField(
         max_length=16, choices=State.choices, default=State.RECEIVING, db_index=True,
+    )
+
+    # Multi-tenant : locataire propriétaire de ce fichier (FK auto-indexée).
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='files',
+    )
+    # Caches de résolution (posés par l'admission). Nullable par nature : un fichier
+    # d'un compte non mappé (discovery) n'a ni canal ni partenaire résolu.
+    channel = models.ForeignKey(
+        'Channel', on_delete=models.SET_NULL, related_name='files',
+        null=True, blank=True,
+    )
+    partner = models.ForeignKey(
+        'Partner', on_delete=models.SET_NULL, related_name='files',
+        null=True, blank=True,
     )
 
     # Identité du fichier
@@ -96,13 +141,90 @@ class Partner(models.Model):
         ACTIVE = 'active', 'Actif'
         REVOKED = 'revoked', 'Révoqué'
 
-    username = models.CharField(max_length=255, unique=True, db_index=True)
+    # Identifiant métier, unique PAR locataire (cf. UniqueConstraint ci-dessous).
+    code = models.CharField(max_length=255, db_index=True)
     status = models.CharField(
         max_length=16, choices=Status.choices, default=Status.ACTIVE,
     )
+    # Multi-tenant : locataire propriétaire (FK auto-indexée).
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='partners',
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['sub_tenant', 'code'], name='uniq_partner_subtenant_code'),
+        ]
 
     def __str__(self):
-        return f'{self.username} ({self.status})'
+        return f'{self.code} ({self.status})'
+
+
+class Channel(models.Model):
+    """Voie d'arrivée concrète d'un partenaire (un compte SFTP, une adresse mail…).
+
+    Un partenaire peut avoir plusieurs canaux. La **résolution** d'un fichier reçu
+    part du seul ``identifier`` (ex : le ``username`` SFTPGo) : la contrainte
+    d'unicité ``(kind, identifier)`` est **globale** (pas de scope sub_tenant) — le
+    locataire en **découle** via le canal trouvé. ``rule`` (JSON, optionnel) porte
+    une autorisation grossière (préfixes de chemin…) ; ``active`` reflète l'état.
+    """
+
+    class Kind(models.TextChoices):
+        SFTP = 'sftp', 'SFTP'
+        EMAIL = 'email', 'E-mail'
+        WEB = 'web', 'Web'
+        URL = 'url', 'URL (réservé)'
+
+    partner = models.ForeignKey(
+        Partner, on_delete=models.CASCADE, related_name='channels',
+    )
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='channels',
+    )
+    kind = models.CharField(max_length=16, choices=Kind.choices, db_index=True)
+    identifier = models.CharField(max_length=255, db_index=True)
+    rule = models.JSONField(null=True, blank=True)
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['kind', 'identifier'], name='uniq_channel_kind_identifier'),
+        ]
+
+    def __str__(self):
+        return f'{self.kind}:{self.identifier}'
+
+
+class Nomenclature(models.Model):
+    """Grammaire attendue d'un sous-dossier d'un canal (sélecteur → règles).
+
+    Sert l'étape **qualification** (incrément suivant, pas encore câblée) : pour un
+    canal donné, ``subfolder`` sélectionne le jeu de règles ; ``grammar`` décrit le
+    format attendu et ``mandatory`` la liste des éléments obligatoires. Table créée
+    **vide** ici — l'enrôlement se fait à la main (admin)."""
+
+    channel = models.ForeignKey(
+        Channel, on_delete=models.CASCADE, related_name='nomenclatures',
+    )
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='nomenclatures',
+    )
+    subfolder = models.CharField(max_length=255, blank=True, default='')
+    grammar = models.JSONField(default=dict, blank=True)
+    mandatory = models.JSONField(default=list, blank=True)
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['channel', 'subfolder'], name='uniq_nomenclature_channel_subfolder'),
+        ]
+
+    def __str__(self):
+        return f'{self.channel}/{self.subfolder or "(racine)"}'
 
 
 class Event(models.Model):
@@ -114,6 +236,10 @@ class Event(models.Model):
     n'update ni ne supprime jamais. L'« état d'admission » courant d'un fichier est
     son **dernier** événement de stage ``admission``.
     """
+
+    class Stage(models.TextChoices):
+        ADMISSION = 'admission', 'Admission'
+        QUALIFICATION = 'qualification', 'Qualification'
 
     class Result(models.TextChoices):
         PASSED = 'passed', 'Réussi'
@@ -130,12 +256,21 @@ class Event(models.Model):
     file = models.ForeignKey(
         ReceivedFile, on_delete=models.CASCADE, related_name='events',
     )
-    stage = models.CharField(max_length=32, db_index=True)  # ex: "admission"
+    # Multi-tenant : locataire propriétaire (FK auto-indexée).
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='events',
+    )
+    stage = models.CharField(
+        max_length=32, choices=Stage.choices, db_index=True,  # ex: "admission"
+    )
     control = models.CharField(max_length=64)               # nom du contrôle
     result = models.CharField(max_length=16, choices=Result.choices)
     monitoring_class = models.CharField(
         max_length=20, choices=MonitoringClass.choices, db_index=True,
     )
+    # Code de cause normalisé (réutilisé par l'agrégation « par cause » et la
+    # qualification à venir). Nullable : tous les événements n'en portent pas.
+    cause_code = models.CharField(max_length=64, null=True, blank=True)
     created_at = models.DateTimeField(default=now_ms, db_index=True)  # UTC, ms
     detail = models.JSONField(default=dict, blank=True)  # raison, version réf., etc.
 
@@ -152,63 +287,24 @@ class Event(models.Model):
         return f'{self.stage}/{self.control}={self.result} (file {self.file_id})'
 
 
-class TriageAck(models.Model):
-    """Triage humain d'une **cause** (cf. ``monitoring_causes``) : statut +
-    propriétaire + note. **Mutable**, et délibérément **distinct** du journal
-    append-only ``Event`` (qui n'est QUE de l'observation) — c'est une décision
-    humaine, pas une observation. Clé = **signature de cause**
-    ``(stage, control, monitoring_class, reason)``. On traite la cause (corrige le
-    partenaire/canal, rejoue) → les fichiers quittent l'ensemble « en échec » seuls.
+class Handled(models.Model):
+    """Tampon « traité » **au niveau fichier** — *set-once*, sans statut mutable.
+
+    Remplace ``FileTriage`` : l'**existence** d'une ligne = le fichier a été traité
+    (un Handle ayant abouti à un OK ``push``, cf. ``triage_file``). Plus de statut,
+    plus de note, plus de triage par cause (``TriageAck`` supprimé). **Sparse** :
+    une ligne uniquement pour les fichiers explicitement traités à la main.
     """
-
-    class Status(models.TextChoices):
-        OPEN = 'open', 'Ouvert'
-        IN_PROGRESS = 'in_progress', 'En cours'
-        RESOLVED = 'resolved', 'Résolu'
-
-    stage = models.CharField(max_length=32)
-    control = models.CharField(max_length=64)
-    monitoring_class = models.CharField(max_length=20)
-    reason = models.CharField(max_length=255, blank=True, default='')
-    status = models.CharField(
-        max_length=16, choices=Status.choices, default=Status.OPEN, db_index=True)
-    owner = models.CharField(max_length=255, blank=True, default='')
-    note = models.TextField(blank=True, default='')
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=['stage', 'control', 'monitoring_class', 'reason'],
-                name='uniq_triage_cause'),
-        ]
-
-    def __str__(self):
-        return f'{self.stage}/{self.control}:{self.reason}={self.status}'
-
-
-class FileTriage(models.Model):
-    """Override de triage **au niveau fichier** (exception) : prime sur l'ack de la
-    cause du fichier (cf. règle de réconciliation, docs §9). **Sparse** : une ligne
-    seulement pour les fichiers explicitement triés à la main.
-    """
-
-    class Status(models.TextChoices):
-        OPEN = 'open', 'Ouvert'
-        RESOLVED = 'resolved', 'Traité'
 
     file = models.OneToOneField(
-        ReceivedFile, on_delete=models.CASCADE, related_name='triage')
-    status = models.CharField(
-        max_length=16, choices=Status.choices, default=Status.RESOLVED, db_index=True)
+        ReceivedFile, on_delete=models.CASCADE, related_name='handled')
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='handled')
     owner = models.CharField(max_length=255, blank=True, default='')
-    note = models.TextField(blank=True, default='')
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    handled_at = models.DateTimeField(default=now_ms, db_index=True)
 
     def __str__(self):
-        return f'file {self.file_id} triage={self.status}'
+        return f'file {self.file_id} handled by {self.owner or "?"}'
 
 
 # Sévérité des classes de monitoring pour le rollup « worst-wins » du board (un

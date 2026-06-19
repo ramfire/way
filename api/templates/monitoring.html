@@ -192,7 +192,7 @@
         // triage (étape 5) — statuts + actions
         tr_open: 'Open', tr_in_progress: 'In progress', tr_resolved: 'Resolved',
         tr_claim: 'Claim', tr_resolve: 'Resolve', tr_reopen: 'Reopen',
-        tr_mark: '✓ Handle', tr_unmark: '↩ Reopen', tr_handled: '✓ handled',
+        tr_mark: '✓ Handle', tr_handled: '✓ handled',
         hide_handled: 'Hide handled',
         // libellés de la modale détail (support)
         adm_title: 'Admission checks', adm_no_events: 'No admission event for this file yet.',
@@ -236,7 +236,7 @@
         cz_partners: 'Partenaires', cz_examples: 'Exemples', cz_status: 'Triage', cz_open: 'à traiter',
         tr_open: 'Ouvert', tr_in_progress: 'En cours', tr_resolved: 'Résolu',
         tr_claim: 'Prendre', tr_resolve: 'Résoudre', tr_reopen: 'Rouvrir',
-        tr_mark: '✓ Traiter', tr_unmark: '↩ Rouvrir', tr_handled: '✓ traité',
+        tr_mark: '✓ Traiter', tr_handled: '✓ traité',
         hide_handled: 'Masquer traités',
         adm_title: 'Contrôles d’admission', adm_no_events: 'Aucun événement d’admission pour ce fichier.',
         adm_c_control: 'Contrôle', adm_c_result: 'Résultat', adm_c_class: 'Classe',
@@ -278,7 +278,7 @@
         cz_partners: 'Partner', cz_examples: 'Esempi', cz_status: 'Triage', cz_open: 'da gestire',
         tr_open: 'Aperto', tr_in_progress: 'In corso', tr_resolved: 'Risolto',
         tr_claim: 'Prendi', tr_resolve: 'Risolvi', tr_reopen: 'Riapri',
-        tr_mark: '✓ Gestisci', tr_unmark: '↩ Riapri', tr_handled: '✓ gestito',
+        tr_mark: '✓ Gestisci', tr_handled: '✓ gestito',
         hide_handled: 'Nascondi gestiti',
         adm_title: 'Controlli di ammissione', adm_no_events: 'Nessun evento di ammissione per questo file.',
         adm_c_control: 'Controllo', adm_c_result: 'Esito', adm_c_class: 'Classe',
@@ -456,11 +456,11 @@
     // par contrôle au double-clic (modale).
     function controlBadge(r) {
       const c = r.control_class;
-      // Le badge montre TOUJOURS le vrai résultat courant (recycle/reject orange
-      // tant que pas re-contrôlé, push/OK vert une fois re-contrôlé et passé). Le
-      // « traité » est un FLAG orthogonal qui persiste à côté (acquittement humain).
-      // Le re-contrôle réel se fait via « Rejouer l'admission » (modale).
-      const flag = (r.triage === 'resolved')
+      // Le badge de classe montre TOUJOURS le vrai résultat courant (recycle/reject
+      // orange tant que pas re-contrôlé, push/OK vert une fois admis). Couplage
+      // strict : le badge « traité » n'apparaît QUE sur un OK (push) retraité via
+      // Handle — jamais sur une ligne en échec.
+      const flag = (c === 'push' && r.handled)
         ? ` <span class="flag-handled" title="${esc(t('tr_handled'))}">${esc(t('tr_handled'))}</span>`
         : '';
       const main = c
@@ -515,15 +515,12 @@
           acts.push(`<button class="act" data-act="archive" data-id="${r.id}">${t('archive')}</button>`);
         if (view === 'history' && r.can_restore)
           acts.push(`<button class="act" data-act="restore" data-id="${r.id}">${t('restore')}</button>`);
-        // Triage fichier (étape 5) : seulement pour les fichiers à classe non-OK.
-        // Le badge « traité » vit désormais dans la colonne Contrôles (vert) ;
-        // ici on ne garde que l'action : Rouvrir (si traité) ou Traiter.
-        if (r.control_class && r.control_class !== 'push') {
-          if (r.triage === 'resolved')
-            acts.push(`<button class="tri-act" data-tri="reopen" data-id="${r.id}">${t('tr_unmark')}</button>`);
-          else
-            acts.push(`<button class="tri-act" data-tri="resolve" data-id="${r.id}">${t('tr_mark')}</button>`);
-        }
+        // Action « Handle » : point d'entrée UNIQUE du flag « traité », proposé
+        // UNIQUEMENT sur une ligne `recycle`. Pas de bouton sinon (OK natif/retraité
+        // = terminal ; pas de Reopen). Le badge « traité » vit dans la colonne
+        // Contrôles (vert) une fois la ligne repassée OK.
+        if (r.control_class === 'recycle')
+          acts.push(`<button class="tri-act" data-tri="resolve" data-id="${r.id}">${t('tr_mark')}</button>`);
         const dl = acts.join(' ');
         // Dernière colonne « horodatage » : stockage (Live) ou archivage/suppression (History).
         const lastTime = (view === 'history')
@@ -731,7 +728,8 @@
         $('err').style.display = 'block';
       }
     }
-    // Triage fichier (étape 5) : resolve (marque traité) / reopen (retire l'override).
+    // Action « Handle » fichier : rejoue l'admission ; le serveur ne pose le flag
+    // « traité » que si la ligne redevient OK (couplage strict). Pas de reopen.
     async function doTriageFile(action, id) {
       try {
         const res = await fetch(`/monitoring/triage/file/${id}/`, {
@@ -865,20 +863,11 @@
     });
 
     // --- Vue agrégée « par cause » (complément, réutilise la modale) -----------
-    // Boutons de triage d'une cause selon son statut courant (claim/resolve/reopen).
-    // Les data-* portent la signature de cause → POST par le handler délégué.
-    function triageButtons(c) {
-      const d = `data-stage="${esc(c.stage)}" data-control="${esc(c.control)}"`
-        + ` data-mclass="${esc(c.monitoring_class)}" data-reason="${esc(c.reason)}"`;
-      const b = (action, key) => `<button class="act tr-btn" ${d} data-action="${action}">${esc(t(key))}</button>`;
-      const st = c.triage.status;
-      if (st === 'resolved') return b('reopen', 'tr_reopen');
-      if (st === 'in_progress') return b('resolve', 'tr_resolve') + ' ' + b('reopen', 'tr_reopen');
-      return b('claim', 'tr_claim') + ' ' + b('resolve', 'tr_resolve');   // open
-    }
+    // Lecture seule : le triage par cause a été retiré (plus de claim/resolve/reopen).
+    // Le traitement se fait fichier par fichier (action « Handle » dans le board).
     function renderCauses(data) {
       $('modal-title').textContent = t('causes_title');
-      // Sous-titre : fichiers concernés + restant à traiter après réconciliation.
+      // Sous-titre : fichiers concernés + restant à traiter (non « Handle »).
       $('modal-sub').textContent = t('causes_sub').replace('{n}', data.files_affected || 0)
         + ` · ${t('cz_open')}: ${data.files_open || 0}`;
       const cz = data.causes || [];
@@ -890,54 +879,24 @@
         const cause = `${esc(c.stage)} / ${esc(ctrlLabel(c.control))}`
           + (c.reason && c.reason !== '—' ? ` · <span class="det">${esc(c.reason)}</span>` : '');
         const partners = c.top_users.map(u => `${esc(u.username || '∅')} (${u.count})`).join(', ') || '—';
-        // « Fichiers » : total + restant à traiter si différent (réconciliation triage).
+        // « Fichiers » : total + restant à traiter si différent (fichiers non « Handle »).
         const files = (c.open_count !== c.count)
           ? `<b>${c.count}</b> <span class="tr-owner">(${t('cz_open')}: ${c.open_count})</span>`
           : `<b>${c.count}</b>`;
-        const owner = c.triage.owner ? `<span class="tr-owner">${esc(c.triage.owner)}</span>` : '';
-        const triage = `<span class="badge tr-${esc(c.triage.status)}">${esc(t('tr_' + c.triage.status))}</span>${owner}`
-          + `<div style="margin-top:.3rem">${triageButtons(c)}</div>`;
         return `<tr>
           <td>${cause}</td>
           <td><span class="badge mc-${esc(c.monitoring_class)}">${esc(t('mc_' + c.monitoring_class) || c.monitoring_class)}</span></td>
           <td>${files}</td>
           <td>${partners}</td>
-          <td>${triage}</td>
           <td class="det">${c.examples.map(esc).join(', ')}</td>
         </tr>`;
       }).join('');
       $('modal-body').innerHTML = `<table><thead><tr>
           <th>${esc(t('cz_cause'))}</th><th>${esc(t('cz_class'))}</th><th>${esc(t('cz_files'))}</th>
-          <th>${esc(t('cz_partners'))}</th><th>${esc(t('cz_status'))}</th><th>${esc(t('cz_examples'))}</th>
+          <th>${esc(t('cz_partners'))}</th><th>${esc(t('cz_examples'))}</th>
         </tr></thead><tbody>${rows}</tbody></table>`;
     }
 
-    // POST d'une action de triage de cause, puis rafraîchit la modale + le board.
-    async function postTriageCause(sig, action) {
-      const body = new URLSearchParams({ ...sig, action });
-      const res = await fetch('/monitoring/triage/cause/', {
-        method: 'POST',
-        headers: { 'X-CSRFToken': getCookie('csrftoken'),
-                   'Content-Type': 'application/x-www-form-urlencoded' },
-        credentials: 'same-origin', body: body.toString(),
-      });
-      if (res.redirected || res.status === 403 || res.status === 302) throw new Error(t('err_session'));
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      return res.json();
-    }
-    // Délégation : clic sur un bouton de triage de cause dans la modale.
-    $('modal-body').addEventListener('click', async (e) => {
-      const btn = e.target.closest('button.tr-btn');
-      if (!btn) return;
-      const d = btn.dataset;
-      try {
-        await postTriageCause({ stage: d.stage, control: d.control,
-                                monitoring_class: d.mclass, reason: d.reason }, d.action);
-        openCauses();   // recharge la modale (statuts + compteurs à jour)
-      } catch (err) {
-        $('modal-sub').textContent = '⚠ ' + err.message;
-      }
-    });
     async function openCauses() {
       $('modal-title').textContent = t('causes_title');
       $('modal-sub').textContent = '';

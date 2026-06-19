@@ -19,7 +19,7 @@ from rest_framework.response import Response
 
 from .admission import STAGE as ADMISSION_STAGE
 from .models import (
-    MONITORING_SEVERITY, Event, FileTriage, ReceivedFile, TriageAck,
+    MONITORING_SEVERITY, Event, Handled, ReceivedFile, default_sub_tenant_id,
 )
 from .s3 import PRESIGN_DEFAULT_EXPIRY, presigned_get_url
 
@@ -119,6 +119,8 @@ class SFTPWebhookView(APIView):
                 bucket=p.get('bucket') or '',
                 action='pre-upload',
                 sftpgo_timestamp=p.get('timestamp'),
+                # Tenant d'ingest par défaut (l'admission le re-pointe ensuite).
+                sub_tenant_id=default_sub_tenant_id(),
                 raw=p,
             ),
         )
@@ -160,9 +162,13 @@ class SFTPWebhookView(APIView):
             rf.stored_at = timezone.now() if success else None
             rf.save()
         else:
+            # Pas de ligne pre-upload corrélée : on crée directement (tenant d'ingest
+            # par défaut, re-pointé par l'admission). La branche update conserve le
+            # sub_tenant déjà posé au pre-upload.
             rf = ReceivedFile.objects.create(
                 s3_key=s3_key,
                 stored_at=timezone.now() if success else None,
+                sub_tenant_id=default_sub_tenant_id(),
                 **fields,
             )
         rf_id = rf.pk
@@ -380,24 +386,25 @@ def monitoring_feed(request):
     show_handled = request.GET.get('show_handled') == '1'
 
     def _hide_handled(qs):
-        return qs if show_handled else qs.exclude(
-            triage__status=FileTriage.Status.RESOLVED)
+        # Un fichier est « traité » ssi une ligne Handled existe (set-once).
+        return qs if show_handled else qs.filter(handled__isnull=True)
 
     # Compteurs par classe de monitoring (axe contrôles, read-model matérialisé),
     # sur la vue courante AVANT le filtre par classe → pilotent les chips. `none` =
-    # aucun contrôle encore passé (control_class NULL). On compte par **vraie
-    # classe** (le flag « traité » est orthogonal au verdict) : un fichier traité
-    # mais encore en échec reste compté dans sa classe de problème (recycle/…) tant
-    # qu'il n'a pas été re-contrôlé OK. Le masquage des traités s'applique comme à
-    # la liste (chip ↔ liste cohérents). Les traités sont AUSSI comptés à part sous
-    # la clé `handled` (chip vert dédié, cliquable, indépendant du toggle).
+    # aucun contrôle encore passé (control_class NULL). **Couplage strict** : un
+    # fichier traité est forcément ``push`` (le flag n'est posé que par un Handle
+    # aboutissant à OK) → il est compté dans `push`, JAMAIS dans une classe d'échec
+    # (plus de double comptage v0.2). Le masquage des traités s'applique comme à la
+    # liste (chip ↔ liste cohérents). Les traités sont AUSSI isolés sous la clé
+    # `handled` (= `handled_total`, sous-ensemble strict des OK ; chip vert dédié,
+    # cliquable, indépendant du toggle).
     per_control_class = {}
     for row in (_hide_handled(ReceivedFile.objects.filter(state__in=states))
                 .values('control_class').annotate(n=Count('id'))):
         per_control_class[row['control_class'] or 'none'] = row['n']
     handled_count = (ReceivedFile.objects
                      .filter(state__in=states,
-                             triage__status=FileTriage.Status.RESOLVED).count())
+                             handled__isnull=False).count())
     if handled_count:
         per_control_class['handled'] = handled_count
 
@@ -408,7 +415,7 @@ def monitoring_feed(request):
     if control_filter == 'handled':
         # Chip « Traité » : on n'affiche QUE les traités (override du masquage par
         # défaut — sinon il n'y aurait rien à voir).
-        base = base.filter(triage__status=FileTriage.Status.RESOLVED)
+        base = base.filter(handled__isnull=False)
     else:
         base = _hide_handled(base)
         if control_filter == 'none':
@@ -497,10 +504,10 @@ def monitoring_feed(request):
         sort = None
         qs = list(base.order_by('-received_at', '-id')[offset:offset + limit])
 
-    # Override de triage par fichier (sparse) pour les lignes de la page (étape 5).
-    file_triage = dict(
-        FileTriage.objects.filter(file_id__in=[rf.pk for rf in qs])
-        .values_list('file_id', 'status'))
+    # Fichiers « traités » (sparse) parmi les lignes de la page (étape 5).
+    handled_ids = set(
+        Handled.objects.filter(file_id__in=[rf.pk for rf in qs])
+        .values_list('file_id', flat=True))
 
     def to_row(rf):
         name = posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)'
@@ -524,9 +531,10 @@ def monitoring_feed(request):
             # Axe contrôles : classe « worst-wins » matérialisée (read-model). Badge
             # générique du board ; le détail par contrôle est dans la modale (dbl-clic).
             'control_class': rf.control_class,
-            # Triage (étape 5) : override AU NIVEAU FICHIER (None = aucun → suit la
-            # cause). Pilote le badge « traité » + l'action ligne.
-            'triage': file_triage.get(rf.pk),
+            # Triage (étape 5) : booléen « traité » AU NIVEAU FICHIER. Couplage
+            # strict ⟹ vrai uniquement sur un OK (``push``) retraité ; le front
+            # n'affiche le badge que si `control_class === 'push' && handled`.
+            'handled': rf.pk in handled_ids,
             # Actions disponibles côté UI (gardées aussi côté serveur).
             'can_archive': rf.state == ReceivedFile.State.FAILED,
             'can_restore': rf.state == ReceivedFile.State.ARCHIVED,
@@ -622,28 +630,20 @@ def monitoring_causes(request):
             names[rf['id']] = posixpath.basename(
                 rf['s3_key'] or rf['path'] or '') or '(sans nom)'
 
-    # Triage (étape 5) — réconciliation cause × fichier.
-    # Acks de cause existants, indexés par signature.
-    acks = {(a.stage, a.control, a.monitoring_class, a.reason): a
-            for a in TriageAck.objects.filter(stage=ADMISSION_STAGE)}
-    # Overrides fichier `resolved` parmi les fichiers concernés (sparse).
-    resolved_files = set(
-        FileTriage.objects.filter(file_id__in=affected,
-                                  status=FileTriage.Status.RESOLVED)
+    # Triage (étape 5) — réconciliation AU NIVEAU FICHIER uniquement : le triage par
+    # cause (``TriageAck``) a été retiré. Un fichier « traité » = ligne Handled (sparse).
+    handled_files = set(
+        Handled.objects.filter(file_id__in=affected)
         .values_list('file_id', flat=True))
 
-    open_files = set()   # fichiers « à traiter » après réconciliation (distincts)
+    open_files = set()   # fichiers « à traiter » (non traités), distincts
     rows = []
     for key, c in causes.items():
-        ack = acks.get(key)
-        cause_resolved = bool(ack and ack.status == TriageAck.Status.RESOLVED)
         files = c['_files']
-        n_file_resolved = sum(1 for fid in files if fid in resolved_files)
-        # « À traiter » dans cette cause : 0 si la cause est résolue, sinon les
-        # fichiers sans override `resolved`. Règle : override fichier OU ack de cause.
-        n_open = 0 if cause_resolved else (c['count'] - n_file_resolved)
-        if not cause_resolved:
-            open_files.update(fid for fid in files if fid not in resolved_files)
+        n_file_resolved = sum(1 for fid in files if fid in handled_files)
+        # « À traiter » dans cette cause = les fichiers non traités (sans Handled).
+        n_open = c['count'] - n_file_resolved
+        open_files.update(fid for fid in files if fid not in handled_files)
         rows.append({
             'stage': c['stage'], 'control': c['control'],
             'monitoring_class': c['monitoring_class'], 'reason': c['reason'],
@@ -652,11 +652,6 @@ def monitoring_causes(request):
             'file_resolved_count': n_file_resolved,
             'top_users': [{'username': u, 'count': n} for u, n in c['_users'].most_common(3)],
             'examples': [names.get(fid, str(fid)) for fid in c['_examples']],
-            'triage': {
-                'status': ack.status if ack else TriageAck.Status.OPEN,
-                'owner': ack.owner if ack else '',
-                'note': ack.note if ack else '',
-            },
         })
     # Tri : le plus sévère d'abord, puis le plus gros volume.
     rows.sort(key=lambda r: (-MONITORING_SEVERITY.get(r['monitoring_class'], -1), -r['count']))
@@ -673,70 +668,39 @@ def monitoring_causes(request):
 
 @require_POST
 @staff_member_required
-def triage_cause(request):
-    """Upsert le triage d'une CAUSE : ``claim`` (→ en cours) / ``resolve`` (→ résolu)
-    / ``reopen`` (→ ouvert). Propriétaire = utilisateur courant. Clé = signature de
-    cause passée en POST. Mutable ; n'altère ni les ``Event`` ni le ``state``.
-    """
-    p = request.POST
-    sig = dict(
-        stage=(p.get('stage') or '')[:32],
-        control=(p.get('control') or '')[:64],
-        monitoring_class=(p.get('monitoring_class') or '')[:20],
-        reason=(p.get('reason') or '')[:255],
-    )
-    status = {
-        'claim': TriageAck.Status.IN_PROGRESS,
-        'resolve': TriageAck.Status.RESOLVED,
-        'reopen': TriageAck.Status.OPEN,
-    }.get(p.get('action'))
-    if status is None or not sig['stage'] or not sig['control']:
-        return JsonResponse({'detail': 'requête de triage invalide'}, status=400)
-
-    ack, _ = TriageAck.objects.get_or_create(**sig)
-    ack.status = status
-    # `open` = désassigné ; claim/resolve s'attribuent à l'utilisateur courant.
-    ack.owner = '' if status == TriageAck.Status.OPEN else request.user.get_username()
-    if 'note' in p:
-        ack.note = (p.get('note') or '')[:2000]
-    ack.save()
-    logger.info('Triage cause %s/%s:%s -> %s par %s', sig['stage'], sig['control'],
-                sig['reason'], status, request.user)
-    return JsonResponse({'ok': True, 'status': ack.status,
-                         'owner': ack.owner, 'note': ack.note})
-
-
-@require_POST
-@staff_member_required
 def triage_file(request, pk):
-    """Override de triage AU NIVEAU FICHIER : ``resolve`` (marque traité **et
-    re-contrôle**) ou ``reopen`` (retire l'override → le fichier suit sa cause).
+    """Action « Handle » AU NIVEAU FICHIER — **point d'entrée UNIQUE** du flag
+    « traité » (ligne ``Handled``, set-once). Côté UI, disponible **uniquement** sur
+    une ligne ``recycle``. Séquence :
+
+    1. rejoue ``file_admission`` (réémet les Events append-only, rematérialise le
+       rollup worst-wins ``control_class``) ;
+    2. **ssi** le verdict redevient OK (``control_class == push``) → pose le flag
+       (la ligne passe OK + badge « traité ») ;
+    3. sinon → **ne pose rien** ; la ligne reste en échec (orange).
+
+    **Couplage strict (option B)** : le flag n'existe QUE pour un OK obtenu via cette
+    action. Un fichier qui repasse ``push`` autrement (``reconcile_files``, rejeu
+    depuis la modale) reste un OK **natif**, sans badge. Plus de ``reopen`` : un
+    OK + traité est terminal. N'altère ni les ``Event`` ni ``ReceivedFile.state``.
     """
     rf = get_object_or_404(ReceivedFile, pk=pk)
-    action = request.POST.get('action')
-    if action == 'resolve':
-        t, _ = FileTriage.objects.get_or_create(file=rf)
-        t.status = FileTriage.Status.RESOLVED
-        t.owner = request.user.get_username()
-        if 'note' in request.POST:
-            t.note = (request.POST.get('note') or '')[:2000]
-        t.save()
-        # « Traiter » pose le flag ET re-contrôle (rejoue l'admission) : si la cause
-        # a été corrigée (partenaire enrôlé, canal autorisé…), le verdict repasse à
-        # admis → control_class OK (badge Recyclage → OK). Sinon il reste en échec,
-        # avec le flag traité. Idempotent et append-only (cf. api/admission.py).
-        from .admission import file_admission
-        verdict = file_admission(rf.pk)
-        rf.refresh_from_db()
-        logger.info('Triage file %s -> resolved (re-contrôle: %s) par %s',
-                    pk, verdict, request.user)
-        return JsonResponse({'ok': True, 'status': t.status, 'owner': t.owner,
-                             'verdict': verdict, 'control_class': rf.control_class})
-    if action == 'reopen':
-        FileTriage.objects.filter(file=rf).delete()
-        logger.info('Triage file %s -> reopen (override retiré) par %s', pk, request.user)
-        return JsonResponse({'ok': True, 'status': None})
-    return JsonResponse({'detail': 'action invalide'}, status=400)
+    if request.POST.get('action') != 'resolve':
+        return JsonResponse({'detail': 'action invalide'}, status=400)
+    from .admission import file_admission
+    file_admission(rf.pk)
+    rf.refresh_from_db()
+    handled = (rf.control_class == Event.MonitoringClass.PUSH)
+    if handled:
+        # Set-once : on ne réécrit pas un tampon existant (pas de owner volatile).
+        Handled.objects.get_or_create(
+            file=rf,
+            defaults={'owner': request.user.get_username(),
+                      'sub_tenant_id': rf.sub_tenant_id})
+    logger.info('Handle file %s -> control_class=%s handled=%s par %s',
+                pk, rf.control_class, handled, request.user)
+    return JsonResponse({'id': rf.pk, 'control_class': rf.control_class,
+                         'handled': handled})
 
 
 def _admission_payload(rf):

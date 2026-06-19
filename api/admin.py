@@ -2,7 +2,9 @@ from django.contrib import admin
 from django.urls import reverse
 from django.utils.html import format_html
 
-from .models import Event, FileTriage, Partner, ReceivedFile, TriageAck
+from .models import (
+    Channel, Event, Handled, Nomenclature, Partner, ReceivedFile, SubTenant,
+)
 
 
 @admin.register(ReceivedFile)
@@ -28,15 +30,40 @@ class ReceivedFileAdmin(admin.ModelAdmin):
         )
 
 
+@admin.register(SubTenant)
+class SubTenantAdmin(admin.ModelAdmin):
+    """Locataire de premier niveau (éditable : enrôlement manuel)."""
+    list_display = ('code', 'name')
+    search_fields = ('code', 'name')
+    ordering = ('code',)
+
+
 @admin.register(Partner)
 class PartnerAdmin(admin.ModelAdmin):
     """Référentiel partenaires : c'est ici qu'un humain **enrôle**/déclare un
     partenaire (modèle discovery), puis re-lance l'admission du fichier en attente.
     """
-    list_display = ('username', 'status')
-    list_filter = ('status',)
-    search_fields = ('username',)
-    ordering = ('username',)
+    list_display = ('code', 'status', 'sub_tenant')
+    list_filter = ('status', 'sub_tenant')
+    search_fields = ('code',)
+    ordering = ('code',)
+
+
+@admin.register(Channel)
+class ChannelAdmin(admin.ModelAdmin):
+    """Canaux d'arrivée (éditable) : l'``identifier`` porte la résolution."""
+    list_display = ('kind', 'identifier', 'partner', 'sub_tenant', 'active')
+    list_filter = ('kind', 'active', 'sub_tenant')
+    search_fields = ('identifier',)
+    ordering = ('kind', 'identifier')
+
+
+@admin.register(Nomenclature)
+class NomenclatureAdmin(admin.ModelAdmin):
+    """Grammaires de sous-dossiers (éditable ; sert la qualification à venir)."""
+    list_display = ('channel', 'subfolder', 'active')
+    list_filter = ('active', 'sub_tenant')
+    search_fields = ('subfolder',)
 
 
 @admin.register(Event)
@@ -61,20 +88,17 @@ class EventAdmin(admin.ModelAdmin):
         return False
 
 
-@admin.register(TriageAck)
-class TriageAckAdmin(admin.ModelAdmin):
-    """Triage humain d'une cause (statut + propriétaire). Mutable."""
-    list_display = ('stage', 'control', 'monitoring_class', 'reason',
-                    'status', 'owner', 'updated_at')
-    list_filter = ('status', 'monitoring_class', 'stage', 'control')
-    search_fields = ('reason', 'owner')
-    ordering = ('-updated_at',)
-
-
-@admin.register(FileTriage)
-class FileTriageAdmin(admin.ModelAdmin):
-    """Override de triage au niveau fichier (exception)."""
-    list_display = ('file', 'status', 'owner', 'updated_at')
-    list_filter = ('status',)
+@admin.register(Handled)
+class HandledAdmin(admin.ModelAdmin):
+    """Tampon « traité » set-once au niveau fichier : **lecture seule**."""
+    list_display = ('file', 'owner', 'handled_at', 'sub_tenant')
+    list_filter = ('sub_tenant',)
     search_fields = ('file__s3_key', 'file__username', 'owner')
-    ordering = ('-updated_at',)
+    ordering = ('-handled_at',)
+    readonly_fields = [f.name for f in Handled._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False

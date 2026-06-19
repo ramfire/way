@@ -19,7 +19,7 @@ from django.core.management.base import BaseCommand
 from django.utils import timezone
 
 from api.admission import file_admission
-from api.models import ReceivedFile
+from api.models import ReceivedFile, default_sub_tenant_id
 from api.s3 import get_s3_client
 
 
@@ -85,6 +85,8 @@ class Command(BaseCommand):
                         s3_key=key, path=key, bucket=bucket,
                         file_size=size, status=1, action='reconcile',
                         reconciled=True, stored_at=timezone.now(),
+                        # Tenant d'ingest par défaut (l'admission le re-pointe).
+                        sub_tenant_id=default_sub_tenant_id(),
                         raw={'source': 'reconcile'},
                     )
             elif rf.state == ReceivedFile.State.RECEIVING:

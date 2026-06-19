@@ -6,8 +6,14 @@ from .admission import (
     latest_admission_event,
 )
 from .models import (
-    Event, Partner, ReceivedFile, current_control_rollup, refresh_control_class,
+    Channel, Event, Handled, Partner, ReceivedFile, SubTenant,
+    current_control_rollup, refresh_control_class,
 )
+
+
+def default_tenant():
+    """Le SubTenant par défaut ``GIL`` (créé par la migration 0009)."""
+    return SubTenant.objects.get(code='GIL')
 
 
 def make_file(username='acme', s3_key='in/acme/file.csv', **kw):
@@ -16,8 +22,23 @@ def make_file(username='acme', s3_key='in/acme/file.csv', **kw):
         state=ReceivedFile.State.STORED,
         s3_key=s3_key, path=kw.pop('path', s3_key),
         username=username, bucket='alfaway-dev', status=1,
+        sub_tenant=kw.pop('sub_tenant', None) or default_tenant(),
         **kw,
     )
+
+
+def enrol(username, status=Partner.Status.ACTIVE, sub_tenant=None):
+    """Enrôle un partenaire + son canal SFTP (la résolution part de l'identifier).
+
+    Remplace l'ancien ``Partner.objects.create(username=…)`` : aujourd'hui la
+    reconnaissance d'un flux passe par un ``Channel(kind='sftp', identifier=…)``.
+    """
+    st = sub_tenant or default_tenant()
+    p = Partner.objects.create(code=username, status=status, sub_tenant=st)
+    Channel.objects.create(
+        kind=Channel.Kind.SFTP, identifier=username, partner=p,
+        sub_tenant=st, active=(status == Partner.Status.ACTIVE))
+    return p
 
 
 def verdict_events(rf):
@@ -26,7 +47,7 @@ def verdict_events(rf):
 
 class AdmissionVerdictTests(TestCase):
     def test_admis_when_mapped_active_authorised(self):
-        Partner.objects.create(username='acme', status=Partner.Status.ACTIVE)
+        enrol('acme')
         rf = make_file(username='acme')
 
         result = file_admission(rf.pk)
@@ -37,12 +58,15 @@ class AdmissionVerdictTests(TestCase):
         self.assertEqual(ev.result, Event.Result.PASSED)
         self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
         self.assertEqual(ev.detail['verdict'], VERDICT_ADMIS)
-        # state ne reflète QUE le stockage S3 : inchangé.
+        # Caches de résolution posés sur la ligne (channel + partner).
         rf.refresh_from_db()
+        self.assertIsNotNone(rf.channel_id)
+        self.assertIsNotNone(rf.partner_id)
+        # state ne reflète QUE le stockage S3 : inchangé.
         self.assertEqual(rf.state, ReceivedFile.State.STORED)
 
     def test_recycle_when_partner_unmapped(self):
-        rf = make_file(username='ghost')  # aucun Partner
+        rf = make_file(username='ghost')  # aucun Channel/Partner
 
         result = file_admission(rf.pk)
 
@@ -51,13 +75,17 @@ class AdmissionVerdictTests(TestCase):
         self.assertEqual(ev.result, Event.Result.FAILED)
         self.assertEqual(ev.monitoring_class, Event.MonitoringClass.RECYCLE)
         self.assertEqual(ev.detail['reason'], 'partner_not_mapped')
-        # Discovery : on n'a JAMAIS auto-créé le partenaire.
-        self.assertFalse(Partner.objects.filter(username='ghost').exists())
+        # Discovery : on n'a JAMAIS auto-créé le canal ni le partenaire.
+        self.assertFalse(Channel.objects.filter(identifier='ghost').exists())
+        self.assertFalse(Partner.objects.filter(code='ghost').exists())
+        # Caches laissés NULL (compte non mappé).
         rf.refresh_from_db()
+        self.assertIsNone(rf.channel_id)
+        self.assertIsNone(rf.partner_id)
         self.assertEqual(rf.state, ReceivedFile.State.STORED)
 
     def test_quarantine_and_warning_when_revoked(self):
-        Partner.objects.create(username='old', status=Partner.Status.REVOKED)
+        enrol('old', status=Partner.Status.REVOKED)
         rf = make_file(username='old')
 
         result = file_admission(rf.pk)
@@ -76,7 +104,7 @@ class AdmissionVerdictTests(TestCase):
 
     @override_settings(ADMISSION_PATH_RULES={'acme': ['in/acme/']})
     def test_channel_authorised_pass_and_fail(self):
-        Partner.objects.create(username='acme', status=Partner.Status.ACTIVE)
+        enrol('acme')
         ok_file = make_file(username='acme', s3_key='in/acme/ok.csv')
         bad_file = make_file(username='acme', s3_key='elsewhere/bad.csv')
 
@@ -88,7 +116,7 @@ class AdmissionVerdictTests(TestCase):
 
 class AdmissionInitMilestoneTests(TestCase):
     def test_first_admis_flagged_then_subsequent_not(self):
-        Partner.objects.create(username='acme', status=Partner.Status.ACTIVE)
+        enrol('acme')
         rf1 = make_file(username='acme', s3_key='in/acme/1.csv')
         rf2 = make_file(username='acme', s3_key='in/acme/2.csv')
 
@@ -108,8 +136,8 @@ class AdmissionRerunSafetyTests(TestCase):
         # 1er passage : non mappé → recycle.
         self.assertEqual(file_admission(rf.pk), VERDICT_RECYCLE)
 
-        # Un humain enrôle le partenaire, puis on rejoue l'admission.
-        Partner.objects.create(username='newcomer', status=Partner.Status.ACTIVE)
+        # Un humain enrôle le partenaire (+ canal), puis on rejoue l'admission.
+        enrol('newcomer')
         self.assertEqual(file_admission(rf.pk), VERDICT_ADMIS)
 
         # Le verdict COURANT (dernier) est admis ; l'audit conserve les deux.
@@ -119,7 +147,7 @@ class AdmissionRerunSafetyTests(TestCase):
         self.assertTrue(latest_admission_event(rf).detail['first'])
 
     def test_rerun_is_append_only_no_short_circuit(self):
-        Partner.objects.create(username='acme', status=Partner.Status.ACTIVE)
+        enrol('acme')
         rf = make_file(username='acme')
 
         file_admission(rf.pk)
@@ -148,7 +176,7 @@ class ControlRollupTests(TestCase):
         self.assertNotIn(rf.pk, current_control_rollup([rf.pk]))
 
     def test_admis_rolls_up_to_push(self):
-        Partner.objects.create(username='acme', status=Partner.Status.ACTIVE)
+        enrol('acme')
         rf = make_file(username='acme')
         file_admission(rf.pk)
 
@@ -159,7 +187,7 @@ class ControlRollupTests(TestCase):
         # Un fichier quarantine porte un verdict `reject` ET un `warning_action`
         # (révoqué qui émet). Le worst-wins doit remonter le warning_action (plus
         # sévère / actionnable), PAS le verdict reject — c'est le signal à surfacer.
-        Partner.objects.create(username='old', status=Partner.Status.REVOKED)
+        enrol('old', status=Partner.Status.REVOKED)
         rf = make_file(username='old')
         result = file_admission(rf.pk)
         self.assertEqual(result, VERDICT_QUARANTINE)
@@ -174,7 +202,7 @@ class ControlRollupTests(TestCase):
         # pas l'ancien recycle resté dans le journal append-only.
         rf = make_file(username='newcomer')
         file_admission(rf.pk)                       # recycle
-        Partner.objects.create(username='newcomer', status=Partner.Status.ACTIVE)
+        enrol('newcomer')
         file_admission(rf.pk)                       # admis
 
         roll = current_control_rollup([rf.pk])[rf.pk]
@@ -182,7 +210,7 @@ class ControlRollupTests(TestCase):
 
     def test_admission_materialises_control_class(self):
         # file_admission rematérialise ReceivedFile.control_class (read-model board).
-        Partner.objects.create(username='old', status=Partner.Status.REVOKED)
+        enrol('old', status=Partner.Status.REVOKED)
         rf = make_file(username='old')
         file_admission(rf.pk)
         rf.refresh_from_db()
@@ -190,7 +218,7 @@ class ControlRollupTests(TestCase):
 
     def test_refresh_handles_bulk_and_null(self):
         rf_none = make_file(s3_key='in/x/none.csv')        # aucun contrôle → NULL
-        Partner.objects.create(username='acme', status=Partner.Status.ACTIVE)
+        enrol('acme')
         rf_admis = make_file(username='acme', s3_key='in/acme/a.csv')
         file_admission(rf_admis.pk)
 
@@ -205,7 +233,7 @@ class MonitoringCausesTests(TestCase):
     """Vue agrégée « par cause » (complément, étape 4)."""
 
     def test_aggregates_current_failing_controls_by_cause(self):
-        Partner.objects.create(username='old', status=Partner.Status.REVOKED)
+        enrol('old', status=Partner.Status.REVOKED)
         for i in range(3):
             file_admission(make_file(username='old', s3_key=f'in/old/{i}.csv').pk)
 
@@ -226,11 +254,16 @@ class MonitoringCausesTests(TestCase):
                          Event.MonitoringClass.WARNING_ACTION)
 
 
-class TriageTests(TestCase):
-    """Triage mutable cause × fichier + réconciliation (étape 5)."""
+class HandledTests(TestCase):
+    """Tampon « traité » set-once au niveau fichier + réconciliation (étape 5).
+
+    Le triage par cause (``TriageAck``) a été retiré : le traitement se fait
+    fichier par fichier via l'action « Handle » (``triage_file``), qui ne pose le
+    flag QUE si le re-contrôle aboutit à un OK (couplage strict).
+    """
 
     def setUp(self):
-        Partner.objects.create(username='old', status=Partner.Status.REVOKED)
+        enrol('old', status=Partner.Status.REVOKED)
         self.files = [make_file(username='old', s3_key=f'in/old/{i}.csv') for i in range(3)]
         for f in self.files:
             file_admission(f.pk)
@@ -240,104 +273,84 @@ class TriageTests(TestCase):
     def _causes(self):
         return {c['control']: c for c in self.client.get('/monitoring/causes/').json()['causes']}
 
-    _WARN = {'stage': 'admission', 'control': 'partner_status',
-             'monitoring_class': 'warning_action', 'reason': 'revoked_partner_still_emitting'}
-
-    def test_cause_claim_resolve_reopen(self):
-        r = self.client.post('/monitoring/triage/cause/', {**self._WARN, 'action': 'claim'}).json()
-        self.assertEqual((r['status'], r['owner']), ('in_progress', 'staff'))
-
-        self.client.post('/monitoring/triage/cause/', {**self._WARN, 'action': 'resolve'})
-        c = self._causes()['partner_status']
-        self.assertEqual(c['triage']['status'], 'resolved')
-        self.assertEqual(c['open_count'], 0)            # cause résolue → plus rien à traiter
-
-        rr = self.client.post('/monitoring/triage/cause/', {**self._WARN, 'action': 'reopen'}).json()
-        self.assertEqual((rr['status'], rr['owner']), ('open', ''))   # désassigné
+    def _handle(self, rf):
+        return self.client.post(f'/monitoring/triage/file/{rf.pk}/', {'action': 'resolve'}).json()
 
     def test_file_override_reconciliation(self):
-        self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'resolve'})
-        c = self._causes()['partner_status']
-        self.assertEqual(c['file_resolved_count'], 1)
-        self.assertEqual(c['open_count'], 2)           # 3 - 1 override
+        # On enrôle le partenaire (cause corrigée) pour que le « Handle » aboutisse.
+        Partner.objects.filter(code='old').update(status=Partner.Status.ACTIVE)
+        Channel.objects.filter(identifier='old').update(active=True)
+        self._handle(self.files[0])
+        c = self._causes().get('partner_status')
+        # La cause a disparu pour ce fichier (il est repassé push) → 2 restants.
+        self.assertEqual(c['count'], 2)
+        self.assertEqual(c['open_count'], 2)
 
-        self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'reopen'})
-        self.assertEqual(self._causes()['partner_status']['file_resolved_count'], 0)
+    def test_handled_is_set_once(self):
+        # « Handle » d'un fichier corrigé pose une (et une seule) ligne Handled.
+        Partner.objects.filter(code='old').update(status=Partner.Status.ACTIVE)
+        Channel.objects.filter(identifier='old').update(active=True)
+        self._handle(self.files[0])
+        self._handle(self.files[0])   # rejouer ne duplique pas
+        self.assertEqual(Handled.objects.filter(file=self.files[0]).count(), 1)
 
     def test_resolved_file_excluded_from_default_view(self):
-        # Reproduit l'exclusion appliquée par monitoring_feed (le feed lui-même
-        # n'est pas testable sur SQLite : il utilise regexp_replace de PostgreSQL).
-        from api.models import FileTriage
+        # Reproduit le masquage de monitoring_feed (_hide_handled = handled__isnull)
+        # — le feed lui-même n'est pas testable ici (regexp_replace PostgreSQL).
+        Partner.objects.filter(code='old').update(status=Partner.Status.ACTIVE)
+        Channel.objects.filter(identifier='old').update(active=True)
         default = lambda: set(ReceivedFile.objects
-                              .exclude(triage__status=FileTriage.Status.RESOLVED)
+                              .filter(handled__isnull=True)
                               .values_list('id', flat=True))
-        self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'resolve'})
-        self.assertNotIn(self.files[0].pk, default())   # masqué (resolved)
+        self._handle(self.files[0])
+        self.assertNotIn(self.files[0].pk, default())   # masqué (traité)
         self.assertIn(self.files[1].pk, default())      # les autres restent
-        self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'reopen'})
-        self.assertIn(self.files[0].pk, default())      # réapparaît après reopen
 
     def test_handled_file_counts_respect_hide_and_handled_bucket(self):
         # per_control_class compte par VRAIE classe en respectant le masquage des
-        # traités (défaut : masqués → exclus de leur classe), et les traités sont
-        # comptés à part dans le bucket `handled`. Reproduit la requête du feed en
-        # vue masquée (non testable sur SQLite : regexp_replace).
+        # traités, et les traités sont comptés à part dans le bucket `handled`.
         from django.db.models import Count
-        from api.models import FileTriage
         counts = lambda: {
             (r['control_class'] or 'none'): r['n']
             for r in (ReceivedFile.objects
-                      .exclude(triage__status=FileTriage.Status.RESOLVED)
+                      .filter(handled__isnull=True)
                       .values('control_class').annotate(n=Count('id')))}
         # 3 fichiers révoqués → control_class worst-wins = warning_action.
         self.assertEqual(counts().get('warning_action'), 3)
-        handled = lambda: (ReceivedFile.objects
-                           .filter(triage__status=FileTriage.Status.RESOLVED).count())
+        handled = lambda: ReceivedFile.objects.filter(handled__isnull=False).count()
         self.assertEqual(handled(), 0)
-        # On en traite un → il sort du compteur de sa classe et alimente `handled`.
-        self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'resolve'})
+        # On corrige la cause puis on en traite un → il quitte sa classe et alimente
+        # `handled` (re-contrôle → push, flag posé).
+        Partner.objects.filter(code='old').update(status=Partner.Status.ACTIVE)
+        Channel.objects.filter(identifier='old').update(active=True)
+        self._handle(self.files[0])
         self.assertEqual(counts().get('warning_action'), 2)
         self.assertEqual(handled(), 1)
-        # Rouvrir → il y revient (et quitte `handled`).
-        self.client.post(f'/monitoring/triage/file/{self.files[0].pk}/', {'action': 'reopen'})
-        self.assertEqual(counts().get('warning_action'), 3)
-        self.assertEqual(handled(), 0)
 
     def test_resolve_recontrols_and_flips_to_ok_when_cause_fixed(self):
-        # « Traiter » pose le flag ET re-contrôle : cause corrigée → badge Recycle → OK.
-        from api.models import FileTriage
+        # « Handle » pose le flag ET re-contrôle : cause corrigée → Recycle → OK.
         rf = make_file(username='newcomer')        # non mappé → recycle
         file_admission(rf.pk)
         rf.refresh_from_db()
         self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
         # On enrôle le partenaire (cause corrigée), puis on traite.
-        Partner.objects.create(username='newcomer', status=Partner.Status.ACTIVE)
-        r = self.client.post(f'/monitoring/triage/file/{rf.pk}/',
-                             {'action': 'resolve'}).json()
-        self.assertEqual(r['verdict'], VERDICT_ADMIS)
+        enrol('newcomer')
+        r = self._handle(rf)
         self.assertEqual(r['control_class'], Event.MonitoringClass.PUSH)
+        self.assertTrue(r['handled'])
         rf.refresh_from_db()
         self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)   # OK
-        self.assertEqual(rf.triage.status, FileTriage.Status.RESOLVED)   # flag persiste
+        self.assertTrue(Handled.objects.filter(file=rf).exists())       # flag posé
 
-    def test_resolve_recontrols_but_stays_failing_if_cause_unfixed(self):
-        # Traiter sans corriger la cause : re-contrôle → reste recycle, flag posé.
-        from api.models import FileTriage
+    def test_resolve_recontrols_but_no_flag_if_cause_unfixed(self):
+        # Traiter sans corriger la cause : re-contrôle → reste recycle, PAS de flag
+        # (couplage strict : le tampon n'existe que pour un OK).
         rf = make_file(username='stranger')        # jamais enrôlé
         file_admission(rf.pk)
-        r = self.client.post(f'/monitoring/triage/file/{rf.pk}/',
-                             {'action': 'resolve'}).json()
-        self.assertEqual(r['verdict'], VERDICT_RECYCLE)
+        r = self._handle(rf)
         self.assertEqual(r['control_class'], Event.MonitoringClass.RECYCLE)
-        rf.refresh_from_db()
-        self.assertEqual(rf.triage.status, FileTriage.Status.RESOLVED)
-
-    def test_files_open_drops_when_all_covering_causes_resolved(self):
-        self.assertEqual(self.client.get('/monitoring/causes/').json()['files_open'], 3)
-        for sig in (self._WARN, {'stage': 'admission', 'control': 'verdict',
-                                 'monitoring_class': 'reject', 'reason': 'partner_revoked'}):
-            self.client.post('/monitoring/triage/cause/', {**sig, 'action': 'resolve'})
-        self.assertEqual(self.client.get('/monitoring/causes/').json()['files_open'], 0)
+        self.assertFalse(r['handled'])
+        self.assertFalse(Handled.objects.filter(file=rf).exists())
 
 
 class ReplayAdmissionEndpointTests(TestCase):
@@ -350,7 +363,7 @@ class ReplayAdmissionEndpointTests(TestCase):
         # recycle (partenaire non mappé) → enrôlement → rejeu via l'endpoint → admis.
         rf = make_file(username='newcomer')
         self.assertEqual(file_admission(rf.pk), VERDICT_RECYCLE)
-        Partner.objects.create(username='newcomer', status=Partner.Status.ACTIVE)
+        enrol('newcomer')
 
         self.client.force_login(self.staff)
         r = self.client.post(f'/monitoring/admission/{rf.pk}/replay/')

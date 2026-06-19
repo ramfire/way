@@ -18,7 +18,7 @@ import logging
 
 from django.conf import settings
 
-from .models import Event, Partner, ReceivedFile, refresh_control_class
+from .models import Channel, Event, Partner, ReceivedFile, refresh_control_class
 
 logger = logging.getLogger(__name__)
 
@@ -43,22 +43,28 @@ REFERENTIAL_VERSION = 1
 
 
 def _emit(rf, control, result, monitoring_class, detail=None):
-    """Append un ``Event`` (audit). Aucun update/suppression : append-only."""
+    """Append un ``Event`` (audit). Aucun update/suppression : append-only.
+
+    L'``Event`` hérite du ``sub_tenant`` du fichier (NOT NULL) : pour un fichier
+    résolu c'est le tenant du canal, sinon le tenant d'ingest par défaut.
+    """
     return Event.objects.create(
         file=rf, stage=STAGE, control=control, result=result,
         monitoring_class=monitoring_class, detail=detail or {},
+        sub_tenant_id=rf.sub_tenant_id,
     )
 
 
-def _channel_authorised(partner, rf):
-    """Canal/chemin autorisé pour ce partenaire (minimal, piloté par la config).
+def _channel_authorised(rf):
+    """Canal/chemin autorisé pour ce flux (minimal, piloté par la config).
 
-    ``settings.ADMISSION_PATH_RULES`` = ``{username: [prefixes autorisés]}``.
-    **Absence de règle pour le partenaire ⇒ autorisé** (admission = observation,
-    on ne bloque pas par défaut). PAS de routage ici : simple préfixe de chemin.
+    ``settings.ADMISSION_PATH_RULES`` = ``{identifier: [prefixes autorisés]}``
+    (``identifier`` = ``username`` SFTPGo = identifiant du canal). **Absence de
+    règle ⇒ autorisé** (admission = observation, on ne bloque pas par défaut). PAS
+    de routage ici : simple préfixe de chemin.
     """
     rules = getattr(settings, 'ADMISSION_PATH_RULES', {}) or {}
-    allowed = rules.get(partner.username)
+    allowed = rules.get(rf.username)
     if not allowed:
         return True, None
     key = (rf.s3_key or rf.path or '').lstrip('/')
@@ -136,15 +142,29 @@ def _run(file_id):
     rf = ReceivedFile.objects.get(pk=file_id)
     username = rf.username
 
-    # Contrôle 1 — partenaire reconnu (mappé au référentiel) ?
-    partner = Partner.objects.filter(username=username).first()
-    if partner is None:
-        # Modèle discovery : ambigu → recycle / en attente d'un humain. On ne
-        # crée JAMAIS d'entrée référentiel automatiquement.
+    # Contrôle 1 — flux reconnu : un canal SFTP porte-t-il cet ``identifier`` ?
+    # La résolution part du seul identifier (unicité globale (kind, identifier)) ;
+    # le partenaire et le locataire en découlent. On pose les caches sur la ligne.
+    channel = (Channel.objects
+               .filter(kind=Channel.Kind.SFTP, identifier=username)
+               .select_related('partner').first())
+    partner = channel.partner if channel else None
+    if channel is None or partner is None:
+        # Modèle discovery : compte non mappé → recycle / en attente d'un humain.
+        # On ne crée JAMAIS Channel ni Partner automatiquement. Caches laissés NULL.
         _emit(rf, CTRL_PARTNER_RECOGNISED, Event.Result.FAILED,
               Event.MonitoringClass.RECYCLE,
               detail=_ref({'reason': 'partner_not_mapped', 'username': username}))
         return _recycle(rf, 'partner_not_mapped')
+    # Caches de résolution + re-pointage du locataire vers celui du canal résolu
+    # (re-câblés à chaque rejeu : le mapping a pu changer). Le fichier passe du
+    # tenant d'ingest par défaut au tenant réel du partenaire.
+    if (rf.channel_id != channel.id or rf.partner_id != partner.id
+            or rf.sub_tenant_id != channel.sub_tenant_id):
+        rf.channel_id = channel.id
+        rf.partner_id = partner.id
+        rf.sub_tenant_id = channel.sub_tenant_id
+        rf.save(update_fields=['channel', 'partner', 'sub_tenant'])
     _emit(rf, CTRL_PARTNER_RECOGNISED, Event.Result.PASSED,
           Event.MonitoringClass.PUSH, detail=_ref({'username': username}))
 
@@ -164,8 +184,8 @@ def _run(file_id):
           Event.MonitoringClass.PUSH,
           detail=_ref({'partner_status': partner.status}))
 
-    # Contrôle 3 — canal/chemin autorisé pour ce partenaire (minimal, no routing).
-    ok, chan_detail = _channel_authorised(partner, rf)
+    # Contrôle 3 — canal/chemin autorisé pour ce flux (minimal, no routing).
+    ok, chan_detail = _channel_authorised(rf)
     if not ok:
         _emit(rf, CTRL_CHANNEL_AUTHORISED, Event.Result.FAILED,
               Event.MonitoringClass.RECYCLE,
