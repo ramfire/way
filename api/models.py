@@ -240,6 +240,7 @@ class Event(models.Model):
     class Stage(models.TextChoices):
         ADMISSION = 'admission', 'Admission'
         QUALIFICATION = 'qualification', 'Qualification'
+        TRIAGE = 'triage', 'Triage (décision opérateur)'
 
     class Result(models.TextChoices):
         PASSED = 'passed', 'Réussi'
@@ -321,6 +322,23 @@ MONITORING_SEVERITY = {
     Event.MonitoringClass.PUSH: 0,
 }
 
+# Cause d'un Event de triage « Reject opérateur » : décision humaine TERMINALE.
+# Elle prime sur le worst-wins (qui place l'actionnable `recycle` au-dessus du
+# terminal `reject`) — cf. court-circuit dans `refresh_control_class`.
+OPERATOR_REJECTED = 'operator_rejected'
+
+
+def operator_rejected_ids(file_ids):
+    """Sous-ensemble des ``file_ids`` rejetés définitivement par un opérateur.
+
+    Append-only : l'**existence** d'un Event de triage ``operator_rejected`` suffit
+    (le Reject est définitif ; aucune décision de triage ultérieure ne le renverse —
+    le Recycle passe par l'admission, pas par le stage ``triage``)."""
+    return set(Event.objects
+               .filter(file_id__in=list(file_ids), stage=Event.Stage.TRIAGE,
+                       cause_code=OPERATOR_REJECTED)
+               .values_list('file_id', flat=True))
+
 
 def current_control_rollup(file_ids):
     """Rollup « worst-wins » de l'axe contrôles, par fichier (générique).
@@ -379,9 +397,17 @@ def refresh_control_class(file_ids):
     if not file_ids:
         return
     rollup = current_control_rollup(file_ids)
+    # Court-circuit terminal : un Reject opérateur force `reject`, en dépit du
+    # worst-wins (board orienté action). C'est le SEUL nom câblé dans cette
+    # matérialisation, par exception assumée — le rollup générique reste intact.
+    rejected = operator_rejected_ids(file_ids)
     by_class = {}
     for fid in file_ids:
-        roll = rollup.get(fid)
-        by_class.setdefault(roll['monitoring_class'] if roll else None, []).append(fid)
+        if fid in rejected:
+            cls = Event.MonitoringClass.REJECT
+        else:
+            roll = rollup.get(fid)
+            cls = roll['monitoring_class'] if roll else None
+        by_class.setdefault(cls, []).append(fid)
     for cls, ids in by_class.items():
         ReceivedFile.objects.filter(pk__in=ids).update(control_class=cls)

@@ -579,3 +579,85 @@ class EnrolNomenclatureEndpointTests(TestCase):
         self.client.force_login(self.staff)
         self.assertEqual(
             self.client.get(f'/monitoring/nomenclature/{rf.pk}/enrol/').status_code, 405)
+
+
+class RemediationEndpointTests(TestCase):
+    """Actions « Recycle » / « Reject » sur un fichier en échec de contrôle."""
+
+    def setUp(self):
+        self.staff = get_user_model().objects.create_user('staff', is_staff=True)
+        self.client.force_login(self.staff)
+
+    def _failing_file(self):
+        # Compte non mappé → admission recycle → control_class=recycle (échec actionnable).
+        rf = make_file(username='ghost', s3_key='in/ghost/x.csv')
+        file_admission(rf.pk)
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
+        return rf
+
+    def test_reject_forces_reject_over_recycle(self):
+        rf = self._failing_file()
+        r = self.client.post(f'/monitoring/files/{rf.pk}/reject/')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['control_class'], Event.MonitoringClass.REJECT)
+        rf.refresh_from_db()
+        # Court-circuit : le reject terminal prime sur le recycle (worst-wins inverse).
+        self.assertEqual(rf.control_class, Event.MonitoringClass.REJECT)
+        self.assertTrue(Event.objects.filter(
+            file=rf, stage=Event.Stage.TRIAGE, cause_code='operator_rejected').exists())
+
+    def test_reject_is_terminal_blocks_further_actions(self):
+        rf = self._failing_file()
+        self.client.post(f'/monitoring/files/{rf.pk}/reject/')
+        # Définitif → plus remédiable : recycle ET reject renvoient 409.
+        self.assertEqual(self.client.post(f'/monitoring/files/{rf.pk}/recycle/').status_code, 409)
+        self.assertEqual(self.client.post(f'/monitoring/files/{rf.pk}/reject/').status_code, 409)
+
+    def test_recycle_replays_controls(self):
+        rf = make_file(username='newcomer')   # subfolder défaut in/acme → recycle
+        file_admission(rf.pk)
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
+        enrol('newcomer')
+        add_nomenclature('newcomer', 'in/acme', r'.+')   # corrige la cause
+        r = self.client.post(f'/monitoring/files/{rf.pk}/recycle/')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['verdict'], VERDICT_ADMIS)
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
+
+    def test_actions_refused_on_ok_file(self):
+        enrol('acme')
+        add_nomenclature('acme', 'in/acme', r'.+')
+        rf = make_file(username='acme', s3_key='in/acme/a.csv')
+        file_admission(rf.pk)
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
+        self.assertEqual(self.client.post(f'/monitoring/files/{rf.pk}/recycle/').status_code, 409)
+        self.assertEqual(self.client.post(f'/monitoring/files/{rf.pk}/reject/').status_code, 409)
+        self.assertFalse(Event.objects.filter(file=rf, stage=Event.Stage.TRIAGE).exists())
+
+    def test_requires_staff(self):
+        rf = self._failing_file()
+        self.client.logout()
+        self.assertIn(
+            self.client.post(f'/monitoring/files/{rf.pk}/reject/').status_code, (302, 403))
+        self.assertFalse(Event.objects.filter(file=rf, stage=Event.Stage.TRIAGE).exists())
+
+    def test_rejects_get(self):
+        rf = self._failing_file()
+        self.assertEqual(self.client.get(f'/monitoring/files/{rf.pk}/reject/').status_code, 405)
+        self.assertEqual(self.client.get(f'/monitoring/files/{rf.pk}/recycle/').status_code, 405)
+
+    def test_feed_exposes_can_remediate(self):
+        rf = self._failing_file()
+        row = next(x for x in self.client.get('/monitoring/feed/').json()['rows']
+                   if x['id'] == rf.pk)
+        self.assertTrue(row['can_remediate'])
+        # Après reject (terminal) → plus remédiable, classe reject dans le feed.
+        self.client.post(f'/monitoring/files/{rf.pk}/reject/')
+        row = next(x for x in self.client.get('/monitoring/feed/').json()['rows']
+                   if x['id'] == rf.pk)
+        self.assertFalse(row['can_remediate'])
+        self.assertEqual(row['control_class'], Event.MonitoringClass.REJECT)

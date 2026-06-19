@@ -24,11 +24,33 @@ from .qualification import (
     latest_qualification_event,
 )
 from .models import (
-    MONITORING_SEVERITY, Event, Handled, ReceivedFile, default_sub_tenant_id,
+    MONITORING_SEVERITY, OPERATOR_REJECTED, Event, Handled, ReceivedFile,
+    default_sub_tenant_id, operator_rejected_ids, refresh_control_class,
 )
 from .s3 import PRESIGN_DEFAULT_EXPIRY, presigned_get_url
 
 logger = logging.getLogger(__name__)
+
+# Classes de contrôle « en échec actionnable » sur lesquelles l'opérateur peut
+# remédier (Recycle/Reject). On exclut `push`/NULL (OK ou aucun contrôle) et
+# `warning_noaction` (avertissement explicitement sans action).
+TRIAGE_FAILURE_CLASSES = {
+    Event.MonitoringClass.BLOCKING, Event.MonitoringClass.WARNING_ACTION,
+    Event.MonitoringClass.RECYCLE, Event.MonitoringClass.REJECT,
+}
+
+
+def _triage_eligible(rf):
+    """Un fichier est remédiable (Recycle/Reject) ssi son contrôle est en échec
+    actionnable ET qu'il n'est pas déjà tranché : ni « traité » (``Handled``), ni
+    déjà rejeté par un opérateur (``operator_rejected``). Garde serveur des deux
+    actions — l'UI n'affiche les boutons que sur ce même critère (``can_remediate``).
+    """
+    if rf.control_class not in TRIAGE_FAILURE_CLASSES:
+        return False
+    if Handled.objects.filter(file=rf).exists():
+        return False
+    return rf.pk not in operator_rejected_ids([rf.pk])
 
 
 class FileNotReady(Exception):
@@ -509,10 +531,12 @@ def monitoring_feed(request):
         sort = None
         qs = list(base.order_by('-received_at', '-id')[offset:offset + limit])
 
-    # Fichiers « traités » (sparse) parmi les lignes de la page (étape 5).
+    # Fichiers « traités » (sparse) + rejetés opérateur parmi les lignes de la page
+    # (batché pour éviter le N+1 ; pilotent `handled` et `can_remediate`).
+    page_ids = [rf.pk for rf in qs]
     handled_ids = set(
-        Handled.objects.filter(file_id__in=[rf.pk for rf in qs])
-        .values_list('file_id', flat=True))
+        Handled.objects.filter(file_id__in=page_ids).values_list('file_id', flat=True))
+    rejected_ids = operator_rejected_ids(page_ids)
 
     def to_row(rf):
         name = posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)'
@@ -543,6 +567,10 @@ def monitoring_feed(request):
             # Actions disponibles côté UI (gardées aussi côté serveur).
             'can_archive': rf.state == ReceivedFile.State.FAILED,
             'can_restore': rf.state == ReceivedFile.State.ARCHIVED,
+            # Remédiation contrôle (Recycle/Reject) : échec actionnable & pas tranché.
+            'can_remediate': (rf.control_class in TRIAGE_FAILURE_CLASSES
+                              and rf.pk not in handled_ids
+                              and rf.pk not in rejected_ids),
         }
 
     # Compteurs globaux par état (indexés) : pilotent les chips + le badge History.
@@ -836,3 +864,55 @@ def enrol_nomenclature(request, pk):
     payload['verdict'] = verdict
     payload['nomenclature_created'] = created
     return JsonResponse(payload)
+
+
+@require_POST
+@staff_member_required
+def recycle_file(request, pk):
+    """Action UI : **Recycle** — remet un fichier en échec en retraitement.
+
+    Réutilise le replay existant ``file_admission`` (ré-émet admission +
+    qualification, append-only, et re-dérive ``control_class``). Garde serveur
+    partagée avec Reject (``_triage_eligible``) : refus 409 sur un fichier OK ou
+    déjà tranché. Renvoie la classe rafraîchie pour laisser le board repoller.
+    """
+    from .admission import file_admission
+
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    if not _triage_eligible(rf):
+        return JsonResponse(
+            {'detail': 'fichier non remédiable (OK ou déjà tranché)'}, status=409)
+    verdict = file_admission(rf.pk)
+    if verdict is None:
+        return JsonResponse({'detail': 'rejeu impossible (voir les logs)'}, status=502)
+    rf.refresh_from_db()
+    logger.info('Recycle (replay) ReceivedFile %s (%s) -> %s par %s',
+                pk, rf.s3_key, verdict, request.user)
+    return JsonResponse({'ok': True, 'id': rf.pk,
+                         'control_class': rf.control_class, 'verdict': verdict})
+
+
+@require_POST
+@staff_member_required
+def reject_file(request, pk):
+    """Action UI : **Reject** — décision opérateur TERMINALE sur un fichier en échec.
+
+    Appende un Event de triage ``operator_rejected`` (append-only, audit) puis
+    rematérialise la classe : le court-circuit de ``refresh_control_class`` force
+    ``reject`` (le terminal humain prime sur l'actionnable ``recycle``). Garde
+    serveur partagée avec Recycle (``_triage_eligible``) : refus 409 sur un fichier
+    OK ou déjà tranché. Définitif (mutuellement exclusif avec Recycle ensuite).
+    """
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    if not _triage_eligible(rf):
+        return JsonResponse(
+            {'detail': 'fichier non remédiable (OK ou déjà tranché)'}, status=409)
+    Event.objects.create(
+        file=rf, sub_tenant_id=rf.sub_tenant_id, stage=Event.Stage.TRIAGE,
+        control='operator_decision', result=Event.Result.FAILED,
+        monitoring_class=Event.MonitoringClass.REJECT, cause_code=OPERATOR_REJECTED,
+        detail={'by': request.user.get_username()})
+    refresh_control_class([rf.pk])
+    rf.refresh_from_db()
+    logger.info('Reject (triage) ReceivedFile %s (%s) par %s', pk, rf.s3_key, request.user)
+    return JsonResponse({'ok': True, 'id': rf.pk, 'control_class': rf.control_class})
