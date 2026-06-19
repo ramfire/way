@@ -292,7 +292,7 @@ class Handled(models.Model):
     """Tampon « traité » **au niveau fichier** — *set-once*, sans statut mutable.
 
     Remplace ``FileTriage`` : l'**existence** d'une ligne = le fichier a été traité
-    (un Handle ayant abouti à un OK ``push``, cf. ``triage_file``). Plus de statut,
+    (un Recycle ayant abouti à un OK ``push``, cf. ``recycle_file``). Plus de statut,
     plus de note, plus de triage par cause (``TriageAck`` supprimé). **Sparse** :
     une ligne uniquement pour les fichiers explicitement traités à la main.
     """

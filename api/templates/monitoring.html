@@ -66,7 +66,7 @@
       border:1px solid #14532d; border-radius:999px; padding:.05rem .4rem; white-space:nowrap; }
     .chk { font-size:.8rem; color:var(--mut); display:flex; align-items:center;
            gap:.3rem; cursor:pointer; user-select:none; }
-    button.act, button.tri-act { padding:.2rem .55rem; font-size:.76rem; }
+    button.act, button.rem-act { padding:.2rem .55rem; font-size:.76rem; }
     a.dl { color:#7dd3fc; text-decoration:none; }
     a.dl:hover { text-decoration:underline; }
     tr.new td { animation:flash 2.5s ease-out; }
@@ -192,7 +192,7 @@
         // triage (étape 5) — statuts + actions
         tr_open: 'Open', tr_in_progress: 'In progress', tr_resolved: 'Resolved',
         tr_claim: 'Claim', tr_resolve: 'Resolve', tr_reopen: 'Reopen',
-        tr_mark: '✓ Handle', tr_handled: '✓ handled',
+        tr_handled: '✓ handled',
         tr_recycle: '↻ Recycle', tr_reject: '⊘ Reject',
         hide_handled: 'Hide handled',
         // libellés de la modale détail (support)
@@ -244,7 +244,7 @@
         cz_partners: 'Partenaires', cz_examples: 'Exemples', cz_status: 'Triage', cz_open: 'à traiter',
         tr_open: 'Ouvert', tr_in_progress: 'En cours', tr_resolved: 'Résolu',
         tr_claim: 'Prendre', tr_resolve: 'Résoudre', tr_reopen: 'Rouvrir',
-        tr_mark: '✓ Traiter', tr_handled: '✓ traité',
+        tr_handled: '✓ traité',
         tr_recycle: '↻ Recycler', tr_reject: '⊘ Rejeter',
         hide_handled: 'Masquer traités',
         adm_title: 'Contrôles d’admission', adm_no_events: 'Aucun événement d’admission pour ce fichier.',
@@ -294,7 +294,7 @@
         cz_partners: 'Partner', cz_examples: 'Esempi', cz_status: 'Triage', cz_open: 'da gestire',
         tr_open: 'Aperto', tr_in_progress: 'In corso', tr_resolved: 'Risolto',
         tr_claim: 'Prendi', tr_resolve: 'Risolvi', tr_reopen: 'Riapri',
-        tr_mark: '✓ Gestisci', tr_handled: '✓ gestito',
+        tr_handled: '✓ gestito',
         tr_recycle: '↻ Ricicla', tr_reject: '⊘ Rifiuta',
         hide_handled: 'Nascondi gestiti',
         adm_title: 'Controlli di ammissione', adm_no_events: 'Nessun evento di ammissione per questo file.',
@@ -543,10 +543,10 @@
         // UNIQUEMENT sur une ligne `recycle`. Pas de bouton sinon (OK natif/retraité
         // = terminal ; pas de Reopen). Le badge « traité » vit dans la colonne
         // Contrôles (vert) une fois la ligne repassée OK.
-        if (r.control_class === 'recycle')
-          acts.push(`<button class="tri-act" data-tri="resolve" data-id="${r.id}">${t('tr_mark')}</button>`);
         // Remédiation contrôle : deux actions mutuellement exclusives sur un échec
         // actionnable non tranché (garde serveur identique via `can_remediate`).
+        // « Recycle » est le mécanisme UNIQUE de retraitement (il pose aussi le flag
+        // « traité » si le re-contrôle aboutit à OK — ex-bouton « Handle »).
         if (r.can_remediate) {
           acts.push(`<button class="rem-act" data-rem="recycle" data-id="${r.id}">${t('tr_recycle')}</button>`);
           acts.push(`<button class="rem-act" data-rem="reject" data-id="${r.id}">${t('tr_reject')}</button>`);
@@ -758,25 +758,6 @@
         $('err').style.display = 'block';
       }
     }
-    // Action « Handle » fichier : rejoue l'admission ; le serveur ne pose le flag
-    // « traité » que si la ligne redevient OK (couplage strict). Pas de reopen.
-    async function doTriageFile(action, id) {
-      try {
-        const res = await fetch(`/monitoring/triage/file/${id}/`, {
-          method: 'POST',
-          headers: { 'X-CSRFToken': getCookie('csrftoken'),
-                     'Content-Type': 'application/x-www-form-urlencoded' },
-          credentials: 'same-origin', body: 'action=' + encodeURIComponent(action),
-        });
-        if (res.redirected || res.status === 403 || res.status === 302) throw new Error(t('err_session'));
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        $('err').style.display = 'none';
-        poll();   // re-render : badge « traité » / action mise à jour
-      } catch (e) {
-        $('err').textContent = '⚠ ' + e.message;
-        $('err').style.display = 'block';
-      }
-    }
     // Remédiation contrôle (Recycle/Reject) : POST dédié, append-only côté serveur ;
     // on repolle pour refléter la nouvelle classe (recyclé re-dérivé, rejeté terminal).
     async function doRemediate(act, id) {
@@ -803,8 +784,6 @@
     $('rows').addEventListener('click', (e) => {
       const rem = e.target.closest('button.rem-act');
       if (rem) { doRemediate(rem.dataset.rem, rem.dataset.id); return; }
-      const tri = e.target.closest('button.tri-act');
-      if (tri) { doTriageFile(tri.dataset.tri, tri.dataset.id); return; }
       const btn = e.target.closest('button.act');
       if (btn) doAction(btn.dataset.act, btn.dataset.id);
     });

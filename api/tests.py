@@ -273,8 +273,8 @@ class HandledTests(TestCase):
     """Tampon « traité » set-once au niveau fichier + réconciliation (étape 5).
 
     Le triage par cause (``TriageAck``) a été retiré : le traitement se fait
-    fichier par fichier via l'action « Handle » (``triage_file``), qui ne pose le
-    flag QUE si le re-contrôle aboutit à un OK (couplage strict).
+    fichier par fichier via l'action « Recycle » (``recycle_file``, ex-« Handle »),
+    qui ne pose le flag QUE si le re-contrôle aboutit à un OK (couplage strict).
     """
 
     def setUp(self):
@@ -292,7 +292,8 @@ class HandledTests(TestCase):
         return {c['control']: c for c in self.client.get('/monitoring/causes/').json()['causes']}
 
     def _handle(self, rf):
-        return self.client.post(f'/monitoring/triage/file/{rf.pk}/', {'action': 'resolve'}).json()
+        # « Recycle » est le mécanisme unique : rejoue ET pose le flag si OK.
+        return self.client.post(f'/monitoring/files/{rf.pk}/recycle/').json()
 
     def test_file_override_reconciliation(self):
         # On enrôle le partenaire (cause corrigée) pour que le « Handle » aboutisse.
@@ -305,11 +306,11 @@ class HandledTests(TestCase):
         self.assertEqual(c['open_count'], 2)
 
     def test_handled_is_set_once(self):
-        # « Handle » d'un fichier corrigé pose une (et une seule) ligne Handled.
+        # Recycler un fichier corrigé pose une (et une seule) ligne Handled.
         Partner.objects.filter(code='old').update(status=Partner.Status.ACTIVE)
         Channel.objects.filter(identifier='old').update(active=True)
-        self._handle(self.files[0])
-        self._handle(self.files[0])   # rejouer ne duplique pas
+        self._handle(self.files[0])   # → push + flag posé
+        self._handle(self.files[0])   # déjà OK/tranché → 409, pas de doublon
         self.assertEqual(Handled.objects.filter(file=self.files[0]).count(), 1)
 
     def test_resolved_file_excluded_from_default_view(self):

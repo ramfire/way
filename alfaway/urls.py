@@ -33,7 +33,6 @@ from api.views import (
     reject_file,
     replay_admission,
     restore_received_file,
-    triage_file,
 )
 
 urlpatterns = [
@@ -47,7 +46,6 @@ urlpatterns = [
     path('monitoring/', monitoring_page, name='monitoring'),
     path('monitoring/feed/', monitoring_feed, name='monitoring-feed'),
     path('monitoring/causes/', monitoring_causes, name='monitoring-causes'),
-    path('monitoring/triage/file/<int:pk>/', triage_file, name='monitoring-triage-file'),
     path('monitoring/admission/<int:pk>/', admission_detail, name='monitoring-admission'),
     path('monitoring/admission/<int:pk>/replay/', replay_admission, name='monitoring-admission-replay'),
     path('monitoring/nomenclature/<int:pk>/enrol/', enrol_nomenclature, name='monitoring-nomenclature-enrol'),

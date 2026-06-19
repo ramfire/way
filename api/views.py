@@ -699,43 +699,6 @@ def monitoring_causes(request):
     })
 
 
-@require_POST
-@staff_member_required
-def triage_file(request, pk):
-    """Action « Handle » AU NIVEAU FICHIER — **point d'entrée UNIQUE** du flag
-    « traité » (ligne ``Handled``, set-once). Côté UI, disponible **uniquement** sur
-    une ligne ``recycle``. Séquence :
-
-    1. rejoue ``file_admission`` (réémet les Events append-only, rematérialise le
-       rollup worst-wins ``control_class``) ;
-    2. **ssi** le verdict redevient OK (``control_class == push``) → pose le flag
-       (la ligne passe OK + badge « traité ») ;
-    3. sinon → **ne pose rien** ; la ligne reste en échec (orange).
-
-    **Couplage strict (option B)** : le flag n'existe QUE pour un OK obtenu via cette
-    action. Un fichier qui repasse ``push`` autrement (``reconcile_files``, rejeu
-    depuis la modale) reste un OK **natif**, sans badge. Plus de ``reopen`` : un
-    OK + traité est terminal. N'altère ni les ``Event`` ni ``ReceivedFile.state``.
-    """
-    rf = get_object_or_404(ReceivedFile, pk=pk)
-    if request.POST.get('action') != 'resolve':
-        return JsonResponse({'detail': 'action invalide'}, status=400)
-    from .admission import file_admission
-    file_admission(rf.pk)
-    rf.refresh_from_db()
-    handled = (rf.control_class == Event.MonitoringClass.PUSH)
-    if handled:
-        # Set-once : on ne réécrit pas un tampon existant (pas de owner volatile).
-        Handled.objects.get_or_create(
-            file=rf,
-            defaults={'owner': request.user.get_username(),
-                      'sub_tenant_id': rf.sub_tenant_id})
-    logger.info('Handle file %s -> control_class=%s handled=%s par %s',
-                pk, rf.control_class, handled, request.user)
-    return JsonResponse({'id': rf.pk, 'control_class': rf.control_class,
-                         'handled': handled})
-
-
 def _admission_payload(rf):
     """Trace de contrôle d'un fichier : tous les événements des stages ``admission``
     **et** ``qualification`` (chaque contrôle + le verdict de chaque stage), du plus
@@ -869,12 +832,15 @@ def enrol_nomenclature(request, pk):
 @require_POST
 @staff_member_required
 def recycle_file(request, pk):
-    """Action UI : **Recycle** — remet un fichier en échec en retraitement.
+    """Action UI : **Recycle** — **mécanisme unique** de retraitement d'un échec.
 
-    Réutilise le replay existant ``file_admission`` (ré-émet admission +
-    qualification, append-only, et re-dérive ``control_class``). Garde serveur
-    partagée avec Reject (``_triage_eligible``) : refus 409 sur un fichier OK ou
-    déjà tranché. Renvoie la classe rafraîchie pour laisser le board repoller.
+    Rejoue ``file_admission`` (ré-émet admission + qualification, append-only,
+    re-dérive ``control_class``) **et** — couplage strict, hérité de l'ancien
+    « Handle » qu'il remplace — pose le flag set-once ``Handled`` **ssi** le
+    re-contrôle aboutit à un OK (``push``). Sinon le fichier reste en échec, sans
+    flag. Garde serveur partagée avec Reject (``_triage_eligible``) : 409 sur un
+    fichier OK ou déjà tranché. Le flag n'existe QUE pour un OK obtenu ici (un OK
+    natif via reconcile/modale n'a pas de badge).
     """
     from .admission import file_admission
 
@@ -886,10 +852,16 @@ def recycle_file(request, pk):
     if verdict is None:
         return JsonResponse({'detail': 'rejeu impossible (voir les logs)'}, status=502)
     rf.refresh_from_db()
-    logger.info('Recycle (replay) ReceivedFile %s (%s) -> %s par %s',
-                pk, rf.s3_key, verdict, request.user)
-    return JsonResponse({'ok': True, 'id': rf.pk,
-                         'control_class': rf.control_class, 'verdict': verdict})
+    handled = (rf.control_class == Event.MonitoringClass.PUSH)
+    if handled:
+        # Set-once : on ne réécrit pas un tampon existant (pas de owner volatile).
+        Handled.objects.get_or_create(
+            file=rf, defaults={'owner': request.user.get_username(),
+                               'sub_tenant_id': rf.sub_tenant_id})
+    logger.info('Recycle ReceivedFile %s (%s) -> %s handled=%s par %s',
+                pk, rf.s3_key, verdict, handled, request.user)
+    return JsonResponse({'ok': True, 'id': rf.pk, 'control_class': rf.control_class,
+                         'verdict': verdict, 'handled': handled})
 
 
 @require_POST
