@@ -25,6 +25,7 @@ from api.views import (
     admission_detail,
     archive_received_file,
     download_received_file,
+    enrol_nomenclature,
     monitoring_causes,
     monitoring_feed,
     monitoring_page,
@@ -47,5 +48,6 @@ urlpatterns = [
     path('monitoring/triage/file/<int:pk>/', triage_file, name='monitoring-triage-file'),
     path('monitoring/admission/<int:pk>/', admission_detail, name='monitoring-admission'),
     path('monitoring/admission/<int:pk>/replay/', replay_admission, name='monitoring-admission-replay'),
+    path('monitoring/nomenclature/<int:pk>/enrol/', enrol_nomenclature, name='monitoring-nomenclature-enrol'),
     path('healthz/', lambda r: JsonResponse({'status': 'ok'})),
 ]

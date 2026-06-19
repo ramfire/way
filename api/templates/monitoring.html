@@ -203,6 +203,13 @@
         adm_replayed: 'Replayed → {v}',
         ctrl_partner_recognised: 'Partner recognised', ctrl_partner_status: 'Partner status',
         ctrl_channel_authorised: 'Channel authorised', ctrl_verdict: 'Verdict',
+        ctrl_nomenclature_recognised: 'Nomenclature recognised', ctrl_filename_grammar: 'Filename grammar',
+        stage_admission: 'admission', stage_qualification: 'qualification',
+        nom_title: 'No nomenclature for this folder', nom_folder: 'Folder',
+        nom_regex_label: 'Filename regex (optional)',
+        nom_regex_ph: 'e.g. .+\\.csv — empty = no name constraint',
+        nom_enrol: '+ Enrol nomenclature', nom_enrolling: 'Enrolling…',
+        nom_enrolled: 'Nomenclature enrolled → {v}',
         st_starting: 'starting…', st_live: 'live ({s}s)', st_paused: 'paused',
         st_error: 'error',
         btn_pause: '⏸ Pause', btn_resume: '▶ Resume',
@@ -246,6 +253,13 @@
         adm_replayed: 'Rejoué → {v}',
         ctrl_partner_recognised: 'Partenaire reconnu', ctrl_partner_status: 'Statut partenaire',
         ctrl_channel_authorised: 'Canal autorisé', ctrl_verdict: 'Verdict',
+        ctrl_nomenclature_recognised: 'Nomenclature reconnue', ctrl_filename_grammar: 'Grammaire du nom',
+        stage_admission: 'admission', stage_qualification: 'qualification',
+        nom_title: 'Aucune nomenclature pour ce dossier', nom_folder: 'Dossier',
+        nom_regex_label: 'Regex du nom de fichier (optionnel)',
+        nom_regex_ph: 'ex. .+\\.csv — vide = aucune contrainte de nom',
+        nom_enrol: '+ Enrôler la nomenclature', nom_enrolling: 'Enrôlement…',
+        nom_enrolled: 'Nomenclature enrôlée → {v}',
         st_starting: 'démarrage…', st_live: 'live ({s}s)', st_paused: 'en pause',
         st_error: 'erreur',
         btn_pause: '⏸ Pause', btn_resume: '▶ Reprendre',
@@ -288,6 +302,13 @@
         adm_replayed: 'Rigiocata → {v}',
         ctrl_partner_recognised: 'Partner riconosciuto', ctrl_partner_status: 'Stato partner',
         ctrl_channel_authorised: 'Canale autorizzato', ctrl_verdict: 'Verdetto',
+        ctrl_nomenclature_recognised: 'Nomenclatura riconosciuta', ctrl_filename_grammar: 'Grammatica del nome',
+        stage_admission: 'ammissione', stage_qualification: 'qualificazione',
+        nom_title: 'Nessuna nomenclatura per questa cartella', nom_folder: 'Cartella',
+        nom_regex_label: 'Regex del nome file (opzionale)',
+        nom_regex_ph: 'es. .+\\.csv — vuoto = nessun vincolo sul nome',
+        nom_enrol: '+ Registra nomenclatura', nom_enrolling: 'Registrazione…',
+        nom_enrolled: 'Nomenclatura registrata → {v}',
         st_starting: 'avvio…', st_live: 'live ({s}s)', st_paused: 'in pausa',
         st_error: 'errore',
         btn_pause: '⏸ Pausa', btn_resume: '▶ Riprendi',
@@ -769,6 +790,9 @@
       if (d.username) bits.push('user=' + d.username);
       if (d.path) bits.push('path=' + d.path);
       if (Array.isArray(d.allowed_prefixes)) bits.push('allowed=' + d.allowed_prefixes.join(','));
+      if (d.subfolder !== undefined) bits.push('subfolder=' + (d.subfolder || '(racine)'));
+      if (d.pattern) bits.push('pattern=' + d.pattern);
+      if (d.filename) bits.push('file=' + d.filename);
       if (d.first) bits.push('first');
       return bits.length ? bits.join(' · ') : '—';
     }
@@ -780,20 +804,32 @@
       // partenaire / canal, l'opérateur relance file_admission depuis ici.
       const replay = `<div style="margin-bottom:.6rem">`
         + `<button class="act" id="adm-replay" data-id="${esc(String(data.id))}">${esc(t('adm_replay'))}</button></div>`;
+      // Enrôlement nomenclature : proposé seulement si le fichier est admis mais sa
+      // qualification est en recycle (nomenclature_not_found). Miroir du « replay ».
+      const nomForm = data.needs_nomenclature ? (
+        `<div style="margin:.2rem 0 .8rem;padding:.6rem;border:1px solid var(--line);border-radius:6px">`
+        + `<div style="margin-bottom:.4rem"><strong>${esc(t('nom_title'))}</strong></div>`
+        + `<div style="margin-bottom:.4rem;opacity:.8">${esc(t('nom_folder'))}: <code>${esc(data.subfolder || '(racine)')}</code></div>`
+        + `<label style="display:block;margin-bottom:.45rem">${esc(t('nom_regex_label'))}<br>`
+        + `<input id="nom-regex" type="text" placeholder="${esc(t('nom_regex_ph'))}" style="width:100%;box-sizing:border-box;margin-top:.2rem"></label>`
+        + `<button class="act" id="nom-enrol" data-id="${esc(String(data.id))}">${esc(t('nom_enrol'))}</button>`
+        + `</div>`
+      ) : '';
+      const head = replay + nomForm;
       const ev = data.events || [];
       if (!ev.length) {
-        $('modal-body').innerHTML = replay + `<div class="empty">${esc(t('adm_no_events'))}</div>`;
+        $('modal-body').innerHTML = head + `<div class="empty">${esc(t('adm_no_events'))}</div>`;
         return;
       }
       const rows = ev.map(e => `
         <tr>
-          <td>${esc(ctrlLabel(e.control))}</td>
+          <td><span style="opacity:.55;font-size:.85em">${esc(t('stage_' + e.stage) || e.stage)}</span> ${esc(ctrlLabel(e.control))}</td>
           <td class="res-${esc(e.result)}">${esc(t('adm_r_' + e.result) || e.result)}</td>
           <td class="mclass">${esc(e.monitoring_class)}</td>
           <td class="det">${esc(admDetailText(e.detail))}</td>
           <td>${esc(fmtTime(e.created_at))}</td>
         </tr>`).join('');
-      $('modal-body').innerHTML = replay + `<table><thead><tr>
+      $('modal-body').innerHTML = head + `<table><thead><tr>
           <th>${esc(t('adm_c_control'))}</th><th>${esc(t('adm_c_result'))}</th>
           <th>${esc(t('adm_c_class'))}</th><th>${esc(t('adm_c_detail'))}</th>
           <th>${esc(t('adm_c_time'))}</th>
@@ -827,6 +863,37 @@
         const b = $('adm-replay'); if (b) { b.disabled = false; b.textContent = t('adm_replay'); }
       }
     }
+    // Enrôlement d'une nomenclature depuis la modale (POST). Crée/réactive la
+    // Nomenclature du (canal, sous-dossier) puis rejoue l'admission (qui ré-enchaîne
+    // la qualification). Même UX que le rejeu : re-render + repoll du board.
+    async function enrolNomenclature(id) {
+      const btn = $('nom-enrol');
+      const regex = $('nom-regex') ? $('nom-regex').value : '';
+      if (btn) { btn.disabled = true; btn.textContent = t('nom_enrolling'); }
+      try {
+        const res = await fetch(`/monitoring/nomenclature/${id}/enrol/`, {
+          method: 'POST',
+          headers: { 'X-CSRFToken': getCookie('csrftoken'),
+                     'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ filename_regex: regex }),
+          credentials: 'same-origin',
+        });
+        if (res.redirected || res.status === 403 || res.status === 302) throw new Error(t('err_session'));
+        if (!res.ok) {
+          let msg = 'HTTP ' + res.status;
+          try { const j = await res.json(); if (j.detail) msg = j.detail; } catch (_) {}
+          throw new Error(msg);
+        }
+        const data = await res.json();
+        renderAdmission(data);   // re-render avec le nouveau verdict de qualif
+        $('modal-body').insertAdjacentHTML('afterbegin',
+          `<div class="empty">${esc(t('nom_enrolled').replace('{v}', data.verdict))}</div>`);
+        poll();                  // rafraîchit le board (worst-wins rematérialisé)
+      } catch (e) {
+        $('modal-body').insertAdjacentHTML('afterbegin', `<div class="empty">⚠ ${esc(e.message)}</div>`);
+        const b = $('nom-enrol'); if (b) { b.disabled = false; b.textContent = t('nom_enrol'); }
+      }
+    }
     async function openAdmission(id) {
       $('modal-title').textContent = t('adm_title');
       $('modal-sub').textContent = '';
@@ -852,7 +919,9 @@
     // Délégation : modal-body est re-rendu via innerHTML (le bouton est recréé).
     $('modal-body').addEventListener('click', (e) => {
       const rb = e.target.closest('#adm-replay');
-      if (rb) replayAdmission(rb.dataset.id);
+      if (rb) { replayAdmission(rb.dataset.id); return; }
+      const nb = e.target.closest('#nom-enrol');
+      if (nb) enrolNomenclature(nb.dataset.id);
     });
     $('modal-close').addEventListener('click', closeModal);
     $('modal-bg').addEventListener('click', (e) => {   // clic hors carte = fermeture

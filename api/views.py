@@ -1,5 +1,6 @@
 import logging
 import posixpath
+import re
 from collections import Counter
 
 from django.conf import settings
@@ -18,6 +19,10 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 
 from .admission import STAGE as ADMISSION_STAGE
+from .qualification import (
+    CAUSE_NOMENCLATURE_NOT_FOUND, STAGE as QUALIFICATION_STAGE,
+    latest_qualification_event,
+)
 from .models import (
     MONITORING_SEVERITY, Event, Handled, ReceivedFile, default_sub_tenant_id,
 )
@@ -704,21 +709,35 @@ def triage_file(request, pk):
 
 
 def _admission_payload(rf):
-    """Trace d'admission d'un fichier : tous les événements de stage ``admission``
-    (chaque contrôle + le verdict), du plus ancien au plus récent. Forme partagée
-    par ``admission_detail`` (lecture) et ``replay_admission`` (rejeu)."""
+    """Trace de contrôle d'un fichier : tous les événements des stages ``admission``
+    **et** ``qualification`` (chaque contrôle + le verdict de chaque stage), du plus
+    ancien au plus récent. Forme partagée par ``admission_detail`` (lecture),
+    ``replay_admission`` et ``enrol_nomenclature`` (rejeu).
+
+    Expose aussi de quoi proposer l'enrôlement d'une nomenclature côté UI :
+    ``subfolder`` (le dossier du fichier) et ``needs_nomenclature`` (vrai si le
+    fichier est admis mais que sa qualification est en ``recycle`` faute de
+    nomenclature — miroir de l'enrôlement partenaire pour l'admission)."""
     events = (Event.objects
-              .filter(file=rf, stage=ADMISSION_STAGE)
+              .filter(file=rf, stage__in=(ADMISSION_STAGE, QUALIFICATION_STAGE))
               .order_by('created_at', 'id'))
+    last_qual = latest_qualification_event(rf)
+    needs_nomenclature = bool(
+        rf.channel_id and last_qual is not None
+        and last_qual.cause_code == CAUSE_NOMENCLATURE_NOT_FOUND)
     return {
         'id': rf.pk,
         'filename': posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)',
         'username': rf.username,
         'state': rf.state,
+        'subfolder': posixpath.dirname(rf.s3_key or rf.path or '').strip('/'),
+        'needs_nomenclature': needs_nomenclature,
         'events': [{
+            'stage': e.stage,
             'control': e.control,
             'result': e.result,
             'monitoring_class': e.monitoring_class,
+            'cause_code': e.cause_code,
             'detail': e.detail if isinstance(e.detail, dict) else {},
             'created_at': e.created_at.isoformat() if e.created_at else None,
         } for e in events],
@@ -763,4 +782,57 @@ def replay_admission(request, pk):
     payload = _admission_payload(rf)
     payload['ok'] = True
     payload['verdict'] = verdict
+    return JsonResponse(payload)
+
+
+@require_POST
+@staff_member_required
+def enrol_nomenclature(request, pk):
+    """Action UI : **enrôler la nomenclature** d'un sous-dossier (le « recycle » de la
+    qualification, miroir de l'enrôlement partenaire côté admission).
+
+    Déclenchée depuis la modale sur un fichier **admis** dont la qualification est en
+    ``recycle`` (``nomenclature_not_found``). Crée (ou réactive/aligne) la
+    ``Nomenclature`` du couple ``(canal, sous-dossier)`` du fichier — avec une
+    grammaire de nom **optionnelle** (regex ; vide = aucune contrainte) — puis
+    **rejoue l'admission**, qui ré-enchaîne la qualification et rematérialise le
+    rollup du board. Renvoie la trace rafraîchie (forme de ``admission_detail``).
+    """
+    from .models import Nomenclature
+    from .admission import file_admission
+
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    if rf.channel_id is None:
+        # Pas de canal résolu ⇒ rien à qualifier ; on enrôle d'abord le partenaire.
+        return JsonResponse(
+            {'detail': 'fichier non admis (canal non résolu) — enrôler le partenaire d’abord'},
+            status=409)
+
+    subfolder = posixpath.dirname(rf.s3_key or rf.path or '').strip('/')
+    filename_regex = (request.POST.get('filename_regex') or '').strip()
+    if filename_regex:
+        try:
+            re.compile(filename_regex)
+        except re.error as exc:
+            return JsonResponse({'detail': f'regex invalide : {exc}'}, status=400)
+    grammar = {'filename': filename_regex} if filename_regex else {}
+
+    nom, created = Nomenclature.objects.get_or_create(
+        channel_id=rf.channel_id, subfolder=subfolder,
+        defaults={'sub_tenant_id': rf.sub_tenant_id, 'grammar': grammar, 'active': True})
+    if not created and (nom.grammar != grammar or not nom.active):
+        # Réenrôlement : on (ré)active et on aligne la grammaire saisie par l'opérateur.
+        nom.grammar, nom.active = grammar, True
+        nom.save(update_fields=['grammar', 'active'])
+    logger.info('Enrôlement nomenclature #%s (canal=%s subfolder=%r created=%s) par %s',
+                nom.pk, rf.channel_id, subfolder, created, request.user)
+
+    verdict = file_admission(rf.pk)   # ré-enchaîne admission + qualification
+    if verdict is None:
+        return JsonResponse({'detail': 'rejeu impossible (voir les logs)'}, status=502)
+    rf.refresh_from_db()
+    payload = _admission_payload(rf)
+    payload['ok'] = True
+    payload['verdict'] = verdict
+    payload['nomenclature_created'] = created
     return JsonResponse(payload)

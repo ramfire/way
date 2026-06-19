@@ -246,3 +246,17 @@ combinaison admission×qualification : un fichier `admis`+`quarantine` remonte e
 `reject`, `admis`+`recycle` en `recycle`, `admis`+`qualified` en `push`. « Handle »
 ne pose le flag « traité » que si le rollup redevient `push` (donc admis **et**
 qualifié) — inchangé.
+
+**Enrôlement nomenclature (UI, 2026-06-19).** Miroir de l'enrôlement partenaire,
+mais **directement dans la modale** (l'admission, elle, renvoie encore vers
+l'admin Django). La trace de la modale (`admission_detail`) couvre désormais
+**les deux stages** (chaque ligne préfixée `admission`/`qualification`) ; le
+payload expose `subfolder` + `needs_nomenclature` (vrai ssi admis **et** dernière
+qualif en `recycle`/`nomenclature_not_found`). Quand le drapeau est levé, la modale
+affiche un encart « Aucune nomenclature pour ce dossier » avec une regex de nom
+**optionnelle** (vide = aucune contrainte). Le bouton poste
+`POST /monitoring/nomenclature/<id>/enrol/` : crée/réactive la `Nomenclature(canal,
+subfolder)` (regex validée côté serveur → 400 sinon ; 409 si le canal n'est pas
+résolu), puis **rejoue `file_admission`** (ré-enchaîne la qualification) et repolle
+le board. Idempotent (`get_or_create` sur `(channel, subfolder)`), staff-only,
+append-only côté `Event`. `mandatory`/complétude toujours différés — **par fichier**.

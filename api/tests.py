@@ -499,3 +499,83 @@ class QualificationTests(TestCase):
         rf = self._admit(s3_key='in/way/deep/f.txt')
         self.assertEqual(qual.latest_qualification_event(rf).detail['verdict'],
                          qual.VERDICT_QUALIFIED)
+
+
+class EnrolNomenclatureEndpointTests(TestCase):
+    """Bouton « Enrôler la nomenclature » de la modale (le recycle de la qualif)."""
+
+    def setUp(self):
+        self.staff = get_user_model().objects.create_user('staff', is_staff=True)
+
+    def _admit_without_nomenclature(self, s3_key='in/way/data.csv'):
+        enrol('way')
+        rf = make_file(username='way', s3_key=s3_key)
+        file_admission(rf.pk)                       # admis, mais qualif → recycle
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
+        return rf
+
+    def test_payload_flags_needs_nomenclature(self):
+        # La modale (admission_detail) expose le drapeau qui révèle le formulaire.
+        rf = self._admit_without_nomenclature()
+        self.client.force_login(self.staff)
+        body = self.client.get(f'/monitoring/admission/{rf.pk}/').json()
+        self.assertTrue(body['needs_nomenclature'])
+        self.assertEqual(body['subfolder'], 'in/way')
+
+    def test_enrol_creates_nomenclature_and_qualifies(self):
+        rf = self._admit_without_nomenclature()
+        self.client.force_login(self.staff)
+        r = self.client.post(f'/monitoring/nomenclature/{rf.pk}/enrol/',
+                             {'filename_regex': r'.+\.csv'})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body['ok'])
+        self.assertTrue(body['nomenclature_created'])
+        self.assertFalse(body['needs_nomenclature'])   # plus de recycle après enrôlement
+        # Nomenclature posée sur (canal, sous-dossier) avec la grammaire saisie.
+        nom = Nomenclature.objects.get(channel_id=rf.channel_id, subfolder='in/way')
+        self.assertEqual(nom.grammar, {'filename': r'.+\.csv'})
+        # Rejeu enchaîné : qualifié → board push.
+        rf.refresh_from_db()
+        self.assertEqual(qual.latest_qualification_event(rf).detail['verdict'],
+                         qual.VERDICT_QUALIFIED)
+        self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
+
+    def test_enrol_without_regex_means_no_constraint(self):
+        rf = self._admit_without_nomenclature(s3_key='in/way/anything.bin')
+        self.client.force_login(self.staff)
+        r = self.client.post(f'/monitoring/nomenclature/{rf.pk}/enrol/', {})
+        self.assertEqual(r.status_code, 200)
+        nom = Nomenclature.objects.get(channel_id=rf.channel_id, subfolder='in/way')
+        self.assertEqual(nom.grammar, {})              # grammaire vide = pas de contrainte
+        self.assertEqual(r.json()['verdict'], VERDICT_ADMIS)
+
+    def test_enrol_rejects_invalid_regex(self):
+        rf = self._admit_without_nomenclature()
+        self.client.force_login(self.staff)
+        r = self.client.post(f'/monitoring/nomenclature/{rf.pk}/enrol/',
+                             {'filename_regex': '['})
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(Nomenclature.objects.exists())   # rien créé sur regex invalide
+
+    def test_enrol_409_when_channel_unresolved(self):
+        # Fichier non admis (partenaire non mappé) → pas de canal → 409, rien créé.
+        rf = make_file(username='ghost', s3_key='in/ghost/x.csv')
+        file_admission(rf.pk)
+        self.client.force_login(self.staff)
+        r = self.client.post(f'/monitoring/nomenclature/{rf.pk}/enrol/', {})
+        self.assertEqual(r.status_code, 409)
+        self.assertFalse(Nomenclature.objects.exists())
+
+    def test_enrol_requires_staff(self):
+        rf = self._admit_without_nomenclature()
+        r = self.client.post(f'/monitoring/nomenclature/{rf.pk}/enrol/', {})
+        self.assertIn(r.status_code, (302, 403))
+        self.assertFalse(Nomenclature.objects.exists())
+
+    def test_enrol_rejects_get(self):
+        rf = self._admit_without_nomenclature()
+        self.client.force_login(self.staff)
+        self.assertEqual(
+            self.client.get(f'/monitoring/nomenclature/{rf.pk}/enrol/').status_code, 405)
