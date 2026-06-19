@@ -837,18 +837,19 @@
         $('modal-body').innerHTML = head + `<div class="empty">${esc(t('adm_no_events'))}</div>`;
         return;
       }
+      // « Résultat » = la classe de monitoring (recycle/reject/push…), badge coloré
+      // identique à la colonne Contrôles du board — l'info utile, plutôt que le binaire
+      // réussi/échoué. Une seule colonne (la classe brute redondante est retirée).
       const rows = ev.map(e => `
         <tr>
           <td><span style="opacity:.55;font-size:.85em">${esc(t('stage_' + e.stage) || e.stage)}</span> ${esc(ctrlLabel(e.control))}</td>
-          <td class="res-${esc(e.result)}">${esc(t('adm_r_' + e.result) || e.result)}</td>
-          <td class="mclass">${esc(e.monitoring_class)}</td>
+          <td><span class="badge mc-${esc(e.monitoring_class)}">${esc(t('mc_' + e.monitoring_class) || e.monitoring_class)}</span></td>
           <td class="det">${esc(admDetailText(e.detail))}</td>
           <td>${esc(fmtTime(e.created_at))}</td>
         </tr>`).join('');
       $('modal-body').innerHTML = head + `<table><thead><tr>
           <th>${esc(t('adm_c_control'))}</th><th>${esc(t('adm_c_result'))}</th>
-          <th>${esc(t('adm_c_class'))}</th><th>${esc(t('adm_c_detail'))}</th>
-          <th>${esc(t('adm_c_time'))}</th>
+          <th>${esc(t('adm_c_detail'))}</th><th>${esc(t('adm_c_time'))}</th>
         </tr></thead><tbody>${rows}</tbody></table>`;
     }
     // Rejeu de l'admission depuis la modale (POST). Réémet un verdict (append-only,
