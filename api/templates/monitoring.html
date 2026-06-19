@@ -56,6 +56,12 @@
     .ds-failed   { background:#9a3412; color:#ffedd5; box-shadow:inset 2px 0 0 #f97316; }
     .ds-recycled { background:#1e3a8a; color:#dbeafe; }
     .ds-rejected { background:#7f1d1d; color:#fecaca; }
+    /* « All » : filtre de remise à zéro → teinte NEUTRE (ardoise), pas sémantique.
+       Slate-800 inactif / slate-600 actif ; on neutralise aussi le surlignage bleu
+       par défaut de .stat.active (spécificité 3 classes > .stat.active). */
+    .ds-all { background:#1e293b; color:#cbd5e1; }
+    .stat.chip-all.active { background:#0f172a; border-color:#64748b; }
+    .stat.chip-all.active .ds-all { background:#475569; color:#e2e8f0; }
     /* Barre de filtre par classe de contrôle (chips, axe contrôles). */
     .cbar { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap;
             padding:.55rem 1.5rem; border-bottom:1px solid var(--line); font-size:.82rem; }
@@ -186,6 +192,7 @@
         th_ip: 'IP', th_size: 'Size', th_transfer: 'Transfer', th_received: 'Received',
         th_stored: 'Stored', th_archived: 'Archived', th_controls: 'Controls',
         // états affichés (board) : 4 valeurs sans ambiguïté verdict↔décision
+        ds_all: 'All',
         ds_ok: 'OK', ds_failed: 'Failed', ds_recycled: 'Recycled', ds_rejected: 'Rejected',
         // classes de monitoring — détail granulaire (modale / agrégat par cause)
         mc_blocking: 'Blocking', mc_warning_action: 'Action needed', mc_recycle: 'Recycle',
@@ -242,6 +249,7 @@
         th_state: 'État', th_file: 'Fichier', th_user: 'Utilisateur', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Taille', th_transfer: 'Transfert', th_received: 'Reçu',
         th_stored: 'Stocké', th_archived: 'Archivé', th_controls: 'Contrôles',
+        ds_all: 'Tous',
         ds_ok: 'OK', ds_failed: 'Échec', ds_recycled: 'Recyclé', ds_rejected: 'Rejeté',
         mc_blocking: 'Bloquant', mc_warning_action: 'Action requise', mc_recycle: 'Recyclage',
         mc_reject: 'Rejeté', mc_warning_noaction: 'Avertissement', mc_push: 'OK', mc_none: '—',
@@ -293,6 +301,7 @@
         th_state: 'Stato', th_file: 'File', th_user: 'Utente', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Dimensione', th_transfer: 'Trasferimento', th_received: 'Ricevuto',
         th_stored: 'Archiviato', th_archived: 'Archiviato il', th_controls: 'Controlli',
+        ds_all: 'Tutti',
         ds_ok: 'OK', ds_failed: 'Fallito', ds_recycled: 'Riciclato', ds_rejected: 'Respinto',
         mc_blocking: 'Bloccante', mc_warning_action: 'Azione richiesta', mc_recycle: 'Riciclo',
         mc_reject: 'Respinto', mc_warning_noaction: 'Avviso', mc_push: 'OK', mc_none: '—',
@@ -502,12 +511,21 @@
         : `<span class="badge ds-${esc(cls)}">${esc(label)}</span>`;
       return `<span class="stat clickable${active}" data-control="${esc(cls)}">${inner} <b>${count}</b></span>`;
     }
+    // Chip « All » (remise à zéro du filtre), TOUJOURS en première position. Total =
+    // somme des compteurs déjà renvoyés (`per_display_state`) → réutilise le comptage
+    // en place (= total de la vue), pas de calcul parallèle. Actif quand aucun filtre.
+    function allFilterChip(total) {
+      const active = controlFilter ? '' : ' active';
+      return `<span class="stat clickable chip-all${active}" data-control="">`
+        + `<span class="badge ds-all">${esc(t('ds_all'))}</span> <b>${total}</b></span>`;
+    }
     function renderControlChips(data) {
       const pc = data.per_display_state || {};
+      const total = Object.values(pc).reduce((s, n) => s + n, 0);
+      if (!total) { $('cbar').innerHTML = ''; return; }   // aucune ligne → barre masquée
       const chips = DISPLAY_ORDER.filter(c => pc[c]).map(c => controlChip(c, pc[c]));
-      $('cbar').innerHTML = chips.length
-        ? `<span class="cbar-lbl">${esc(t('ctl_filter'))} :</span>` + chips.join('')
-        : '';
+      $('cbar').innerHTML = `<span class="cbar-lbl">${esc(t('ctl_filter'))} :</span>`
+        + allFilterChip(total) + chips.join('');
     }
 
     // Bouton « Causes » : compteur des fichiers en échec SANS décision (état `failed`),
