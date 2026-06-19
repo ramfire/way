@@ -420,44 +420,49 @@ def monitoring_feed(request):
             return qs
         return qs.filter(handled__isnull=True).exclude(**_rejected_q)
 
-    # Compteurs par classe de monitoring (axe contrôles, read-model matérialisé),
-    # sur la vue courante AVANT le filtre par classe → pilotent les chips. `none` =
-    # aucun contrôle encore passé (control_class NULL). **Couplage strict** : un
-    # fichier tranché (traité OU rejeté-opérateur) est compté dans son bucket dédié
-    # (`handled` / `rejected`), JAMAIS dans une classe affichée. Les deux buckets sont
-    # des sous-ensembles isolés (chips dédiés, cliquables, indépendants du toggle) :
-    # `handled` = OK retraités ; `rejected` = rejets terminaux opérateur.
-    per_control_class = {}
-    for row in (_hide_resolved(ReceivedFile.objects.filter(state__in=states))
-                .values('control_class').annotate(n=Count('id'))):
-        per_control_class[row['control_class'] or 'none'] = row['n']
-    handled_count = (ReceivedFile.objects
-                     .filter(state__in=states, handled__isnull=False).count())
-    if handled_count:
-        per_control_class['handled'] = handled_count
-    rejected_count = (ReceivedFile.objects
-                      .filter(state__in=states, **_rejected_q).distinct().count())
-    if rejected_count:
-        per_control_class['rejected'] = rejected_count
+    def _undecided(qs):
+        # Aucune décision opérateur posée (ni « Recycled »/Handled, ni « Rejected »).
+        return qs.filter(handled__isnull=True).exclude(**_rejected_q)
 
-    # Filtre par classe de monitoring (chip cliquable). Valeurs valides = les 6
-    # classes + `none` (NULL) + buckets dédiés `handled` / `rejected`. Autre → rien.
-    valid_classes = set(Event.MonitoringClass.values)
+    # Compteurs des 4 ÉTATS affichés — vocabulaire sans ambiguïté verdict↔décision —
+    # plus `none` (aucun contrôle encore passé). Mutuellement exclusifs, indépendants
+    # du toggle :
+    #   ok       = verdict OK (push), aucune décision        → vert
+    #   failed   = verdict en ÉCHEC, aucune décision         → orange + boutons Recycle/Reject
+    #   recycled = l'opérateur a recyclé (ligne Handled)     → terminal, Download seul
+    #   rejected = l'opérateur a rejeté (operator_rejected)  → terminal, Download seul
+    # NB : un `reject` MOTEUR (quarantine, sans décision) tombe dans `failed` — plus
+    # jamais « Rejected » tant qu'aucune décision opérateur n'est prise.
+    _vis = ReceivedFile.objects.filter(state__in=states)
+    _und = _undecided(_vis)
+    per_display_state = {}
+    for key, n in (
+        ('ok', _und.filter(control_class=Event.MonitoringClass.PUSH).count()),
+        ('failed', _und.filter(control_class__in=TRIAGE_FAILURE_CLASSES).count()),
+        ('recycled', _vis.filter(handled__isnull=False).count()),
+        ('rejected', _vis.filter(**_rejected_q).distinct().count()),
+        ('none', _und.filter(control_class__isnull=True).count()),
+    ):
+        if n:
+            per_display_state[key] = n
+
+    # Filtre par état affiché (chip cliquable). `recycled`/`rejected` outrepassent le
+    # masquage par défaut (sinon rien à voir) ; `ok`/`failed`/`none` restent sur les
+    # fichiers SANS décision. Autre valeur → pas de filtre (vue par défaut masquée).
     control_filter = request.GET.get('control')
-    if control_filter == 'handled':
-        # Chip « Traité » : on n'affiche QUE les traités (override du masquage).
+    if control_filter == 'recycled':
         base = base.filter(handled__isnull=False)
     elif control_filter == 'rejected':
-        # Chip « Rejeté » : on n'affiche QUE les rejets terminaux opérateur.
         base = base.filter(**_rejected_q).distinct()
+    elif control_filter == 'ok':
+        base = _undecided(base).filter(control_class=Event.MonitoringClass.PUSH)
+    elif control_filter == 'failed':
+        base = _undecided(base).filter(control_class__in=TRIAGE_FAILURE_CLASSES)
+    elif control_filter == 'none':
+        base = _undecided(base).filter(control_class__isnull=True)
     else:
+        control_filter = None
         base = _hide_resolved(base)
-        if control_filter == 'none':
-            base = base.filter(control_class__isnull=True)
-        elif control_filter in valid_classes:
-            base = base.filter(control_class=control_filter)
-        else:
-            control_filter = None
 
     # Total des lignes correspondant au(x) filtre(s), AVANT pagination (top-N).
     matched_total = base.count()
@@ -545,10 +550,25 @@ def monitoring_feed(request):
         Handled.objects.filter(file_id__in=page_ids).values_list('file_id', flat=True))
     rejected_ids = operator_rejected_ids(page_ids)
 
+    def _display_state(rf):
+        # Les 4 états sans ambiguïté (cf. compteurs ci-dessus). La décision opérateur
+        # (Recycled/Rejected) prime sur le verdict ; un `reject` moteur sans décision
+        # reste « failed » (jamais « rejected »).
+        if rf.pk in handled_ids:
+            return 'recycled'
+        if rf.pk in rejected_ids:
+            return 'rejected'
+        if rf.control_class == Event.MonitoringClass.PUSH:
+            return 'ok'
+        if rf.control_class in TRIAGE_FAILURE_CLASSES:
+            return 'failed'
+        return 'none'
+
     def to_row(rf):
         name = posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)'
         # Durée de transfert : SFTPGo la fournit dans le payload (`elapsed`, ms).
         elapsed = rf.raw.get('elapsed') if isinstance(rf.raw, dict) else None
+        ds = _display_state(rf)
         return {
             'id': rf.pk,
             'state': rf.state,
@@ -574,10 +594,10 @@ def monitoring_feed(request):
             # Actions disponibles côté UI (gardées aussi côté serveur).
             'can_archive': rf.state == ReceivedFile.State.FAILED,
             'can_restore': rf.state == ReceivedFile.State.ARCHIVED,
-            # Remédiation contrôle (Recycle/Reject) : échec actionnable & pas tranché.
-            'can_remediate': (rf.control_class in TRIAGE_FAILURE_CLASSES
-                              and rf.pk not in handled_ids
-                              and rf.pk not in rejected_ids),
+            # État affiché (4 états sans ambiguïté) — pilote badge + boutons. `failed`
+            # = échec SANS décision opérateur ⟹ seul état qui propose Recycle/Reject.
+            'display_state': ds,
+            'can_remediate': ds == 'failed',
         }
 
     # Compteurs globaux par état (indexés) : pilotent les chips + le badge History.
@@ -592,7 +612,7 @@ def monitoring_feed(request):
         'view': view,
         'rows': [to_row(rf) for rf in qs],
         'per_state': per_state,
-        'per_control_class': per_control_class,
+        'per_display_state': per_display_state,
         'live_total': live_total,
         'history_total': history_total,
         # Écho de la requête de tri/filtre + cardinalités (pilote « affichés / total »).

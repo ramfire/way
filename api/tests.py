@@ -651,26 +651,63 @@ class RemediationEndpointTests(TestCase):
         self.assertEqual(self.client.get(f'/monitoring/files/{rf.pk}/reject/').status_code, 405)
         self.assertEqual(self.client.get(f'/monitoring/files/{rf.pk}/recycle/').status_code, 405)
 
-    def test_feed_exposes_can_remediate(self):
+    def test_feed_exposes_failed_state_and_remediation(self):
+        # Échec MOTEUR sans décision → état affiché « failed » (jamais « rejected »),
+        # avec remédiation possible.
         rf = self._failing_file()
         row = next(x for x in self.client.get('/monitoring/feed/').json()['rows']
                    if x['id'] == rf.pk)
+        self.assertEqual(row['display_state'], 'failed')
         self.assertTrue(row['can_remediate'])
 
     def test_rejected_hidden_by_default_visible_via_chip(self):
         rf = self._failing_file()
         self.client.post(f'/monitoring/files/{rf.pk}/reject/')
-        # Tranché → absent du board par défaut ; compté dans le bucket dédié `rejected`,
-        # plus dans la classe affichée `reject`.
+        # Décision opérateur → état « rejected », absent du board par défaut ; compté
+        # dans le bucket dédié `rejected`, plus dans `failed`.
         data = self.client.get('/monitoring/feed/').json()
         self.assertNotIn(rf.pk, [x['id'] for x in data['rows']])
-        self.assertEqual(data['per_control_class'].get('rejected'), 1)
-        self.assertIsNone(data['per_control_class'].get('reject'))
-        # Chip « Rejeté » : on le retrouve, terminal (non remédiable).
+        self.assertEqual(data['per_display_state'].get('rejected'), 1)
+        self.assertIsNone(data['per_display_state'].get('failed'))
+        # Chip « Rejected » : on le retrouve, terminal (non remédiable).
         row = next(x for x in self.client.get('/monitoring/feed/?control=rejected')
                    .json()['rows'] if x['id'] == rf.pk)
+        self.assertEqual(row['display_state'], 'rejected')
         self.assertFalse(row['can_remediate'])
-        self.assertEqual(row['control_class'], Event.MonitoringClass.REJECT)
         # Réaffiché aussi par le toggle « show resolved ».
         self.assertIn(rf.pk, [x['id'] for x in
                       self.client.get('/monitoring/feed/?show_handled=1').json()['rows']])
+
+    def test_engine_reject_shows_failed_not_rejected(self):
+        # Cœur du lot : quarantine MOTEUR (nom non conforme) → control_class=reject
+        # SANS décision opérateur → état affiché « failed » + remédiable. Jamais
+        # « rejected » tant qu'aucun opérateur n'a tranché.
+        enrol('way')
+        add_nomenclature('way', 'in/way', r'\d+\.csv')   # n'accepte que des chiffres
+        rf = make_file(username='way', s3_key='in/way/abc.csv')
+        file_admission(rf.pk)
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.REJECT)
+        row = next(x for x in self.client.get('/monitoring/feed/').json()['rows']
+                   if x['id'] == rf.pk)
+        self.assertEqual(row['display_state'], 'failed')
+        self.assertTrue(row['can_remediate'])
+
+    def test_recycled_and_ok_states(self):
+        # Recycle abouti (Handled) → « recycled » (masqué par défaut) ; OK natif → « ok ».
+        rf = make_file(username='newcomer')
+        file_admission(rf.pk)
+        enrol('newcomer')
+        add_nomenclature('newcomer', 'in/acme', r'.+')
+        self.client.post(f'/monitoring/files/{rf.pk}/recycle/')   # → push + Handled
+        row = next(x for x in self.client.get('/monitoring/feed/?control=recycled')
+                   .json()['rows'] if x['id'] == rf.pk)
+        self.assertEqual(row['display_state'], 'recycled')
+        self.assertFalse(row['can_remediate'])
+        enrol('acme')
+        add_nomenclature('acme', 'in/acme', r'.+')
+        ok = make_file(username='acme', s3_key='in/acme/a.csv')
+        file_admission(ok.pk)
+        row = next(x for x in self.client.get('/monitoring/feed/').json()['rows']
+                   if x['id'] == ok.pk)
+        self.assertEqual(row['display_state'], 'ok')

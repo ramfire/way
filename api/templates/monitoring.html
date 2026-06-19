@@ -51,6 +51,11 @@
     .mc-warning_noaction { background:#334155; color:#cbd5e1; }
     .mc-push             { background:#14532d; color:#bbf7d0; }
     .mc-none             { color:var(--mut); }
+    /* États affichés (board) : 4 valeurs sans ambiguïté verdict↔décision. */
+    .ds-ok       { background:#14532d; color:#bbf7d0; }
+    .ds-failed   { background:#9a3412; color:#ffedd5; box-shadow:inset 2px 0 0 #f97316; }
+    .ds-recycled { background:#1e3a8a; color:#dbeafe; }
+    .ds-rejected { background:#7f1d1d; color:#fecaca; }
     /* Barre de filtre par classe de contrôle (chips, axe contrôles). */
     .cbar { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap;
             padding:.55rem 1.5rem; border-bottom:1px solid var(--line); font-size:.82rem; }
@@ -180,7 +185,9 @@
         th_state: 'Status', th_file: 'File', th_user: 'User', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Size', th_transfer: 'Transfer', th_received: 'Received',
         th_stored: 'Stored', th_archived: 'Archived', th_controls: 'Controls',
-        // classes de monitoring — badge « worst-wins » de la colonne Contrôles
+        // états affichés (board) : 4 valeurs sans ambiguïté verdict↔décision
+        ds_ok: 'OK', ds_failed: 'Failed', ds_recycled: 'Recycled', ds_rejected: 'Rejected',
+        // classes de monitoring — détail granulaire (modale / agrégat par cause)
         mc_blocking: 'Blocking', mc_warning_action: 'Action needed', mc_recycle: 'Recycle',
         mc_reject: 'Rejected', mc_warning_noaction: 'Warning', mc_push: 'OK', mc_none: '—',
         ctl_filter: 'Controls', ctl_all: 'All',
@@ -235,6 +242,7 @@
         th_state: 'État', th_file: 'Fichier', th_user: 'Utilisateur', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Taille', th_transfer: 'Transfert', th_received: 'Reçu',
         th_stored: 'Stocké', th_archived: 'Archivé', th_controls: 'Contrôles',
+        ds_ok: 'OK', ds_failed: 'Échec', ds_recycled: 'Recyclé', ds_rejected: 'Rejeté',
         mc_blocking: 'Bloquant', mc_warning_action: 'Action requise', mc_recycle: 'Recyclage',
         mc_reject: 'Rejeté', mc_warning_noaction: 'Avertissement', mc_push: 'OK', mc_none: '—',
         ctl_filter: 'Contrôles', ctl_all: 'Tous',
@@ -285,6 +293,7 @@
         th_state: 'Stato', th_file: 'File', th_user: 'Utente', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Dimensione', th_transfer: 'Trasferimento', th_received: 'Ricevuto',
         th_stored: 'Archiviato', th_archived: 'Archiviato il', th_controls: 'Controlli',
+        ds_ok: 'OK', ds_failed: 'Fallito', ds_recycled: 'Riciclato', ds_rejected: 'Respinto',
         mc_blocking: 'Bloccante', mc_warning_action: 'Azione richiesta', mc_recycle: 'Riciclo',
         mc_reject: 'Respinto', mc_warning_noaction: 'Avviso', mc_push: 'OK', mc_none: '—',
         ctl_filter: 'Controlli', ctl_all: 'Tutti',
@@ -357,12 +366,9 @@
       { id:'th-controls', key:'control',    i18n:'th_controls' },
     ];
 
-    // Classes de monitoring (axe contrôles), de la plus sévère à la moins (worst-wins).
-    // Ordre = échelle de sévérité décidée (design §5) ; `none` = aucun contrôle passé.
-    // `handled` = clé synthétique du feed (fichiers traités) → chip vert dédié,
-    // hors classes de problème ; `none` = aucun contrôle passé.
-    const CLASS_ORDER = ['blocking', 'warning_action', 'recycle', 'reject',
-                         'warning_noaction', 'push', 'handled', 'rejected', 'none'];
+    // États affichés du board (4 sans ambiguïté + `none` = aucun contrôle passé).
+    // L'actionnable (`failed`) en tête ; `recycled`/`rejected` = décisions opérateur.
+    const DISPLAY_ORDER = ['failed', 'ok', 'recycled', 'rejected', 'none'];
 
     let lang = localStorage.getItem('monitoring_lang');
     if (!I18N[lang]) lang = 'en';      // défaut : anglais
@@ -479,49 +485,35 @@
     // générique tous stages). `mc-none` = aucun contrôle encore passé. Détail complet
     // par contrôle au double-clic (modale).
     function controlBadge(r) {
-      const c = r.control_class;
-      // Le badge de classe montre TOUJOURS le vrai résultat courant (recycle/reject
-      // orange tant que pas re-contrôlé, push/OK vert une fois admis). Couplage
-      // strict : le badge « traité » n'apparaît QUE sur un OK (push) retraité via
-      // Handle — jamais sur une ligne en échec.
-      const flag = (c === 'push' && r.handled)
-        ? ` <span class="flag-handled" title="${esc(t('tr_handled'))}">${esc(t('tr_handled'))}</span>`
-        : '';
-      const main = c
-        ? `<span class="badge mc-${esc(c)}">${esc(t('mc_' + c) || c)}</span>`
-        : `<span class="mc-none">${esc(t('mc_none'))}</span>`;
-      return main + flag;
+      // Badge = l'un des 4 états sans ambiguïté (verdict vs décision opérateur) :
+      // ok / failed / recycled / rejected. `none` = aucun contrôle encore passé.
+      const s = r.display_state;
+      return (!s || s === 'none')
+        ? `<span class="mc-none">${esc(t('mc_none'))}</span>`
+        : `<span class="badge ds-${esc(s)}">${esc(t('ds_' + s) || s)}</span>`;
     }
 
     // Chips de filtre par classe de monitoring (axe contrôles), ordonnés du plus
     // sévère au moins sévère ; on n'affiche que les classes présentes (count > 0).
     function controlChip(cls, count) {
       const active = (controlFilter === cls) ? ' active' : '';
-      // Buckets dédiés (tranché) : `handled` (badge vert) / `rejected` (badge rouge,
-      // réutilise mc-reject) ; sinon badge de la classe de monitoring.
-      const label = (cls === 'handled') ? t('tr_handled')
-        : (cls === 'rejected') ? t('tr_rejected')
-        : (t('mc_' + cls) || cls);
+      const label = (cls === 'none') ? t('mc_none') : (t('ds_' + cls) || cls);
       const inner = (cls === 'none') ? esc(label)
-        : (cls === 'handled') ? `<span class="badge tr-resolved">${esc(label)}</span>`
-        : (cls === 'rejected') ? `<span class="badge mc-reject">${esc(label)}</span>`
-        : `<span class="badge mc-${esc(cls)}">${esc(label)}</span>`;
+        : `<span class="badge ds-${esc(cls)}">${esc(label)}</span>`;
       return `<span class="stat clickable${active}" data-control="${esc(cls)}">${inner} <b>${count}</b></span>`;
     }
     function renderControlChips(data) {
-      const pc = data.per_control_class || {};
-      const chips = CLASS_ORDER.filter(c => pc[c]).map(c => controlChip(c, pc[c]));
+      const pc = data.per_display_state || {};
+      const chips = DISPLAY_ORDER.filter(c => pc[c]).map(c => controlChip(c, pc[c]));
       $('cbar').innerHTML = chips.length
         ? `<span class="cbar-lbl">${esc(t('ctl_filter'))} :</span>` + chips.join('')
         : '';
     }
 
-    // Bouton « Causes » : compteur des fichiers « à attention » (classe ≠ push/none),
+    // Bouton « Causes » : compteur des fichiers en échec SANS décision (état `failed`),
     // dérivé des compteurs déjà renvoyés par le feed (pas d'appel réseau).
     function updateCausesBtn(data) {
-      const pc = data.per_control_class || {};
-      const n = ['blocking', 'warning_action', 'recycle', 'reject', 'warning_noaction']
-        .reduce((s, k) => s + (pc[k] || 0), 0);
+      const n = (data.per_display_state || {}).failed || 0;
       $('btn-causes').textContent = t('causes_btn') + (n ? ` (${n})` : '');
     }
 
