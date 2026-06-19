@@ -656,9 +656,21 @@ class RemediationEndpointTests(TestCase):
         row = next(x for x in self.client.get('/monitoring/feed/').json()['rows']
                    if x['id'] == rf.pk)
         self.assertTrue(row['can_remediate'])
-        # Après reject (terminal) → plus remédiable, classe reject dans le feed.
+
+    def test_rejected_hidden_by_default_visible_via_chip(self):
+        rf = self._failing_file()
         self.client.post(f'/monitoring/files/{rf.pk}/reject/')
-        row = next(x for x in self.client.get('/monitoring/feed/').json()['rows']
-                   if x['id'] == rf.pk)
+        # Tranché → absent du board par défaut ; compté dans le bucket dédié `rejected`,
+        # plus dans la classe affichée `reject`.
+        data = self.client.get('/monitoring/feed/').json()
+        self.assertNotIn(rf.pk, [x['id'] for x in data['rows']])
+        self.assertEqual(data['per_control_class'].get('rejected'), 1)
+        self.assertIsNone(data['per_control_class'].get('reject'))
+        # Chip « Rejeté » : on le retrouve, terminal (non remédiable).
+        row = next(x for x in self.client.get('/monitoring/feed/?control=rejected')
+                   .json()['rows'] if x['id'] == rf.pk)
         self.assertFalse(row['can_remediate'])
         self.assertEqual(row['control_class'], Event.MonitoringClass.REJECT)
+        # Réaffiché aussi par le toggle « show resolved ».
+        self.assertIn(rf.pk, [x['id'] for x in
+                      self.client.get('/monitoring/feed/?show_handled=1').json()['rows']])

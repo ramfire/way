@@ -405,46 +405,53 @@ def monitoring_feed(request):
     if state_filter:
         base = base.filter(state=state_filter)
 
-    # Triage (étape 5) : par défaut on MASQUE les fichiers marqués « traités »
-    # (override fichier `resolved`) → le board ne montre que ce qui reste à faire.
-    # `?show_handled=1` les réaffiche (toggle UI). Le masquage s'applique AUSSI aux
-    # compteurs par classe ci-dessous, pour que les chips/badge « Causes (N) » se
-    # rafraîchissent quand on traite un fichier (sinon le compteur ne bouge pas).
+    # Triage : par défaut on MASQUE les fichiers TRANCHÉS → le board ne montre que ce
+    # qui reste à arbitrer. « Tranché » = soit « traité » (ligne ``Handled``, set-once,
+    # forcément un OK ``push``), soit **rejeté définitivement** par un opérateur
+    # (Event de triage ``operator_rejected``, forcément un ``reject`` via le
+    # court-circuit). `?show_handled=1` réaffiche les deux (toggle UI). Le masquage
+    # s'applique AUSSI aux compteurs ci-dessous (chip ↔ liste cohérents).
     show_handled = request.GET.get('show_handled') == '1'
+    _rejected_q = {'events__stage': Event.Stage.TRIAGE,
+                   'events__cause_code': OPERATOR_REJECTED}
 
-    def _hide_handled(qs):
-        # Un fichier est « traité » ssi une ligne Handled existe (set-once).
-        return qs if show_handled else qs.filter(handled__isnull=True)
+    def _hide_resolved(qs):
+        if show_handled:
+            return qs
+        return qs.filter(handled__isnull=True).exclude(**_rejected_q)
 
     # Compteurs par classe de monitoring (axe contrôles, read-model matérialisé),
     # sur la vue courante AVANT le filtre par classe → pilotent les chips. `none` =
     # aucun contrôle encore passé (control_class NULL). **Couplage strict** : un
-    # fichier traité est forcément ``push`` (le flag n'est posé que par un Handle
-    # aboutissant à OK) → il est compté dans `push`, JAMAIS dans une classe d'échec
-    # (plus de double comptage v0.2). Le masquage des traités s'applique comme à la
-    # liste (chip ↔ liste cohérents). Les traités sont AUSSI isolés sous la clé
-    # `handled` (= `handled_total`, sous-ensemble strict des OK ; chip vert dédié,
-    # cliquable, indépendant du toggle).
+    # fichier tranché (traité OU rejeté-opérateur) est compté dans son bucket dédié
+    # (`handled` / `rejected`), JAMAIS dans une classe affichée. Les deux buckets sont
+    # des sous-ensembles isolés (chips dédiés, cliquables, indépendants du toggle) :
+    # `handled` = OK retraités ; `rejected` = rejets terminaux opérateur.
     per_control_class = {}
-    for row in (_hide_handled(ReceivedFile.objects.filter(state__in=states))
+    for row in (_hide_resolved(ReceivedFile.objects.filter(state__in=states))
                 .values('control_class').annotate(n=Count('id'))):
         per_control_class[row['control_class'] or 'none'] = row['n']
     handled_count = (ReceivedFile.objects
-                     .filter(state__in=states,
-                             handled__isnull=False).count())
+                     .filter(state__in=states, handled__isnull=False).count())
     if handled_count:
         per_control_class['handled'] = handled_count
+    rejected_count = (ReceivedFile.objects
+                      .filter(state__in=states, **_rejected_q).distinct().count())
+    if rejected_count:
+        per_control_class['rejected'] = rejected_count
 
     # Filtre par classe de monitoring (chip cliquable). Valeurs valides = les 6
-    # classes + `none` (NULL) + `handled` (chip vert dédié). Autre → pas de filtre.
+    # classes + `none` (NULL) + buckets dédiés `handled` / `rejected`. Autre → rien.
     valid_classes = set(Event.MonitoringClass.values)
     control_filter = request.GET.get('control')
     if control_filter == 'handled':
-        # Chip « Traité » : on n'affiche QUE les traités (override du masquage par
-        # défaut — sinon il n'y aurait rien à voir).
+        # Chip « Traité » : on n'affiche QUE les traités (override du masquage).
         base = base.filter(handled__isnull=False)
+    elif control_filter == 'rejected':
+        # Chip « Rejeté » : on n'affiche QUE les rejets terminaux opérateur.
+        base = base.filter(**_rejected_q).distinct()
     else:
-        base = _hide_handled(base)
+        base = _hide_resolved(base)
         if control_filter == 'none':
             base = base.filter(control_class__isnull=True)
         elif control_filter in valid_classes:
@@ -576,7 +583,7 @@ def monitoring_feed(request):
     # Compteurs globaux par état (indexés) : pilotent les chips + le badge History.
     # Respectent le masquage des traités (cohérence avec les lignes/compteurs visibles).
     per_state = {s.value: 0 for s in ReceivedFile.State}
-    for row in _hide_handled(ReceivedFile.objects.all()).values('state').annotate(n=Count('id')):
+    for row in _hide_resolved(ReceivedFile.objects.all()).values('state').annotate(n=Count('id')):
         per_state[row['state']] = row['n']
     live_total = sum(per_state[s.value] for s in LIVE_STATES)
     history_total = sum(per_state[s.value] for s in HISTORY_STATES)

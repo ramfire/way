@@ -192,9 +192,9 @@
         // triage (étape 5) — statuts + actions
         tr_open: 'Open', tr_in_progress: 'In progress', tr_resolved: 'Resolved',
         tr_claim: 'Claim', tr_resolve: 'Resolve', tr_reopen: 'Reopen',
-        tr_handled: '✓ handled',
+        tr_handled: '✓ handled', tr_rejected: '⊘ rejected',
         tr_recycle: '↻ Recycle', tr_reject: '⊘ Reject',
-        hide_handled: 'Hide handled',
+        hide_handled: 'Hide resolved',
         // libellés de la modale détail (support)
         adm_title: 'Admission checks', adm_no_events: 'No admission event for this file yet.',
         adm_c_control: 'Control', adm_c_result: 'Result', adm_c_class: 'Class',
@@ -244,9 +244,9 @@
         cz_partners: 'Partenaires', cz_examples: 'Exemples', cz_status: 'Triage', cz_open: 'à traiter',
         tr_open: 'Ouvert', tr_in_progress: 'En cours', tr_resolved: 'Résolu',
         tr_claim: 'Prendre', tr_resolve: 'Résoudre', tr_reopen: 'Rouvrir',
-        tr_handled: '✓ traité',
+        tr_handled: '✓ traité', tr_rejected: '⊘ rejeté',
         tr_recycle: '↻ Recycler', tr_reject: '⊘ Rejeter',
-        hide_handled: 'Masquer traités',
+        hide_handled: 'Masquer tranchés',
         adm_title: 'Contrôles d’admission', adm_no_events: 'Aucun événement d’admission pour ce fichier.',
         adm_c_control: 'Contrôle', adm_c_result: 'Résultat', adm_c_class: 'Classe',
         adm_c_detail: 'Détail', adm_c_time: 'Heure',
@@ -294,9 +294,9 @@
         cz_partners: 'Partner', cz_examples: 'Esempi', cz_status: 'Triage', cz_open: 'da gestire',
         tr_open: 'Aperto', tr_in_progress: 'In corso', tr_resolved: 'Risolto',
         tr_claim: 'Prendi', tr_resolve: 'Risolvi', tr_reopen: 'Riapri',
-        tr_handled: '✓ gestito',
+        tr_handled: '✓ gestito', tr_rejected: '⊘ rifiutato',
         tr_recycle: '↻ Ricicla', tr_reject: '⊘ Rifiuta',
-        hide_handled: 'Nascondi gestiti',
+        hide_handled: 'Nascondi risolti',
         adm_title: 'Controlli di ammissione', adm_no_events: 'Nessun evento di ammissione per questo file.',
         adm_c_control: 'Controllo', adm_c_result: 'Esito', adm_c_class: 'Classe',
         adm_c_detail: 'Dettaglio', adm_c_time: 'Ora',
@@ -362,7 +362,7 @@
     // `handled` = clé synthétique du feed (fichiers traités) → chip vert dédié,
     // hors classes de problème ; `none` = aucun contrôle passé.
     const CLASS_ORDER = ['blocking', 'warning_action', 'recycle', 'reject',
-                         'warning_noaction', 'push', 'handled', 'none'];
+                         'warning_noaction', 'push', 'handled', 'rejected', 'none'];
 
     let lang = localStorage.getItem('monitoring_lang');
     if (!I18N[lang]) lang = 'en';      // défaut : anglais
@@ -497,10 +497,14 @@
     // sévère au moins sévère ; on n'affiche que les classes présentes (count > 0).
     function controlChip(cls, count) {
       const active = (controlFilter === cls) ? ' active' : '';
-      // `handled` : libellé + badge vert « traité » (réutilise tr-resolved).
-      const label = (cls === 'handled') ? t('tr_handled') : (t('mc_' + cls) || cls);
+      // Buckets dédiés (tranché) : `handled` (badge vert) / `rejected` (badge rouge,
+      // réutilise mc-reject) ; sinon badge de la classe de monitoring.
+      const label = (cls === 'handled') ? t('tr_handled')
+        : (cls === 'rejected') ? t('tr_rejected')
+        : (t('mc_' + cls) || cls);
       const inner = (cls === 'none') ? esc(label)
         : (cls === 'handled') ? `<span class="badge tr-resolved">${esc(label)}</span>`
+        : (cls === 'rejected') ? `<span class="badge mc-reject">${esc(label)}</span>`
         : `<span class="badge mc-${esc(cls)}">${esc(label)}</span>`;
       return `<span class="stat clickable${active}" data-control="${esc(cls)}">${inner} <b>${count}</b></span>`;
     }
