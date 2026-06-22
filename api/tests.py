@@ -1,3 +1,6 @@
+import io
+from unittest.mock import patch
+
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
 
@@ -6,6 +9,7 @@ from .admission import (
     latest_admission_event,
 )
 from . import qualification as qual
+from . import parsing
 from .models import (
     Channel, Event, Handled, Nomenclature, Partner, ReceivedFile, Route,
     SubTenant, current_control_rollup, refresh_control_class,
@@ -907,3 +911,127 @@ class RoutingTeeScenarioTests(TestCase):
         rf = self._admit('/OTHER_9.dat')
         self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
         self.assertIsNone(rf.route_id)
+
+
+# Layout NAV de test (forme conforme à validate_layout) : TSV, 3 colonnes.
+PARSE_LAYOUT = {
+    'format': 'csv', 'delimiter': '\t', 'encoding': 'utf-8',
+    'header': {'present': True, 'columns': ['A', 'B', 'C']},
+}
+
+
+def _fake_s3(content_bytes):
+    """Client S3 factice : ``get_object(...)['Body'].read()`` rend ``content_bytes``."""
+    from unittest.mock import MagicMock
+    c = MagicMock()
+    c.get_object.return_value = {'Body': io.BytesIO(content_bytes)}
+    return c
+
+
+class ParsingTests(TestCase):
+    """Stage parsing (§1.5) : décodage structurel piloté par ``nomenclature.layout``."""
+
+    def _qualified_file(self, filename='NAV.txt', layout=PARSE_LAYOUT, file_size=None):
+        """Enrôle tee + une Nomenclature .txt (avec layout) et qualifie un fichier."""
+        enrol('tee')
+        route = add_route('tee')
+        nom = add_nomenclature('tee', subfolder='', filename_regex=r'.*\.txt', route=route)
+        nom.layout = layout
+        nom.save()
+        rf = make_file(username='tee', s3_key=f'/{filename}', path=f'tee/{filename}',
+                       file_size=file_size)
+        file_admission(rf.pk)  # produit le verdict qualification `qualified`
+        self.assertEqual(qual.latest_qualification_event(rf).detail['verdict'],
+                         qual.VERDICT_QUALIFIED)
+        return rf, nom
+
+    def _parse(self, rf, content):
+        with patch('api.parsing.get_s3_client', return_value=_fake_s3(content)):
+            return parsing.file_parsing(rf.pk)
+
+    def test_well_formed_tsv_parses(self):
+        rf, _ = self._qualified_file()
+        verdict = self._parse(rf, b'A\tB\tC\n1\t2\t3\n4\t5\t6\n')
+        self.assertEqual(verdict, parsing.VERDICT_PARSED)
+        ev = parsing.latest_parsing_event(rf)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+        self.assertEqual(ev.detail['record_count'], 2)
+        self.assertEqual(ev.detail['column_count'], 3)
+
+    def test_header_only_parses_zero_records(self):
+        # NAV_02 : en-tête seul, 0 ligne de données → parse OK (la vacuité = §1.7).
+        rf, _ = self._qualified_file()
+        verdict = self._parse(rf, b'A\tB\tC')
+        self.assertEqual(verdict, parsing.VERDICT_PARSED)
+        self.assertEqual(parsing.latest_parsing_event(rf).detail['record_count'], 0)
+
+    def test_empty_file_recycles_no_header(self):
+        rf, _ = self._qualified_file()
+        verdict = self._parse(rf, b'')
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
+                         parsing.CAUSE_HEADER_MISMATCH)
+
+    def test_malformed_record_recycles(self):
+        rf, _ = self._qualified_file()
+        verdict = self._parse(rf, b'A\tB\tC\n1\t2\n')  # 2 champs au lieu de 3
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        ev = parsing.latest_parsing_event(rf)
+        self.assertEqual(ev.cause_code, parsing.CAUSE_MALFORMED_RECORD)
+        self.assertEqual(ev.detail['record_index'], 1)
+
+    def test_header_mismatch_recycles(self):
+        rf, _ = self._qualified_file()
+        verdict = self._parse(rf, b'A\tB\tC\tD\n')  # 4 colonnes vs 3 déclarées
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
+                         parsing.CAUSE_HEADER_MISMATCH)
+
+    def test_layout_not_declared_recycles(self):
+        rf, _ = self._qualified_file(layout={})
+        verdict = self._parse(rf, b'A\tB\tC\n1\t2\t3\n')
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
+                         parsing.CAUSE_LAYOUT_NOT_DECLARED)
+
+    def test_unsupported_format_recycles(self):
+        rf, _ = self._qualified_file(layout={'format': 'xml'})
+        verdict = self._parse(rf, b'<x/>')
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
+                         parsing.CAUSE_UNSUPPORTED_FORMAT)
+
+    def test_unreadable_s3_recycles(self):
+        rf, _ = self._qualified_file()
+        c = _fake_s3(b'')
+        c.get_object.side_effect = RuntimeError('S3 down')
+        with patch('api.parsing.get_s3_client', return_value=c):
+            verdict = parsing.file_parsing(rf.pk)
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
+                         parsing.CAUSE_UNREADABLE)
+
+    def test_too_large_recycles_without_s3_read(self):
+        rf, _ = self._qualified_file(file_size=parsing.DEFAULT_MAX_BYTES + 1)
+        c = _fake_s3(b'A\tB\tC\n')
+        with patch('api.parsing.get_s3_client', return_value=c):
+            verdict = parsing.file_parsing(rf.pk)
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
+                         parsing.CAUSE_TOO_LARGE)
+        c.get_object.assert_not_called()  # garde taille AVANT toute lecture S3
+
+    def test_not_qualified_returns_none(self):
+        # Fichier non qualifié (partenaire non mappé) → rien à parser.
+        rf = make_file(username='ghost', s3_key='/x.txt', path='in/x.txt')
+        file_admission(rf.pk)
+        verdict = self._parse(rf, b'A\tB\tC\n')
+        self.assertIsNone(verdict)
+        self.assertIsNone(parsing.latest_parsing_event(rf))
+
+    def test_rerun_is_append_only(self):
+        rf, _ = self._qualified_file()
+        self._parse(rf, b'A\tB\tC\n1\t2\t3\n')
+        self._parse(rf, b'A\tB\tC\n1\t2\t3\n')
+        self.assertEqual(
+            Event.objects.filter(file=rf, stage=parsing.STAGE).count(), 2)

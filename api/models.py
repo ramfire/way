@@ -370,6 +370,7 @@ class Event(models.Model):
         ADMISSION = 'admission', 'Admission'
         QUALIFICATION = 'qualification', 'Qualification'
         ROUTING = 'routing', 'Routage'
+        PARSING = 'parsing', 'Parsing'
         TRIAGE = 'triage', 'Triage (décision opérateur)'
 
     class Result(models.TextChoices):
