@@ -835,13 +835,15 @@ def enrol_nomenclature(request, pk):
             return JsonResponse({'detail': f'regex invalide : {exc}'}, status=400)
     grammar = {'filename': filename_regex} if filename_regex else {}
 
+    # N Nomenclatures par (canal, sous-dossier) depuis §1.4 : la grammaire fait partie
+    # de la clé d'idempotence (une ligne par motif). La Route s'assigne séparément
+    # (admin) ; un enrôlement sans route → qualifié puis recycle (route_not_configured).
     nom, created = Nomenclature.objects.get_or_create(
-        channel_id=rf.channel_id, subfolder=subfolder,
-        defaults={'sub_tenant_id': rf.sub_tenant_id, 'grammar': grammar, 'active': True})
-    if not created and (nom.grammar != grammar or not nom.active):
-        # Réenrôlement : on (ré)active et on aligne la grammaire saisie par l'opérateur.
-        nom.grammar, nom.active = grammar, True
-        nom.save(update_fields=['grammar', 'active'])
+        channel_id=rf.channel_id, subfolder=subfolder, grammar=grammar,
+        defaults={'sub_tenant_id': rf.sub_tenant_id, 'active': True})
+    if not created and not nom.active:
+        nom.active = True
+        nom.save(update_fields=['active'])
     logger.info('Enrôlement nomenclature #%s (canal=%s subfolder=%r created=%s) par %s',
                 nom.pk, rf.channel_id, subfolder, created, request.user)
 

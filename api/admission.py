@@ -210,9 +210,14 @@ def file_admission(file_id):
         verdict = _run(file_id)
         # Chaînage qualification : seulement si admis (canal/partenaire résolus).
         # Garde dédiée → un échec de qualification n'affecte JAMAIS le verdict
-        # d'admission qu'on renvoie. Le refresh ci-dessous couvre les deux stages.
+        # d'admission qu'on renvoie. Puis, court-circuit : le routing ne tourne QUE
+        # si la qualification a passé (qualified) — il consomme la Nomenclature
+        # matchée (in-process). Le refresh unique ci-dessous couvre les trois stages.
         if verdict == VERDICT_ADMIS:
-            _run_qualification(file_id)
+            qual_verdict, nomenclature = _run_qualification(file_id)
+            from .qualification import VERDICT_QUALIFIED
+            if qual_verdict == VERDICT_QUALIFIED:
+                _run_routing(file_id, nomenclature)
         # Rematérialise le rollup worst-wins de l'axe contrôles pour ce fichier
         # (read-model du board), tous stages confondus. Source de vérité = les Event.
         refresh_control_class([file_id])
@@ -225,14 +230,28 @@ def file_admission(file_id):
 def _run_qualification(file_id):
     """Chaîne la qualification, garantie non bloquante (log + avale toute erreur).
 
-    Le ``refresh_control_class`` est laissé à l'appelant (admission) pour n'en faire
-    qu'un seul, couvrant admission + qualification.
+    Renvoie ``(verdict, nomenclature)`` — ``(None, None)`` en cas d'échec non
+    bloquant. Le ``refresh_control_class`` est laissé à l'appelant (admission) pour
+    n'en faire qu'un seul, couvrant les trois stages.
     """
     try:
         from .qualification import qualify_no_refresh
-        qualify_no_refresh(file_id)
+        return qualify_no_refresh(file_id)
     except Exception:
         logger.exception('Qualification (chaînée): échec non bloquant file %s', file_id)
+        return None, None
+
+
+def _run_routing(file_id, nomenclature):
+    """Chaîne le routing, garantie non bloquante (log + avale toute erreur).
+
+    Comme la qualification, le ``refresh_control_class`` est laissé à l'appelant.
+    """
+    try:
+        from .routing import resolve_route
+        resolve_route(file_id, nomenclature)
+    except Exception:
+        logger.exception('Routing (chaîné): échec non bloquant file %s', file_id)
 
 
 def latest_admission_event(rf_or_id):

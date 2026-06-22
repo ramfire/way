@@ -1,3 +1,4 @@
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
 
@@ -76,6 +77,15 @@ class ReceivedFile(models.Model):
     )
     partner = models.ForeignKey(
         'Partner', on_delete=models.SET_NULL, related_name='files',
+        null=True, blank=True,
+    )
+    # Clé de dispatch posée par le stage **routing** (§1.4) : la Route portée par la
+    # Nomenclature qui a qualifié le fichier (``nomenclature.route``). Nullable par
+    # nature (fichier pas encore routé, ou route non configurée/inactive). ``PROTECT``
+    # : une Route référencée ne peut être supprimée. **Jamais sticky** : recalculée OU
+    # effacée à chaque rejeu de la chaîne (cf. ``api/routing.py``). FK ⇒ index auto.
+    route = models.ForeignKey(
+        'Route', on_delete=models.PROTECT, related_name='files',
         null=True, blank=True,
     )
 
@@ -198,13 +208,55 @@ class Channel(models.Model):
         return f'{self.kind}:{self.identifier}'
 
 
-class Nomenclature(models.Model):
-    """Grammaire attendue d'un sous-dossier d'un canal (sélecteur → règles).
+def validate_layout(value):
+    """Validateur **de forme** du descripteur ``layout`` (§1.5), au save.
 
-    Sert l'étape **qualification** (incrément suivant, pas encore câblée) : pour un
-    canal donné, ``subfolder`` sélectionne le jeu de règles ; ``grammar`` décrit le
-    format attendu et ``mandatory`` la liste des éléments obligatoires. Table créée
-    **vide** ici — l'enrôlement se fait à la main (admin)."""
+    Spec de décodage du fichier (delimiter, encoding, header/control_total…),
+    consommée **plus tard** par le parsing — ici on ne vérifie que la **forme et
+    les types**, jamais une valeur métier. Volontairement **permissif** : on ne
+    rejette pas les clés inconnues (le schéma se resserrera à l'onboarding des
+    familles). Un descripteur malformé doit échouer au save pour qu'une erreur de
+    config soit attrapée tôt, hors de l'espace recycle/reject du parsing.
+
+    Un ``{}`` (défaut) est valide : « layout pas encore déclaré ».
+    """
+    if not isinstance(value, dict):
+        raise ValidationError('layout must be a dict (JSON object).')
+    if not value:
+        return
+
+    str_keys = ('format', 'delimiter', 'encoding')
+    for key in str_keys:
+        if key in value and not isinstance(value[key], str):
+            raise ValidationError(f'layout.{key} must be a string.')
+
+    if 'record_types' in value and not isinstance(value['record_types'], list):
+        raise ValidationError('layout.record_types must be a list.')
+
+    if 'header' in value:
+        header = value['header']
+        if not isinstance(header, dict):
+            raise ValidationError('layout.header must be a dict.')
+        if 'control_total' in header:
+            control_total = header['control_total']
+            if not isinstance(control_total, dict):
+                raise ValidationError(
+                    'layout.header.control_total must be a dict locating the '
+                    'field (e.g. {"field": ...} or {"position": ...}).'
+                )
+
+
+class Nomenclature(models.Model):
+    """Contrat de nommage **fin** d'un (canal, sous-dossier) → porte sa Route (§1.4).
+
+    Sert l'étape **qualification** : ``subfolder`` borne le périmètre, ``grammar``
+    (regex de nom) **reconnaît** le fichier. Contrairement au modèle initial (1
+    Nomenclature par sous-dossier), il y a désormais **N Nomenclatures par
+    (canal, sous-dossier)** : une par motif précis (ex. ``POS*.csv`` vs ``TXN*.csv``).
+    La qualification retient celle dont la grammaire matche le nom, ``priority``
+    départageant un éventuel recouvrement. La Nomenclature matchée porte la ``route``
+    (clé de dispatch posée par le routing). ``mandatory`` : différé.
+    """
 
     channel = models.ForeignKey(
         Channel, on_delete=models.CASCADE, related_name='nomenclatures',
@@ -216,15 +268,92 @@ class Nomenclature(models.Model):
     grammar = models.JSONField(default=dict, blank=True)
     mandatory = models.JSONField(default=list, blank=True)
     active = models.BooleanField(default=True)
+    # Départage si plusieurs grammaires matchent le même nom (DESC ; le + haut gagne).
+    priority = models.IntegerField(default=0)
+    # Route portée par ce contrat (§1.4). Nullable = pas encore configurée (→ recycle
+    # au routing). PROTECT : une Route référencée ne peut être supprimée.
+    route = models.ForeignKey(
+        'Route', on_delete=models.PROTECT, related_name='nomenclatures',
+        null=True, blank=True, db_index=True,
+    )
+    # Spec de décodage de la famille (§1.5), consommée **plus tard** par le parsing.
+    # ``{}`` = layout pas encore déclaré ⇒ recycle (config gap) au parse, plus tard.
+    # Validé en forme au save (cf. ``validate_layout``), jamais en valeur métier.
+    layout = models.JSONField(default=dict, blank=True, validators=[validate_layout])
+    # Contrat de complétude (§1.7), consommé **plus tard** : contenu attendu par
+    # défaut ; la vacuité doit être explicitement autorisée par famille.
+    can_be_empty = models.BooleanField(default=False)
+
+    # Plus de UniqueConstraint(channel, subfolder) : N Nomenclatures par sous-dossier,
+    # départagées par grammaire (+ priority). L'unicité « par motif » n'est pas
+    # exprimable en contrainte DB (la grammaire est un JSON regex) → gérée à l'usage.
+    # La Route étant désormais transverse (pas de sub_tenant), plus de garde-fou
+    # « même locataire » : une Nomenclature peut référencer n'importe quelle Route.
+
+    def save(self, *args, **kwargs):
+        # Validation **au save** du seul ``layout`` (forme only) : un descripteur
+        # malformé doit échouer ici, pour qu'une erreur de config soit attrapée tôt
+        # — hors de l'espace recycle/reject du parsing (§1.5). Les ``validators`` de
+        # champ ne s'exécutent qu'au ``full_clean`` (admin/forms) ; on les rejoue
+        # explicitement ici pour couvrir aussi les ``.save()`` programmatiques, sans
+        # élargir la validation aux autres champs (pas de changement de comportement).
+        validate_layout(self.layout)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'{self.channel}/{self.subfolder or "(racine)"}'
+
+
+class Route(models.Model):
+    """Descripteur de traitement **réutilisable**, référencé par une Nomenclature (§1.4).
+
+    Une Route décrit *où va* un flux reconnu et *comment le charger* — sans embarquer
+    aucune logique de parsing (déféré §1.5). Le routing se contente de poser la clé
+    (``ReceivedFile.route``) = ``nomenclature.route`` (au plus une route par
+    Nomenclature ; **n Nomenclatures → 1 Route** réutilisable). ``code`` est le slug
+    stable (**unique globalement**). ``layout``/``layout_version`` décrivent la
+    structure cible, ``target`` la destination déclarative, ``strategy`` le loader
+    (``null`` = loader générique). ``data_type``/``business_domain``/``data_owner``
+    provisoires avant l'IAM (cf. [[iam-rights-redesign]]).
+
+    **Non scopée locataire** : pas de ``sub_tenant`` ni de ``partner``. Une Route est
+    un descripteur **réutilisable** transverse ; le rattachement à un partenaire/tenant
+    se fait via la Nomenclature qui la référence (``Nomenclature.route``).
+    """
+
+    code = models.CharField(max_length=128, db_index=True)  # slug stable
+    label = models.CharField(max_length=255, blank=True, default='')
+
+    # Provisoire avant l'IAM (libellés plats ; future redéfinition des droits).
+    data_type = models.CharField(max_length=64, blank=True, default='')
+    business_domain = models.CharField(max_length=64, blank=True, default='')
+    data_owner = models.CharField(max_length=128, blank=True, default='')
+
+    # Structure cible (déclaratif, consommé par le futur stage de load §1.5).
+    layout = models.JSONField(default=dict, blank=True)
+    layout_version = models.IntegerField(default=1)
+    target = models.JSONField(default=dict, blank=True)
+
+    # Loader : ``strategy=null`` ⇒ loader générique ; sinon stratégie nommée.
+    strategy = models.CharField(max_length=64, null=True, blank=True)
+    strategy_params = models.JSONField(default=dict, blank=True)
+
+    # Attributs transverses (contains_pii, regulatory_scope…).
+    attributes = models.JSONField(default=dict, blank=True)
+
+    active = models.BooleanField(default=True)
+    version = models.IntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=['channel', 'subfolder'], name='uniq_nomenclature_channel_subfolder'),
+                fields=['code'], name='uniq_route_code'),
         ]
 
     def __str__(self):
-        return f'{self.channel}/{self.subfolder or "(racine)"}'
+        return self.code
 
 
 class Event(models.Model):
@@ -240,6 +369,7 @@ class Event(models.Model):
     class Stage(models.TextChoices):
         ADMISSION = 'admission', 'Admission'
         QUALIFICATION = 'qualification', 'Qualification'
+        ROUTING = 'routing', 'Routage'
         TRIAGE = 'triage', 'Triage (décision opérateur)'
 
     class Result(models.TextChoices):

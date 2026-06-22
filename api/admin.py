@@ -3,8 +3,32 @@ from django.urls import reverse
 from django.utils.html import format_html
 
 from .models import (
-    Channel, Event, Handled, Nomenclature, Partner, ReceivedFile, SubTenant,
+    Channel, Event, Handled, Nomenclature, Partner, ReceivedFile, Route,
+    SubTenant,
 )
+
+# Ordre d'affichage des modèles dans l'index admin (par défaut alphabétique).
+# On suit la hiérarchie du référentiel — tenant → partner → channel →
+# nomenclature → route — puis le runtime/journal (fichiers, événements, traités).
+# But explicite : remonter « Sub tenants » tout en haut, au-dessus de « Channels ».
+_MODEL_ORDER = [
+    'SubTenant', 'Partner', 'Channel', 'Nomenclature', 'Route',
+    'ReceivedFile', 'Event', 'Handled',
+]
+_ORDER_INDEX = {name: i for i, name in enumerate(_MODEL_ORDER)}
+_default_get_app_list = admin.site.get_app_list
+
+
+def _ordered_get_app_list(request, app_label=None):
+    """Surcharge ``AdminSite.get_app_list`` : trie les modèles selon ``_MODEL_ORDER``."""
+    app_list = _default_get_app_list(request, app_label)
+    for app in app_list:
+        app['models'].sort(
+            key=lambda m: _ORDER_INDEX.get(m['object_name'], len(_ORDER_INDEX)))
+    return app_list
+
+
+admin.site.get_app_list = _ordered_get_app_list
 
 
 @admin.register(ReceivedFile)
@@ -60,10 +84,27 @@ class ChannelAdmin(admin.ModelAdmin):
 
 @admin.register(Nomenclature)
 class NomenclatureAdmin(admin.ModelAdmin):
-    """Grammaires de sous-dossiers (éditable ; sert la qualification à venir)."""
-    list_display = ('channel', 'subfolder', 'active')
-    list_filter = ('active', 'sub_tenant')
+    """Contrats de nommage (éditable) : grammaire + Route portée (§1.4)."""
+    list_display = ('channel', 'subfolder', 'route', 'priority', 'active')
+    list_filter = ('active', 'sub_tenant', 'route')
     search_fields = ('subfolder',)
+    autocomplete_fields = ('route',)
+
+
+@admin.register(Route)
+class RouteAdmin(admin.ModelAdmin):
+    """Descripteur de traitement réutilisable (§1.4), référencé par les Nomenclatures.
+
+    Configurable à la main (pas d'UI IAM pour l'instant — cf. data_owner provisoire).
+    Descripteur transverse (non scopé locataire).
+    """
+    list_display = (
+        'code', 'data_type', 'business_domain',
+        'layout_version', 'active',
+    )
+    list_filter = ('active', 'business_domain', 'data_type')
+    search_fields = ('code', 'label', 'data_owner')
+    ordering = ('code',)
 
 
 @admin.register(Event)

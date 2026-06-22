@@ -1,20 +1,27 @@
 """Étape **qualification** du cycle de vie d'un fichier (post-admission).
 
 Deuxième producteur de l'axe contrôles après l'admission. Une fois un fichier
-**admis** (flux reconnu, partenaire actif, canal autorisé), la qualification décide
-s'il est **conforme** à la grammaire attendue de son sous-dossier. C'est de
-l'**observation/classification pure** (cf. docs/admission-monitoring-design.md §12) :
+**admis** (flux reconnu, partenaire actif, canal autorisé), la qualification
+**sélectionne la Nomenclature** dont la grammaire reconnaît le nom du fichier. La
+Nomenclature est le contrat de nommage **fin** (ex. ``POS*.csv``) et porte sa
+``route`` (consommée au stage routing §1.4). C'est de l'**observation/
+classification pure** :
 
-  * **par fichier** : sélecteur ``subfolder = dirname(s3_key)``, contrôle de nom
-    ``basename(s3_key)`` contre la regex de la ``Nomenclature`` du canal ;
+  * **par fichier** : sélecteur ``subfolder = dirname(s3_key)`` ; parmi les N
+    Nomenclatures du (canal, sous-dossier), on retient **celle dont la grammaire
+    matche** ``basename(s3_key)`` ;
   * **chaînée** après un verdict admission ``admis`` (donc ``rf.channel`` résolu),
-    et **rejouable** (re-jouer l'admission ré-exécute la qualification) ;
+    et **rejouable** ; expose la Nomenclature matchée **in-process** au routing ;
   * mêmes garanties que l'admission : append-only (``Event``), **ne touche jamais**
     ``ReceivedFile.state``, **ne lève jamais** vers l'appelant.
 
-Verdicts (cf. §12) : pas de nomenclature → ``recycle`` (trou d'enrôlement,
-retraitable) ; nom non conforme → ``quarantine`` (fichier mauvais, non retraité) ;
-tout passe → ``qualified`` (``push``).
+**Le moteur ne *reject* jamais** (décision 2026-06-22) : tout ce qui n'est pas
+``qualified`` est ``recycle`` (retraitable). Le ``reject`` est une **décision
+humaine** (triage opérateur). Verdicts : sous-dossier non enrôlé → ``recycle``
+(``nomenclature_not_found``) ; nom ne matche aucune Nomenclature → ``recycle``
+(``nomenclature_no_match``) ; ≥2 Nomenclatures ex æquo → ``recycle``
+(``ambiguous_nomenclature_config``) ; regex de config invalide → ``recycle``
+(``grammar_invalid``) ; sinon → ``qualified`` (``push``).
 """
 import logging
 import posixpath
@@ -31,14 +38,15 @@ CTRL_NOMENCLATURE_RECOGNISED = 'nomenclature_recognised'
 CTRL_FILENAME_GRAMMAR = 'filename_grammar'
 CTRL_VERDICT = 'verdict'
 
-# Verdicts (posés dans detail['verdict'] de l'événement final).
+# Verdicts (posés dans detail['verdict'] de l'événement final). Pas de quarantine :
+# le moteur ne reject jamais (cf. docstring) — seul le triage opérateur le fait.
 VERDICT_QUALIFIED = 'qualified'
 VERDICT_RECYCLE = 'recycle'
-VERDICT_QUARANTINE = 'quarantine'
 
 # Codes de cause normalisés (Event.cause_code).
-CAUSE_NOMENCLATURE_NOT_FOUND = 'nomenclature_not_found'
-CAUSE_GRAMMAR_MISMATCH = 'filename_grammar_mismatch'
+CAUSE_NOMENCLATURE_NOT_FOUND = 'nomenclature_not_found'   # 0 nomenclature pour le subfolder
+CAUSE_NOMENCLATURE_NO_MATCH = 'nomenclature_no_match'     # nom ne matche aucune nomenclature
+CAUSE_AMBIGUOUS_NOMENCLATURE = 'ambiguous_nomenclature_config'  # ≥2 ex æquo
 CAUSE_GRAMMAR_INVALID = 'grammar_invalid'
 
 # Version du référentiel/règles au moment de la décision (traçabilité).
@@ -73,16 +81,23 @@ def _filename(rf):
 
 
 def _qualified(rf, nom):
-    """Verdict **qualified** : nomenclature trouvée, nom conforme."""
+    """Verdict **qualified** : une Nomenclature reconnaît le fichier.
+
+    ``nom`` (la Nomenclature matchée) est consignée dans le ``detail`` (audit, via
+    ``nomenclature_id``) **et** retournée à la chaîne : elle est le contrat d'entrée
+    du routing (§1.4), qui lira ``nom.route`` in-process (pas de relecture base)."""
     _emit(rf, CTRL_VERDICT, Event.Result.PASSED, Event.MonitoringClass.PUSH,
           detail=_ref({'verdict': VERDICT_QUALIFIED, 'nomenclature_id': nom.pk,
                        'subfolder': nom.subfolder}))
-    logger.info('Qualification QUALIFIED file=%s subfolder=%s', rf.pk, nom.subfolder)
+    logger.info('Qualification QUALIFIED file=%s subfolder=%s nomenclature=%s',
+                rf.pk, nom.subfolder, nom.pk)
     return VERDICT_QUALIFIED
 
 
 def _recycle(rf, reason, extra=None):
-    """Verdict **recycle** : corrigeable en interne (enrôlement), sera retraité."""
+    """Verdict **recycle** : corrigeable en interne (enrôlement), sera retraité.
+
+    Seul verdict d'échec de la qualification : le moteur ne reject jamais."""
     detail = _ref({'verdict': VERDICT_RECYCLE, 'reason': reason})
     if extra:
         detail.update(extra)
@@ -90,17 +105,6 @@ def _recycle(rf, reason, extra=None):
           detail=detail, cause_code=reason)
     logger.info('Qualification RECYCLE file=%s reason=%s', rf.pk, reason)
     return VERDICT_RECYCLE
-
-
-def _quarantine(rf, reason, extra=None):
-    """Verdict **quarantine** : fichier non conforme, conservé pour audit, non retraité."""
-    detail = _ref({'verdict': VERDICT_QUARANTINE, 'reason': reason})
-    if extra:
-        detail.update(extra)
-    _emit(rf, CTRL_VERDICT, Event.Result.FAILED, Event.MonitoringClass.REJECT,
-          detail=detail, cause_code=reason)
-    logger.info('Qualification QUARANTINE file=%s reason=%s', rf.pk, reason)
-    return VERDICT_QUARANTINE
 
 
 def _grammar_regex(nom):
@@ -114,67 +118,101 @@ def _grammar_regex(nom):
     return pattern or None
 
 
-def _run(rf):
-    """Cœur de la qualification (peut lever ; encapsulé par ``file_qualification``)."""
-    subfolder = _subfolder(rf)
+def _matching_nomenclatures(candidates, filename):
+    """Sous-ensemble des ``candidates`` dont la grammaire reconnaît ``filename``.
 
-    # Contrôle 1 — nomenclature reconnue pour (canal, sous-dossier) ?
-    nom = (Nomenclature.objects
-           .filter(channel_id=rf.channel_id, subfolder=subfolder, active=True)
-           .first()) if rf.channel_id else None
-    if nom is None:
-        # Discovery : aucune nomenclature → en attente d'un humain (enrôle puis rejoue).
+    Grammaire vide ⇒ attrape-tout (matche). Lève ``re.error`` si une regex de config
+    est invalide (l'appelant la traite en recycle ``grammar_invalid``)."""
+    matches = []
+    for nom in candidates:
+        pattern = _grammar_regex(nom)
+        if pattern is None:
+            matches.append(nom)
+        elif re.fullmatch(pattern, filename) is not None:
+            matches.append(nom)
+    return matches
+
+
+def _run(rf):
+    """Cœur de la qualification (peut lever ; encapsulé par ``file_qualification``).
+
+    Renvoie ``(verdict, nomenclature)`` : la Nomenclature n'est peuplée que sur
+    ``qualified`` (sinon ``None``). Aucun verdict reject : le moteur ne reject jamais.
+    """
+    subfolder = _subfolder(rf)
+    filename = _filename(rf)
+
+    # Contrôle 1 — sous-dossier enrôlé : ≥1 Nomenclature pour (canal, sous-dossier) ?
+    candidates = list(
+        Nomenclature.objects
+        .filter(channel_id=rf.channel_id, subfolder=subfolder, active=True)
+    ) if rf.channel_id else []
+    if not candidates:
+        # Discovery : sous-dossier inconnu → enrôle une Nomenclature puis rejoue.
         _emit(rf, CTRL_NOMENCLATURE_RECOGNISED, Event.Result.FAILED,
               Event.MonitoringClass.RECYCLE,
               detail=_ref({'reason': CAUSE_NOMENCLATURE_NOT_FOUND, 'subfolder': subfolder}),
               cause_code=CAUSE_NOMENCLATURE_NOT_FOUND)
-        return _recycle(rf, CAUSE_NOMENCLATURE_NOT_FOUND, {'subfolder': subfolder})
+        return _recycle(rf, CAUSE_NOMENCLATURE_NOT_FOUND, {'subfolder': subfolder}), None
     _emit(rf, CTRL_NOMENCLATURE_RECOGNISED, Event.Result.PASSED,
-          Event.MonitoringClass.PUSH, detail=_ref({'subfolder': subfolder}))
+          Event.MonitoringClass.PUSH,
+          detail=_ref({'subfolder': subfolder, 'candidates': [n.pk for n in candidates]}))
 
-    # Contrôle 2 — grammaire (regex) du nom de fichier.
-    filename = _filename(rf)
-    pattern = _grammar_regex(nom)
-    if pattern:
-        try:
-            matched = re.fullmatch(pattern, filename) is not None
-        except re.error as e:
-            # Regex de config invalide → recycle (corriger la nomenclature, rejouer).
+    # Contrôle 2 — sélection : la grammaire de QUELLE Nomenclature reconnaît le nom ?
+    try:
+        matches = _matching_nomenclatures(candidates, filename)
+    except re.error as e:
+        # Regex de config invalide → recycle (corriger la nomenclature, rejouer).
+        _emit(rf, CTRL_FILENAME_GRAMMAR, Event.Result.FAILED,
+              Event.MonitoringClass.RECYCLE,
+              detail=_ref({'reason': CAUSE_GRAMMAR_INVALID, 'filename': filename,
+                           'error': str(e)}),
+              cause_code=CAUSE_GRAMMAR_INVALID)
+        return _recycle(rf, CAUSE_GRAMMAR_INVALID, {'filename': filename}), None
+    if not matches:
+        # Nom ne matche aucune Nomenclature enrôlée → recycle (PAS reject : un humain
+        # tranche — ajouter une Nomenclature, ou rejeter via le triage opérateur).
+        _emit(rf, CTRL_FILENAME_GRAMMAR, Event.Result.FAILED,
+              Event.MonitoringClass.RECYCLE,
+              detail=_ref({'reason': CAUSE_NOMENCLATURE_NO_MATCH, 'filename': filename,
+                           'subfolder': subfolder}),
+              cause_code=CAUSE_NOMENCLATURE_NO_MATCH)
+        return _recycle(rf, CAUSE_NOMENCLATURE_NO_MATCH,
+                        {'filename': filename, 'subfolder': subfolder}), None
+    if len(matches) > 1:
+        top = max(n.priority for n in matches)
+        tops = [n for n in matches if n.priority == top]
+        if len(tops) > 1:
+            # Plusieurs Nomenclatures ex æquo au sommet → anomalie de config (recycle).
             _emit(rf, CTRL_FILENAME_GRAMMAR, Event.Result.FAILED,
                   Event.MonitoringClass.RECYCLE,
-                  detail=_ref({'reason': CAUSE_GRAMMAR_INVALID, 'pattern': pattern,
-                               'error': str(e)}),
-                  cause_code=CAUSE_GRAMMAR_INVALID)
-            return _recycle(rf, CAUSE_GRAMMAR_INVALID,
-                            {'pattern': pattern, 'filename': filename})
+                  detail=_ref({'reason': CAUSE_AMBIGUOUS_NOMENCLATURE, 'filename': filename,
+                               'tied_nomenclatures': sorted(n.pk for n in tops)}),
+                  cause_code=CAUSE_AMBIGUOUS_NOMENCLATURE)
+            return _recycle(rf, CAUSE_AMBIGUOUS_NOMENCLATURE,
+                            {'filename': filename,
+                             'tied_nomenclatures': sorted(n.pk for n in tops)}), None
+        nom = tops[0]
     else:
-        matched = True  # pas de contrainte de nom dans la grammaire
-    if not matched:
-        # Nom non conforme : le fichier lui-même est mauvais → quarantine (non retraité).
-        _emit(rf, CTRL_FILENAME_GRAMMAR, Event.Result.FAILED,
-              Event.MonitoringClass.REJECT,
-              detail=_ref({'reason': CAUSE_GRAMMAR_MISMATCH, 'filename': filename,
-                           'pattern': pattern}),
-              cause_code=CAUSE_GRAMMAR_MISMATCH)
-        return _quarantine(rf, CAUSE_GRAMMAR_MISMATCH,
-                           {'filename': filename, 'pattern': pattern})
-    _emit(rf, CTRL_FILENAME_GRAMMAR, Event.Result.PASSED,
-          Event.MonitoringClass.PUSH, detail=_ref({'filename': filename}))
+        nom = matches[0]
+    _emit(rf, CTRL_FILENAME_GRAMMAR, Event.Result.PASSED, Event.MonitoringClass.PUSH,
+          detail=_ref({'filename': filename, 'nomenclature_id': nom.pk}))
 
-    # Tout est passé → qualifié.
-    return _qualified(rf, nom)
+    return _qualified(rf, nom), nom
 
 
 def qualify_no_refresh(file_id):
     """Qualifie un fichier **sans** rematérialiser le board (peut lever).
 
     Réservé au **chaînage** depuis l'admission, qui fait un unique
-    ``refresh_control_class`` couvrant les deux stages. Renvoie le verdict, ou
-    ``None`` si le fichier n'a pas de canal résolu (non admis → rien à qualifier).
+    ``refresh_control_class`` couvrant les deux stages. Renvoie
+    ``(verdict, nomenclature)``, ou ``(None, None)`` si le fichier n'a pas de canal
+    résolu (non admis → rien à qualifier). La Nomenclature alimente le routing
+    chaîné (in-process).
     """
     rf = ReceivedFile.objects.get(pk=file_id)
     if rf.channel_id is None:
-        return None
+        return None, None
     return _run(rf)
 
 
@@ -182,11 +220,11 @@ def file_qualification(file_id):
     """Lance la qualification d'un fichier (par son id) et renvoie le verdict.
 
     Entrée **autonome** (rematérialise le board), **ne lève jamais** (garde
-    englobante). Renvoie le verdict (``qualified`` / ``recycle`` / ``quarantine``),
-    ``None`` si non qualifiable (pas de canal) ou en cas d'erreur inattendue.
+    englobante). Renvoie le verdict (``qualified`` / ``recycle``), ``None`` si non
+    qualifiable (pas de canal) ou en cas d'erreur inattendue.
     """
     try:
-        verdict = qualify_no_refresh(file_id)
+        verdict, _nom = qualify_no_refresh(file_id)
         refresh_control_class([file_id])
         return verdict
     except Exception:
