@@ -71,7 +71,7 @@ class Command(BaseCommand):
                 continue
             db_by_key[key] = rf  # garde le plus récent (ordre croissant)
 
-        backfilled = promoted = marked_missing = in_sync = 0
+        backfilled = promoted = marked_missing = sized = in_sync = 0
 
         # 3) S3 -> base : backfill / promote.
         for key, size in s3_objects.items():
@@ -109,6 +109,15 @@ class Command(BaseCommand):
                     rf.deleted_at = None
                     rf.reconciled = True
                     rf.save(update_fields=['state', 'deleted_at', 'reconciled'])
+            elif rf.file_size is None:
+                # Ligne `stored` déjà alignée mais sans taille : le hook `upload` de
+                # SFTPGo ne porte pas `file_size`. On la backfill depuis S3 — répare
+                # l'historique antérieur au remplissage à l'ingestion (cf. _on_upload).
+                sized += 1
+                self.stdout.write(f'  [size    ] {key} (file_size <- {size} o)')
+                if not dry:
+                    rf.file_size = size
+                    rf.save(update_fields=['file_size'])
             else:
                 in_sync += 1
 
@@ -141,7 +150,8 @@ class Command(BaseCommand):
         tag = 'DRY-RUN — ' if dry else ''
         self.stdout.write(self.style.SUCCESS(
             f'{tag}backfill={backfilled} promote={promoted} '
-            f'missing={marked_missing} admission={admitted} déjà-ok={in_sync}'))
+            f'missing={marked_missing} size={sized} admission={admitted} '
+            f'déjà-ok={in_sync}'))
 
     def _default_bucket(self):
         """Bucket réel : l'unique bucket des lignes, sinon SCW_BUCKET_PREFIX."""

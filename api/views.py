@@ -27,7 +27,7 @@ from .models import (
     MONITORING_SEVERITY, OPERATOR_REJECTED, Event, Handled, ReceivedFile,
     default_sub_tenant_id, operator_rejected_ids, refresh_control_class,
 )
-from .s3 import PRESIGN_DEFAULT_EXPIRY, presigned_get_url
+from .s3 import PRESIGN_DEFAULT_EXPIRY, object_size, presigned_get_url
 
 logger = logging.getLogger(__name__)
 
@@ -163,13 +163,25 @@ class SFTPWebhookView(APIView):
         success = sftp_status in (None, 1)
         state = ReceivedFile.State.STORED if success else ReceivedFile.State.FAILED
 
+        # Taille du fichier : le hook `upload` de SFTPGo ne transmet PAS `file_size`.
+        # Quand elle manque (upload réussi), on la lit une fois depuis S3 (clé
+        # physique = `path`, repli `virtual_path`) pour la stocker à la source — ainsi
+        # tous les consommateurs (complétude §1.7, board…) la trouvent en base, sans
+        # toucher S3 plus tard. Best-effort : `object_size` renvoie None si S3 KO,
+        # auquel cas la ligne reste sans taille (le filet `reconcile_files` rattrape).
+        file_size = p.get('file_size')
+        if file_size is None and success:
+            bucket = p.get('bucket') or settings.SCW_BUCKET_PREFIX
+            physical_key = p.get('path') or _key(p).lstrip('/')
+            file_size = object_size(bucket, physical_key)
+
         fields = dict(
             path=p.get('path') or '',
             username=username,
             protocol=p.get('protocol') or '',
             ip=p.get('ip') or None,
             session_id=session_id,
-            file_size=p.get('file_size'),
+            file_size=file_size,
             status=sftp_status,
             bucket=p.get('bucket') or '',
             action='upload',

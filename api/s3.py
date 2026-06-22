@@ -20,6 +20,19 @@ def get_s3_client():
     )
 
 
+def object_size(bucket, key):
+    """Taille (octets) de l'objet S3, ou ``None`` si introuvable/injoignable.
+
+    Lecture **best-effort** : toute erreur (objet absent, réseau/S3 down, creds)
+    est avalée et renvoie ``None``. Utilisée à l'ingestion quand le webhook SFTPGo
+    ne transmet pas la taille (son hook ``upload`` ne porte pas ``file_size``)."""
+    try:
+        head = get_s3_client().head_object(Bucket=bucket, Key=key)
+        return head['ContentLength']
+    except Exception:
+        return None
+
+
 def presigned_get_url(bucket, key, expires_in=PRESIGN_DEFAULT_EXPIRY, filename=None):
     """URL GET pré-signée vers un objet. ``filename`` force le nom du téléchargement."""
     params = {'Bucket': bucket, 'Key': key}
