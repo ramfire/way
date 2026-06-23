@@ -20,9 +20,9 @@
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
     a.navlink { color:var(--mut); font-size:.82rem; text-decoration:none; }
     a.navlink:hover { color:#fff; }
-    button { background:var(--card); color:var(--txt); border:1px solid var(--line);
+    button, select { background:var(--card); color:var(--txt); border:1px solid var(--line);
              border-radius:6px; padding:.35rem .7rem; cursor:pointer; font-size:.8rem; }
-    button:hover { border-color:var(--mut); }
+    button:hover, select:hover { border-color:var(--mut); }
     .chips { display:flex; gap:.5rem; flex-wrap:wrap; padding:.8rem 1.5rem 0; }
     .chip { background:var(--card); border:1px solid var(--line); border-radius:999px;
             padding:.3rem .8rem; font-size:.8rem; cursor:pointer; }
@@ -50,6 +50,10 @@
   <header>
     <h1>AlfaWay — <span data-i18n="title">Business monitoring</span></h1>
     <a class="navlink" href="/monitoring/">← <span data-i18n="itboard">IT board</span></a>
+    <label class="meta">
+      <span data-i18n="recvdate">Reception date</span>
+      <select id="recvdate-filter"></select>
+    </label>
     <span class="spacer"></span>
     <div class="meta">
       <span id="count"></span>
@@ -63,6 +67,7 @@
   <table>
     <thead>
       <tr>
+        <th data-i18n="recvdate">Reception date</th>
         <th data-i18n="subfund">Sub-fund</th>
         <th data-i18n="valdate">Valuation date</th>
         <th data-i18n="feed">Feed</th>
@@ -79,16 +84,19 @@
   const REFRESH_MS = 10000;                 // 10 s — aligné sur le board IT
   const FEED = '/monitoring/business/feed/';
   let control = null;                        // filtre control_class courant
+  let receptionDate = null;                  // filtre jour de réception (null = TOUS)
 
   const I18N = {
     en: {title:'Business monitoring', itboard:'IT board', live:'live', subfund:'Sub-fund',
          valdate:'Valuation date', feed:'Feed', verdict:'Verdict', known:'Known?',
          file:'Source file', none:'No partition yet.', all:'All', fails:'Fails',
-         candidate:'candidate', yes:'known'},
+         candidate:'candidate', yes:'known', recvdate:'Reception date', alldates:'All dates',
+         locale:'en-US'},
     fr: {title:'Supervision métier', itboard:'board IT', live:'live', subfund:'Sous-fonds',
          valdate:'Date de valo', feed:'Flux', verdict:'Verdict', known:'Connu ?',
          file:'Fichier source', none:'Aucune partition.', all:'Tout', fails:'Échecs',
-         candidate:'candidat', yes:'connu'},
+         candidate:'candidat', yes:'connu', recvdate:'Date réception', alldates:'Toutes',
+         locale:'fr-FR'},
   };
   let lang = localStorage.getItem('bm_lang') || 'en';
 
@@ -108,6 +116,32 @@
 
   function esc(s) { return (s == null ? '' : String(s)).replace(/[&<>]/g,
     c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+  // Date+heure courte, cohérent avec le board IT (heure puis date, locale courante).
+  function fmtTime(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso), loc = (I18N[lang] || I18N.en).locale;
+    return d.toLocaleTimeString(loc) + ' ' + d.toLocaleDateString(loc);
+  }
+
+  // Peuple le dropdown des jours de réception observés ; conserve la sélection.
+  // Valeurs = jours ISO (YYYY-MM-DD) ; libellés formatés via la locale courante.
+  function fmtDay(iso) {
+    if (!iso) return iso;
+    const d = new Date(iso + 'T00:00:00');
+    return d.toLocaleDateString((I18N[lang] || I18N.en).locale);
+  }
+  function renderRecvDates(dates) {
+    const t = I18N[lang];
+    const sel = document.getElementById('recvdate-filter');
+    const opts = [`<option value="">${esc(t.alldates)}</option>`]
+      .concat((dates || []).map(d => `<option value="${esc(d)}">${esc(fmtDay(d))}</option>`));
+    sel.innerHTML = opts.join('');
+    sel.value = receptionDate || '';          // restaure (défaut « Toutes »)
+  }
+  document.getElementById('recvdate-filter').onchange = (e) => {
+    receptionDate = e.target.value || null; poll();
+  };
 
   function renderChips(per, fails, total) {
     const t = I18N[lang];
@@ -138,6 +172,7 @@
         ? `<span class="badge known">✓ ${t.yes}</span>`
         : `<span class="badge candidate">${t.candidate}</span>`;
       return `<tr>
+        <td class="mono">${esc(fmtTime(r.received_at))}</td>
         <td>${sf}</td>
         <td class="mono">${esc(r.valuation_date_value)}</td>
         <td>${esc(r.feed)}</td>
@@ -150,11 +185,15 @@
 
   async function poll() {
     try {
-      const url = FEED + (control ? `?control=${encodeURIComponent(control)}` : '');
+      const params = new URLSearchParams();
+      if (control) params.set('control', control);
+      if (receptionDate) params.set('reception_date', receptionDate);
+      const url = FEED + (params.toString() ? `?${params}` : '');
       const res = await fetch(url, {credentials: 'same-origin'});
       if (!res.ok) throw new Error(res.status);
       const data = await res.json();
       renderChips(data.per_class, data.fails_total, data.total);
+      renderRecvDates(data.reception_dates);
       renderRows(data.rows);
       document.getElementById('count').textContent =
         `${data.returned} / ${data.matched_total}`;

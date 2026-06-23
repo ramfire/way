@@ -9,7 +9,7 @@ from django.db.models import (
     Case, CharField, Count, F, FloatField, Func, IntegerField, Value, When,
 )
 from django.db.models.fields.json import KeyTextTransform
-from django.db.models.functions import Cast, Coalesce, Lower
+from django.db.models.functions import Cast, Coalesce, Lower, TruncDate
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
@@ -676,7 +676,19 @@ def business_monitoring_feed(request):
     fails_total = sum(per_class[c] for c in TRIAGE_FAILURE_CLASSES)
     total = sum(per_class.values())
 
-    qs = IdentificationPartition.objects.select_related('sub_fund', 'feed')
+    # Jours de RÉCEPTION DISTINCTS observés (peuple le dropdown). Même scope que les
+    # compteurs (toute la projection, mono-tenant GIL — pas de filtre sub_tenant en
+    # lecture). ``received_at`` est un timestamp → on agrège au jour (TIME_ZONE=UTC).
+    reception_dates = [d.isoformat() for d in (IdentificationPartition.objects
+                       .annotate(_rday=TruncDate('received_file__received_at'))
+                       .order_by('_rday')
+                       .values_list('_rday', flat=True)
+                       .distinct()) if d]
+
+    # ``select_related('received_file')`` : la colonne « Date réception » lit
+    # ``received_file.received_at`` → évite le N+1 sur la page de partitions.
+    qs = IdentificationPartition.objects.select_related(
+        'sub_fund', 'feed', 'received_file')
     control = request.GET.get('control')
     if control == 'fails':
         qs = qs.filter(control_class__in=TRIAGE_FAILURE_CLASSES)
@@ -684,6 +696,11 @@ def business_monitoring_feed(request):
         qs = qs.filter(control_class=control)
     else:
         control = None
+    # Filtre AFFICHAGE pur sur le jour de réception observé (défaut = TOUS). Ne touche
+    # PAS aux compteurs/chips (per_class reste global, cf. décision §1.6-c).
+    reception_date = request.GET.get('reception_date') or None
+    if reception_date:
+        qs = qs.filter(received_file__received_at__date=reception_date)
     matched_total = qs.count()
 
     try:
@@ -706,6 +723,9 @@ def business_monitoring_feed(request):
         'control_class': p.control_class,
         'is_known_subfund': p.is_known_subfund,
         'received_file_id': p.received_file_id,
+        # Date de réception du fichier COURANT (dernier contributeur, = source du #NNN).
+        'received_at': (p.received_file.received_at.isoformat()
+                        if p.received_file_id and p.received_file.received_at else None),
         'last_event_at': p.last_event_at.isoformat() if p.last_event_at else None,
     } for p in qs[offset:offset + limit]]
 
@@ -715,6 +735,8 @@ def business_monitoring_feed(request):
         'fails_total': fails_total,
         'total': total,
         'control_filter': control,
+        'reception_date_filter': reception_date,
+        'reception_dates': reception_dates,
         'limit': limit,
         'offset': offset,
         'matched_total': matched_total,
