@@ -1,6 +1,50 @@
+import contextvars
+import uuid
+from contextlib import contextmanager
+
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
+
+
+# --- Passe de traitement (« run ») -----------------------------------------
+# Identifiant partagé par TOUS les Event d'une même passe de pipeline (admission
+# → qualification → routing → parsing), d'une identification, ou d'une décision
+# de triage. Porté par un contextvar et appliqué AUTOMATIQUEMENT comme défaut du
+# champ ``Event.run_id`` (callable default évalué à la création de chaque Event),
+# donc AUCUN point d'émission n'a besoin de le passer explicitement.
+#
+# Pourquoi : le rollup « worst-wins » du board ne doit refléter que la **dernière
+# passe** de chaque stage. Sans ``run_id``, un contrôle qui cesse d'être émis
+# (colonne retypée, règle retirée du contrat) fige son dernier verdict À VIE dans
+# le rollup (cf. incident NAV_001 : un `column_type` échoué d'une version périmée
+# du layout maintenait `control_class=recycle` alors que le fichier décode bien).
+_run_id_var = contextvars.ContextVar('alfaway_run_id', default=None)
+
+
+def _current_run_id():
+    """Défaut du champ ``Event.run_id`` : le run courant (``None`` hors d'une passe)."""
+    return _run_id_var.get()
+
+
+@contextmanager
+def run_scope(run_id=None):
+    """Ouvre une passe : tous les ``Event`` créés dedans partagent un ``run_id``.
+
+    **Réentrant** : un scope imbriqué hérite du run englobant (la passe externe
+    prime). C'est volontaire — les stages chaînés depuis l'admission (qualif /
+    routing / parsing via les variantes ``*_no_refresh``) doivent rester dans la
+    MÊME passe que l'admission qui les orchestre.
+    """
+    existing = _run_id_var.get()
+    if existing is not None:
+        yield existing                      # déjà dans une passe → on hérite
+        return
+    token = _run_id_var.set(run_id or uuid.uuid4().hex)
+    try:
+        yield _run_id_var.get()
+    finally:
+        _run_id_var.reset(token)
 
 
 def now_ms():
@@ -411,6 +455,15 @@ class Event(models.Model):
     # qualification à venir). Nullable : tous les événements n'en portent pas.
     cause_code = models.CharField(max_length=64, null=True, blank=True)
     created_at = models.DateTimeField(default=now_ms, db_index=True)  # UTC, ms
+    # Passe de traitement (cf. ``run_scope``). Stampé automatiquement via le défaut
+    # callable ``_current_run_id`` (contextvar) : tous les Event d'une même passe le
+    # partagent. ``null`` = Event créé hors d'une passe (legacy avant backfill, ou
+    # création directe hors orchestrateur). Le rollup l'utilise pour ne retenir que
+    # la **dernière passe** de chaque stage.
+    run_id = models.CharField(
+        max_length=32, null=True, blank=True, db_index=True,
+        default=_current_run_id, editable=False,
+    )
     detail = models.JSONField(default=dict, blank=True)  # raison, version réf., etc.
 
     class Meta:
@@ -481,17 +534,19 @@ def operator_rejected_ids(file_ids):
 def current_control_rollup(file_ids):
     """Rollup « worst-wins » de l'axe contrôles, par fichier (générique).
 
-    Pour chaque fichier : on prend l'état **courant** de chacun de ses contrôles
-    (= dernier ``Event`` par couple ``(stage, control)`` — append-only/rejouable),
-    puis on retient la **classe de monitoring la plus sévère** parmi eux
-    (``MONITORING_SEVERITY``, board orienté action). Un seul signal par fichier,
-    **toutes étapes/contrôles confondus** : admission aujourd'hui, contrôles DORA
-    demain, sans câbler aucun nom de contrôle/stage.
+    Pour chaque fichier, on ne considère que la **dernière passe de chaque stage**
+    (``run_id`` du dernier ``Event`` du stage, cf. ``run_scope``) : un contrôle qui
+    a cessé d'être émis dans la passe courante (colonne retypée, règle retirée du
+    contrat) est ainsi **écarté** au lieu de figer son ancien verdict. Parmi les
+    contrôles de ces passes courantes, on retient la **classe de monitoring la plus
+    sévère** (``MONITORING_SEVERITY``, board orienté action). Un seul signal par
+    fichier, **toutes étapes confondues** : admission/qualif/routing/parsing
+    aujourd'hui, contrôles DORA demain, sans câbler aucun nom de contrôle/stage.
 
-    NB : le worst-wins porte sur **tous** les contrôles, pas sur le seul ``verdict``
-    — c'est ce qui fait **remonter** un signal comme le ``warning_action``
-    « partenaire révoqué qui émet » (plus sévère que le verdict ``reject``), au lieu
-    de l'enterrer (cf. docs/admission-monitoring-design.md §5/§7).
+    NB : le worst-wins porte sur **tous** les contrôles de la passe courante, pas
+    sur le seul ``verdict`` — c'est ce qui fait **remonter** un signal comme le
+    ``warning_action`` « partenaire révoqué qui émet » (plus sévère que le verdict
+    ``reject``), au lieu de l'enterrer (cf. docs/admission-monitoring-design.md §5/§7).
 
     Renvoie ``{file_id: {'monitoring_class', 'stage', 'control', 'result'}}`` ;
     un fichier sans aucun événement est simplement absent du mapping.
@@ -499,18 +554,24 @@ def current_control_rollup(file_ids):
     file_ids = list(file_ids)
     if not file_ids:
         return {}
-    # Derniers d'abord : la 1re ligne vue pour un (file, stage, control) est l'actuelle.
+    # Derniers d'abord : pour chaque (file, stage), le 1er event vu fixe le ``run_id``
+    # de la passe courante ; on ne garde ensuite QUE les events de cette passe (même
+    # (file, stage, run_id)). Append-only + mono-thread par fichier ⇒ les events d'une
+    # passe sont contigus dans cet ordre, jamais entrelacés avec une passe antérieure.
     events = (Event.objects
               .filter(file_id__in=file_ids)
-              .order_by('file_id', 'stage', 'control', '-created_at', '-id')
-              .values('file_id', 'stage', 'control', 'monitoring_class', 'result'))
-    current = {}   # (file, stage, control) -> event courant
-    for e in events:
-        key = (e['file_id'], e['stage'], e['control'])
-        if key not in current:
-            current[key] = e
+              .order_by('file_id', 'stage', '-created_at', '-id')
+              .values('file_id', 'stage', 'control', 'monitoring_class',
+                      'result', 'run_id'))
+    stage_run = {}   # (file, stage) -> run_id de la passe courante du stage
     worst = {}
-    for (fid, _stage, _control), e in current.items():
+    for e in events:
+        sk = (e['file_id'], e['stage'])
+        if sk not in stage_run:
+            stage_run[sk] = e['run_id']          # le plus récent du stage
+        if e['run_id'] != stage_run[sk]:
+            continue                             # event d'une passe antérieure → ignoré
+        fid = e['file_id']
         sev = MONITORING_SEVERITY.get(e['monitoring_class'], -1)
         best = worst.get(fid)
         if best is None or sev > best['_severity']:

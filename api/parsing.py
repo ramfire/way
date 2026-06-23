@@ -24,7 +24,7 @@ from datetime import datetime
 
 from django.conf import settings
 
-from .models import Event, Feed, ReceivedFile, refresh_control_class
+from .models import Event, Feed, ReceivedFile, refresh_control_class, run_scope
 from .qualification import VERDICT_QUALIFIED, latest_qualification_event
 from .s3 import get_s3_client
 
@@ -343,8 +343,12 @@ def file_parsing(file_id):
     (garde englobante). Renvoie ``parsed`` / ``recycle``, ``None`` si non parsable
     (pas qualifié) ou en cas d'erreur inattendue."""
     try:
-        verdict = parse_no_refresh(file_id)
-        refresh_control_class([file_id])
+        # Passe autonome : les Event de parsing partagent un ``run_id`` ; le rollup
+        # ne retiendra que cette passe pour le stage parsing (les contrôles d'une
+        # version antérieure du contrat — ex. ``column_type`` retiré — sont écartés).
+        with run_scope():
+            verdict = parse_no_refresh(file_id)
+            refresh_control_class([file_id])
         return verdict
     except Exception:
         logger.exception('Parsing: erreur inattendue pour file %s', file_id)

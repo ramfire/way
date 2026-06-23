@@ -23,7 +23,7 @@ from django.conf import settings
 
 from .models import (
     Channel, Event, Feed, IdentificationRule, Partner, ReceivedFile,
-    Referential, ReferentialEntry, SubFund, refresh_control_class,
+    Referential, ReferentialEntry, SubFund, refresh_control_class, run_scope,
 )
 from .s3 import get_s3_client
 
@@ -214,23 +214,26 @@ def file_admission(file_id):
     verdict (``admis`` / ``recycle`` / ``quarantine``) ou ``None`` en cas d'erreur.
     """
     try:
-        verdict = _run(file_id)
-        # Chaînage qualification : seulement si admis (canal/partenaire résolus).
-        # Garde dédiée → un échec de qualification n'affecte JAMAIS le verdict
-        # d'admission qu'on renvoie. Puis, court-circuit : routing PUIS parsing (§1.5)
-        # ne tournent QUE si la qualification a passé (qualified) — ils consomment la
-        # Feed matchée (in-process). Le parsing est chaîné **en direct après le
-        # verdict routing** (il décode selon la Feed, indépendamment de la
-        # route). Le refresh unique ci-dessous couvre les quatre stages.
-        if verdict == VERDICT_ADMIS:
-            qual_verdict, feed = _run_qualification(file_id)
-            from .qualification import VERDICT_QUALIFIED
-            if qual_verdict == VERDICT_QUALIFIED:
-                _run_routing(file_id, feed)
-                _run_parsing(file_id, feed)
-        # Rematérialise le rollup worst-wins de l'axe contrôles pour ce fichier
-        # (read-model du board), tous stages confondus. Source de vérité = les Event.
-        refresh_control_class([file_id])
+        # Une seule passe (``run_id``) couvre les quatre stages chaînés : tous leurs
+        # Event partagent le run, et le rollup ne retiendra que cette passe par stage.
+        with run_scope():
+            verdict = _run(file_id)
+            # Chaînage qualification : seulement si admis (canal/partenaire résolus).
+            # Garde dédiée → un échec de qualification n'affecte JAMAIS le verdict
+            # d'admission qu'on renvoie. Puis, court-circuit : routing PUIS parsing
+            # (§1.5) ne tournent QUE si la qualification a passé (qualified) — ils
+            # consomment la Feed matchée (in-process). Le parsing est chaîné **en
+            # direct après le verdict routing** (il décode selon la Feed,
+            # indépendamment de la route). Le refresh unique couvre les quatre stages.
+            if verdict == VERDICT_ADMIS:
+                qual_verdict, feed = _run_qualification(file_id)
+                from .qualification import VERDICT_QUALIFIED
+                if qual_verdict == VERDICT_QUALIFIED:
+                    _run_routing(file_id, feed)
+                    _run_parsing(file_id, feed)
+            # Rematérialise le rollup worst-wins de l'axe contrôles pour ce fichier
+            # (read-model du board), tous stages confondus. Vérité = les Event.
+            refresh_control_class([file_id])
         return verdict
     except Exception:
         logger.exception('Admission: erreur inattendue pour file %s', file_id)
@@ -561,7 +564,16 @@ def file_identification(file_id):
     ``control_class`` en ``finally``. Ne modifie ni ``state`` ni ``file_admission``.
     Chaînée après l'admission par l'**orchestrateur** webhook
     (``SFTPWebhookView._run_admission``, §1.6-b2a) lorsque le verdict est ``push`` ;
-    aussi déclenchable à la demande via ``manage.py run_identification``."""
+    aussi déclenchable à la demande via ``manage.py run_identification``.
+
+    Passe propre (``run_scope``), distincte de celle de l'admission : ses Event
+    partagent un ``run_id`` et le rollup ne retient que la dernière identification."""
+    with run_scope():
+        _run_identification(file_id)
+
+
+def _run_identification(file_id):
+    """Cœur de l'identification (cf. ``file_identification`` pour les invariants)."""
     try:
         rf = ReceivedFile.objects.get(pk=file_id)
     except ReceivedFile.DoesNotExist:

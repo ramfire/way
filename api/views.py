@@ -23,7 +23,7 @@ from .qualification import (
 )
 from .models import (
     MONITORING_SEVERITY, OPERATOR_REJECTED, Event, Handled, ReceivedFile,
-    default_sub_tenant_id, operator_rejected_ids, refresh_control_class,
+    default_sub_tenant_id, operator_rejected_ids, refresh_control_class, run_scope,
 )
 from .s3 import PRESIGN_DEFAULT_EXPIRY, object_size, presigned_get_url
 
@@ -932,12 +932,13 @@ def reject_file(request, pk):
     if not _triage_eligible(rf):
         return JsonResponse(
             {'detail': 'fichier non remédiable (OK ou déjà tranché)'}, status=409)
-    Event.objects.create(
-        file=rf, sub_tenant_id=rf.sub_tenant_id, stage=Event.Stage.TRIAGE,
-        control='operator_decision', result=Event.Result.FAILED,
-        monitoring_class=Event.MonitoringClass.REJECT, cause_code=OPERATOR_REJECTED,
-        detail={'by': request.user.get_username()})
-    refresh_control_class([rf.pk])
+    with run_scope():
+        Event.objects.create(
+            file=rf, sub_tenant_id=rf.sub_tenant_id, stage=Event.Stage.TRIAGE,
+            control='operator_decision', result=Event.Result.FAILED,
+            monitoring_class=Event.MonitoringClass.REJECT, cause_code=OPERATOR_REJECTED,
+            detail={'by': request.user.get_username()})
+        refresh_control_class([rf.pk])
     rf.refresh_from_db()
     logger.info('Reject (triage) ReceivedFile %s (%s) par %s', pk, rf.s3_key, request.user)
     return JsonResponse({'ok': True, 'id': rf.pk, 'control_class': rf.control_class})

@@ -27,7 +27,7 @@ import logging
 import posixpath
 import re
 
-from .models import Event, Feed, ReceivedFile, refresh_control_class
+from .models import Event, Feed, ReceivedFile, refresh_control_class, run_scope
 
 logger = logging.getLogger(__name__)
 
@@ -224,8 +224,10 @@ def file_qualification(file_id):
     qualifiable (pas de canal) ou en cas d'erreur inattendue.
     """
     try:
-        verdict, _nom = qualify_no_refresh(file_id)
-        refresh_control_class([file_id])
+        # Passe autonome : les Event de qualification partagent un ``run_id``.
+        with run_scope():
+            verdict, _nom = qualify_no_refresh(file_id)
+            refresh_control_class([file_id])
         return verdict
     except Exception:
         logger.exception('Qualification: erreur inattendue pour file %s', file_id)

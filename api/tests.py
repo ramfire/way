@@ -1125,3 +1125,115 @@ class ParsingColumnContractsTests(ParsingTests):
         self.assertEqual(verdict, parsing.VERDICT_PARSED)
         self.assertEqual(parsing.latest_parsing_event(rf).control,
                          parsing.CTRL_FILE_DECODED)
+
+
+# Contrats à 2 colonnes : B en `number` échoue sur un séparateur de milliers ;
+# le passer en `string` retire le contrôle column_type (plus jamais émis).
+_CONTRACT_NUM = {
+    'format': 'csv', 'delimiter': '\t', 'encoding': 'utf-8',
+    'header': {'present': True, 'columns': ['A', 'B']},
+    'column_contracts': [
+        {'name': 'A', 'type': 'string', 'required': True, 'nullable': False},
+        {'name': 'B', 'type': 'number', 'required': True, 'nullable': False},
+    ],
+}
+_CONTRACT_STR = {
+    'format': 'csv', 'delimiter': '\t', 'encoding': 'utf-8',
+    'header': {'present': True, 'columns': ['A', 'B']},
+    'column_contracts': [
+        {'name': 'A', 'type': 'string', 'required': True, 'nullable': False},
+        {'name': 'B', 'type': 'string', 'required': True, 'nullable': False},
+    ],
+}
+
+
+class RunScopeTests(TestCase):
+    """``run_scope`` / ``run_id`` : le contextvar et son défaut callable."""
+
+    def test_outside_scope_run_id_is_none(self):
+        from .models import _current_run_id
+        self.assertIsNone(_current_run_id())
+
+    def test_scope_sets_and_resets(self):
+        from .models import _current_run_id, run_scope
+        with run_scope() as rid:
+            self.assertIsNotNone(rid)
+            self.assertEqual(_current_run_id(), rid)
+        self.assertIsNone(_current_run_id())   # reset en sortie
+
+    def test_scope_is_reentrant_inner_inherits_outer(self):
+        from .models import _current_run_id, run_scope
+        with run_scope() as outer:
+            with run_scope() as inner:
+                self.assertEqual(inner, outer)            # la passe externe prime
+                self.assertEqual(_current_run_id(), outer)
+            self.assertEqual(_current_run_id(), outer)    # toujours dans l'externe
+
+    def test_event_created_in_scope_is_stamped(self):
+        from .models import run_scope
+        rf = make_file(username='acme')
+        with run_scope() as rid:
+            ev = Event.objects.create(
+                file=rf, sub_tenant=rf.sub_tenant, stage=Event.Stage.ADMISSION,
+                control='c', result=Event.Result.PASSED,
+                monitoring_class=Event.MonitoringClass.PUSH)
+        ev.refresh_from_db()
+        self.assertEqual(ev.run_id, rid)
+
+
+class RunIdRollupTests(ParsingTests):
+    """Rollup scopé à la dernière passe (fix du « contrôle fantôme »).
+
+    Réutilise les helpers de ``ParsingTests`` (``_qualified_file`` / ``_parse``)."""
+
+    def test_admission_pass_shares_one_run_id(self):
+        # Une passe file_admission (admission→qualif→routing→parsing) = un seul run.
+        enrol('tee')
+        route = add_route('tee')
+        add_feed('tee', subfolder='', filename_regex=r'.*\.txt', route=route)
+        rf = make_file(username='tee', s3_key='/X.txt', path='tee/X.txt')
+        file_admission(rf.pk)
+        run_ids = set(Event.objects.filter(file=rf).values_list('run_id', flat=True))
+        self.assertEqual(len(run_ids), 1)
+        self.assertIsNotNone(next(iter(run_ids)))
+
+    def test_standalone_parse_starts_new_run(self):
+        # file_admission = passe A (parse passthrough inclus) ; file_parsing = passe B.
+        rf, _ = self._qualified_file()
+        admission_runs = set(Event.objects.filter(file=rf, stage='admission')
+                             .values_list('run_id', flat=True))
+        self._parse(rf, b'A\tB\tC\n1\t2\t3\n')
+        parse_runs = list(Event.objects.filter(file=rf, stage='parsing')
+                          .order_by('id').values_list('run_id', flat=True))
+        self.assertGreaterEqual(len(set(parse_runs)), 2)     # ≥2 passes de parsing
+        self.assertNotIn(parse_runs[-1], admission_runs)     # dernière ≠ passe admission
+
+    def test_stale_control_excluded_after_contract_fix(self):
+        # LE cas NAV_001 : column_type échoue (B=number sur "1,000"), puis on corrige
+        # le contrat (B=string) → le fichier décode, le fantôme column_type est écarté.
+        rf, nom = self._qualified_file(layout=_CONTRACT_NUM)
+        self._parse(rf, b'A\tB\n1\t1,000\n')                 # column_type FAILED
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
+
+        nom.layout = _CONTRACT_STR
+        nom.save()                                           # B devient string
+        verdict = self._parse(rf, b'A\tB\n1\t1,000\n')       # file_decoded PASSED
+        self.assertEqual(verdict, parsing.VERDICT_PARSED)
+        rf.refresh_from_db()
+        # Le board repasse au vert : la passe courante du parsing n'a plus de column_type.
+        self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
+        # L'échec d'origine survit dans l'audit (append-only) mais hors passe courante.
+        self.assertTrue(Event.objects.filter(
+            file=rf, control=parsing.CTRL_COLUMN_TYPE,
+            result=Event.Result.FAILED).exists())
+
+    def test_rollup_keeps_worst_control_of_latest_pass(self):
+        # Worst-wins INTRA-passe préservé : un échec column_type prime sur les autres
+        # contrôles PUSH de la même passe de parsing.
+        rf, _ = self._qualified_file(layout=_CONTRACT_NUM)
+        self._parse(rf, b'A\tB\n1\tnotnum\n')
+        roll = current_control_rollup([rf.pk])[rf.pk]
+        self.assertEqual(roll['monitoring_class'], Event.MonitoringClass.RECYCLE)
+        self.assertEqual(roll['stage'], parsing.STAGE)
+        self.assertEqual(roll['control'], parsing.CTRL_COLUMN_TYPE)
