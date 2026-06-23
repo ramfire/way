@@ -20,6 +20,7 @@ Le moteur ne *reject* jamais : tout problème (config, lecture, décodage, forme
 ``recycle`` (retraitable — on corrige le ``layout`` puis on rejoue).
 """
 import logging
+from datetime import datetime
 
 from django.conf import settings
 
@@ -34,6 +35,12 @@ STAGE = 'parsing'
 # Nom de contrôle (stable : utilisé en lecture/board).
 CTRL_FILE_DECODED = 'file_decoded'
 
+# §1.5+ — contrôles de contrat par colonne (granularité FICHIER, pas ligne-à-ligne).
+# Noms stables (board/lecture) ; chaque contrôle est un Event de stage parsing distinct.
+CTRL_COLUMN_PRESENT = 'column_present'
+CTRL_COLUMN_NOT_NULL = 'column_not_null'
+CTRL_COLUMN_TYPE = 'column_type'
+
 # Verdicts (posés dans detail['verdict']).
 VERDICT_PARSED = 'parsed'
 VERDICT_RECYCLE = 'recycle'
@@ -45,6 +52,13 @@ CAUSE_UNREADABLE = 'unreadable'                     # objet S3 illisible (transi
 CAUSE_DECODE_ERROR = 'decode_error'
 CAUSE_HEADER_MISMATCH = 'header_mismatch'
 CAUSE_MALFORMED_RECORD = 'malformed_record'
+# §1.5+ — causes des contrôles de contrat par colonne.
+CAUSE_COLUMN_MISSING = 'column_missing'        # colonne required absente du header
+CAUSE_COLUMN_NULL = 'column_not_null'          # valeur vide sur colonne nullable:false
+CAUSE_COLUMN_TYPE = 'column_type'              # valeur non conforme au type/format
+
+# Types validables par un contrat de colonne (``format`` requis si ``date``).
+CONTRACT_TYPES = ('string', 'date', 'number')
 
 # Formats délimités supportés par ce premier moteur.
 SUPPORTED_FORMATS = ('csv',)
@@ -57,22 +71,31 @@ def _max_bytes():
     return getattr(settings, 'PARSE_MAX_BYTES', DEFAULT_MAX_BYTES)
 
 
-def _emit(rf, result, monitoring_class, detail, cause_code=None):
-    """Append un ``Event`` de parsing (audit). Hérite du ``sub_tenant`` du fichier."""
+def _emit(rf, result, monitoring_class, detail, cause_code=None,
+          control=CTRL_FILE_DECODED):
+    """Append un ``Event`` de parsing (audit). Hérite du ``sub_tenant`` du fichier.
+
+    ``control`` par défaut = ``file_decoded`` (décodage structurel) ; les contrôles
+    de contrat par colonne (§1.5+) passent leur propre nom (``column_present`` …)."""
     return Event.objects.create(
-        file=rf, stage=STAGE, control=CTRL_FILE_DECODED, result=result,
+        file=rf, stage=STAGE, control=control, result=result,
         monitoring_class=monitoring_class, detail=detail,
         cause_code=cause_code, sub_tenant_id=rf.sub_tenant_id,
     )
 
 
-def _recycle(rf, cause, extra=None):
-    """Seul verdict d'échec : le moteur ne reject jamais (retraitable)."""
+def _recycle(rf, cause, extra=None, control=CTRL_FILE_DECODED):
+    """Seul verdict d'échec : le moteur ne reject jamais (retraitable).
+
+    ``control`` permet de scoper le contrôle fautif (contrat de colonne §1.5+) sans
+    changer la sémantique : recycle = corrigeable (layout côté plateforme), rejouable.
+    Le ``reject`` reste une décision humaine (triage), jamais émise par le moteur."""
     detail = {'verdict': VERDICT_RECYCLE, 'reason': cause}
     if extra:
         detail.update(extra)
-    _emit(rf, Event.Result.FAILED, Event.MonitoringClass.RECYCLE, detail, cause_code=cause)
-    logger.info('Parsing RECYCLE file=%s cause=%s', rf.pk, cause)
+    _emit(rf, Event.Result.FAILED, Event.MonitoringClass.RECYCLE, detail,
+          cause_code=cause, control=control)
+    logger.info('Parsing RECYCLE file=%s control=%s cause=%s', rf.pk, control, cause)
     return VERDICT_RECYCLE
 
 
@@ -107,6 +130,90 @@ def _fetch_bytes(rf):
     bucket = rf.bucket or settings.SCW_BUCKET_PREFIX
     obj = get_s3_client().get_object(Bucket=bucket, Key=_physical_key(rf))
     return obj['Body'].read()
+
+
+def _value_matches_type(value, type_, fmt):
+    """Conformité **de forme** d'une valeur non vide à son type déclaré (§1.5+).
+
+    ``date`` → ``datetime.strptime(value, fmt)`` (``fmt`` requis). ``number`` → cast
+    ``float``. ``string`` (et tout type non reconnu) → toujours conforme (pas de
+    contrainte de forme). On ne valide JAMAIS le sens métier (existence référentiel =
+    identification §1.6)."""
+    if type_ == 'date':
+        if not fmt:
+            return False        # contrat mal déclaré : date sans format → non conforme
+        try:
+            datetime.strptime(value, fmt)
+            return True
+        except (ValueError, TypeError):
+            return False
+    if type_ == 'number':
+        try:
+            float(value)
+            return True
+        except (ValueError, TypeError):
+            return False
+    return True
+
+
+def _check_column_contracts(rf, contracts, header_fields, data_lines, delimiter):
+    """§1.5+ : contrôle de contrat par colonne (présence / non-nullité / type).
+
+    Granularité **FICHIER** : ≥1 ligne fautive compromet le fichier (verdict global,
+    comme ``header_mismatch``), AUCUN rejet ligne-à-ligne. Court-circuit au premier
+    **type** de défaut bloquant, dans l'ordre présence → non-nullité → type. Renvoie
+    le verdict d'échec (``VERDICT_RECYCLE``) si un contrôle est FAILED, sinon ``None``
+    (tous OK → l'appelant émet ``parsed``). ``reject`` jamais émis (cf. ``_recycle``)."""
+    # 1) column_present : colonnes ``required`` absentes du header RÉEL du fichier.
+    #    Recouvre/complète header_mismatch (même si le layout ne fige pas les colonnes).
+    missing = [c.get('name') for c in contracts
+               if c.get('required') and c.get('name') not in header_fields]
+    if missing:
+        return _recycle(rf, CAUSE_COLUMN_MISSING, {'missing': missing},
+                        control=CTRL_COLUMN_PRESENT)
+
+    # Mapping nom de colonne → position, pour lire chaque valeur par son contrat.
+    index_of = {name: i for i, name in enumerate(header_fields)}
+    not_null = [c for c in contracts
+                if c.get('nullable') is False and c.get('name') in index_of]
+    typed = [c for c in contracts
+             if c.get('type') in ('date', 'number') and c.get('name') in index_of]
+    if not not_null and not typed:
+        return None     # rien à valider sur le contenu (contrats string/nullable only)
+
+    empty_counts = {}   # nom de colonne → nb de lignes à valeur vide
+    bad_type = {}       # nom de colonne → {column, type, format, bad_rows, sample}
+    for line in data_lines:
+        fields = line.split(delimiter)
+        for c in not_null:
+            idx = index_of[c['name']]
+            val = fields[idx] if idx < len(fields) else ''
+            if val is None or str(val).strip() == '':
+                empty_counts[c['name']] = empty_counts.get(c['name'], 0) + 1
+        for c in typed:
+            idx = index_of[c['name']]
+            raw = fields[idx] if idx < len(fields) else ''
+            s = '' if raw is None else str(raw).strip()
+            if s == '':
+                continue    # vide = ressort de column_not_null, pas de column_type
+            if not _value_matches_type(s, c.get('type'), c.get('format')):
+                b = bad_type.setdefault(c['name'], {
+                    'column': c['name'], 'type': c.get('type'),
+                    'format': c.get('format'), 'bad_rows': 0, 'sample': []})
+                b['bad_rows'] += 1
+                if len(b['sample']) < 5:
+                    b['sample'].append(s)
+
+    # 2) column_not_null : ≥1 valeur vide sur une colonne nullable:false → FAILED.
+    if empty_counts:
+        cols = [{'column': n, 'empty_rows': k} for n, k in empty_counts.items()]
+        return _recycle(rf, CAUSE_COLUMN_NULL, {'columns': cols},
+                        control=CTRL_COLUMN_NOT_NULL)
+    # 3) column_type : ≥1 valeur non conforme au type/format déclaré → FAILED.
+    if bad_type:
+        return _recycle(rf, CAUSE_COLUMN_TYPE, {'columns': list(bad_type.values())},
+                        control=CTRL_COLUMN_TYPE)
+    return None
 
 
 def _parse(rf, feed):
@@ -161,6 +268,7 @@ def _parse(rf, feed):
         column_count = len(header_fields)
         data_lines = lines[1:]
     else:
+        header_fields = None    # pas de header → pas de mapping nom→colonne (cf. §1.5+)
         if expected_columns:
             column_count = len(expected_columns)
         elif lines:
@@ -176,6 +284,16 @@ def _parse(rf, feed):
                 'record_index': i + 1,  # 1-based parmi les lignes de données
                 'expected_fields': column_count,
                 'found_fields': len(fields)})
+
+    # §1.5+ — contrat par colonne (présence / non-nullité / type). Rétro-compatible :
+    # absent → comportement inchangé. Le mapping par ``name`` exige un header réel ;
+    # sans header (header_fields None), on ne peut pas l'appliquer → on laisse passer.
+    contracts = layout.get('column_contracts')
+    if isinstance(contracts, list) and contracts and header_fields is not None:
+        verdict = _check_column_contracts(
+            rf, contracts, header_fields, data_lines, delimiter)
+        if verdict is not None:
+            return verdict      # un contrôle de contrat a échoué (recycle, fichier global)
 
     return _parsed(rf, {
         'format': fmt, 'column_count': column_count,

@@ -1043,3 +1043,85 @@ class ParsingTests(TestCase):
         self._parse(rf, b'A\tB\tC\n1\t2\t3\n')
         after = Event.objects.filter(file=rf, stage=parsing.STAGE).count()
         self.assertEqual(after - before, 2)
+
+
+# §1.5+ — layout enrichi d'un contrat par colonne (TSV ; A=pivot non-null, B=date).
+PARSE_LAYOUT_CONTRACTS = {
+    'format': 'csv', 'delimiter': '\t', 'encoding': 'utf-8',
+    'header': {'present': True, 'columns': ['A', 'B', 'C']},
+    'column_contracts': [
+        {'name': 'A', 'as': 'sub_fund', 'required': True,
+         'nullable': False, 'type': 'string'},
+        {'name': 'B', 'as': 'valuation_date', 'required': True,
+         'nullable': False, 'type': 'date', 'format': '%Y-%m-%d'},
+        {'name': 'C', 'as': 'share_class', 'required': False,
+         'nullable': True, 'type': 'string'},
+    ],
+}
+
+
+class ParsingColumnContractsTests(ParsingTests):
+    """§1.5+ — contrôle de contrat par colonne (présence/non-nullité/type), niveau FICHIER.
+
+    Réutilise les helpers de ``ParsingTests`` (``_qualified_file``/``_parse``). Le gate
+    vers l'identification = ``control_class == PUSH`` : un contrôle FAILED le ferme."""
+
+    def test_not_null_violation_recycles_and_gates_identification(self):
+        # A (sub_fund, nullable:false) vide sur une ligne → column_not_null FAILED.
+        rf, _ = self._qualified_file(layout=PARSE_LAYOUT_CONTRACTS)
+        verdict = self._parse(rf, b'A\tB\tC\n\t2026-06-20\tx\n1\t2026-06-20\ty\n')
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        ev = parsing.latest_parsing_event(rf)
+        self.assertEqual(ev.control, parsing.CTRL_COLUMN_NOT_NULL)
+        self.assertEqual(ev.cause_code, parsing.CAUSE_COLUMN_NULL)
+        self.assertEqual(ev.detail['columns'][0]['column'], 'A')
+        self.assertEqual(ev.detail['columns'][0]['empty_rows'], 1)
+        rf.refresh_from_db()
+        self.assertNotEqual(rf.control_class, Event.MonitoringClass.PUSH)
+
+    def test_type_violation_recycles_and_gates_identification(self):
+        # B (date %Y-%m-%d) reçue en "20260620" → column_type FAILED.
+        rf, _ = self._qualified_file(layout=PARSE_LAYOUT_CONTRACTS)
+        verdict = self._parse(rf, b'A\tB\tC\n1\t20260620\tx\n')
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        ev = parsing.latest_parsing_event(rf)
+        self.assertEqual(ev.control, parsing.CTRL_COLUMN_TYPE)
+        self.assertEqual(ev.cause_code, parsing.CAUSE_COLUMN_TYPE)
+        self.assertEqual(ev.detail['columns'][0]['column'], 'B')
+        self.assertEqual(ev.detail['columns'][0]['bad_rows'], 1)
+        self.assertIn('20260620', ev.detail['columns'][0]['sample'])
+        rf.refresh_from_db()
+        self.assertNotEqual(rf.control_class, Event.MonitoringClass.PUSH)
+
+    def test_missing_required_column_recycles(self):
+        # Contrat required sur une colonne absente du header → column_present FAILED.
+        layout = dict(PARSE_LAYOUT_CONTRACTS)
+        layout['column_contracts'] = PARSE_LAYOUT_CONTRACTS['column_contracts'] + [
+            {'name': 'Z', 'as': 'isin', 'required': True,
+             'nullable': False, 'type': 'string'}]
+        rf, _ = self._qualified_file(layout=layout)
+        verdict = self._parse(rf, b'A\tB\tC\n1\t2026-06-20\tx\n')
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        ev = parsing.latest_parsing_event(rf)
+        self.assertEqual(ev.control, parsing.CTRL_COLUMN_PRESENT)
+        self.assertEqual(ev.cause_code, parsing.CAUSE_COLUMN_MISSING)
+        self.assertEqual(ev.detail['missing'], ['Z'])
+
+    def test_conformant_file_parses_and_opens_identification_gate(self):
+        # Fichier entièrement conforme au contrat → PARSED, control_class PUSH (gate ouvert).
+        rf, _ = self._qualified_file(layout=PARSE_LAYOUT_CONTRACTS)
+        verdict = self._parse(rf, b'A\tB\tC\n1\t2026-06-20\tx\n2\t2026-06-21\t\n')
+        self.assertEqual(verdict, parsing.VERDICT_PARSED)
+        ev = parsing.latest_parsing_event(rf)
+        self.assertEqual(ev.control, parsing.CTRL_FILE_DECODED)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
+
+    def test_layout_without_contracts_unchanged(self):
+        # Rétro-compat : aucun column_contracts → comportement parsing inchangé.
+        rf, _ = self._qualified_file(layout=PARSE_LAYOUT)
+        verdict = self._parse(rf, b'A\tB\tC\n\t\t\n')  # vides : OK sans contrat
+        self.assertEqual(verdict, parsing.VERDICT_PARSED)
+        self.assertEqual(parsing.latest_parsing_event(rf).control,
+                         parsing.CTRL_FILE_DECODED)
