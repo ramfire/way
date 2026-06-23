@@ -12,7 +12,7 @@ from . import qualification as qual
 from . import parsing
 from .models import (
     Channel, Event, Handled, Feed, Partner, ReceivedFile, Route,
-    SubTenant, current_control_rollup, refresh_control_class,
+    SubFund, SubFundAlias, SubTenant, current_control_rollup, refresh_control_class,
 )
 
 
@@ -1267,3 +1267,48 @@ class IdentificationInModalTests(TestCase):
         self.assertTrue(any(
             e['monitoring_class'] == Event.MonitoringClass.WARNING_ACTION
             for e in id_events))
+
+
+class SubFundAliasTests(TestCase):
+    """§1.6-a-ter — alias code externe provider → SubFund canonique, scopé par Feed."""
+
+    def setUp(self):
+        self.t = default_tenant()
+        self.sf = SubFund.objects.create(key='PP001', sub_tenant=self.t)
+        enrol('tee')
+        self.feed_a = add_feed('tee', subfolder='a', filename_regex=r'.+', route=add_route('tee'))
+        self.feed_b = add_feed('tee', subfolder='b', filename_regex=r'.+')
+
+    def test_alias_maps_external_code_to_canonical_subfund(self):
+        a = SubFundAlias.objects.create(
+            sub_fund=self.sf, feed=self.feed_a, external_code='EXT-1',
+            sub_tenant=self.t)
+        self.assertEqual(a.sub_fund, self.sf)
+        self.assertIn('EXT-1', str(a))
+        self.assertIn('PP001', str(a))               # __str__ porte la clé canonique
+        self.assertEqual(list(self.sf.aliases.all()), [a])   # related_name='aliases'
+
+    def test_duplicate_code_in_same_feed_rejected(self):
+        from django.db import IntegrityError, transaction
+        SubFundAlias.objects.create(
+            sub_fund=self.sf, feed=self.feed_a, external_code='DUP', sub_tenant=self.t)
+        sf2 = SubFund.objects.create(key='PP002', sub_tenant=self.t)
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():               # même (tenant, feed, code) → bloqué
+                SubFundAlias.objects.create(
+                    sub_fund=sf2, feed=self.feed_a, external_code='DUP',
+                    sub_tenant=self.t)
+
+    def test_same_code_distinct_feeds_allowed(self):
+        # Le namespace est le Feed : le même code dans deux feeds = deux mappings OK.
+        SubFundAlias.objects.create(
+            sub_fund=self.sf, feed=self.feed_a, external_code='SAME', sub_tenant=self.t)
+        SubFundAlias.objects.create(
+            sub_fund=self.sf, feed=self.feed_b, external_code='SAME', sub_tenant=self.t)
+        self.assertEqual(
+            SubFundAlias.objects.filter(external_code='SAME').count(), 2)
+
+    def test_admin_changelist_loads(self):
+        admin = get_user_model().objects.create_superuser('root', 'r@x.io', 'pw')
+        self.client.force_login(admin)
+        self.assertEqual(self.client.get('/admin/api/subfundalias/').status_code, 200)

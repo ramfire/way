@@ -6,7 +6,7 @@ from .models import (
     BusinessCalendar, CalendarException, CalendarHoliday,
     Channel, Event, Handled, Feed, IdentificationProfile, IdentificationRule,
     Partner, ReceivedFile, Referential, ReferentialEntry, Route, SubFund,
-    SubTenant,
+    SubFundAlias, SubTenant,
 )
 
 # Ordre d'affichage des modèles dans l'index admin (par défaut alphabétique).
@@ -176,12 +176,28 @@ class ReferentialAdmin(admin.ModelAdmin):
     list_filter = ('absence_policy',)
 
 
+class SubFundAliasInline(admin.TabularInline):
+    """Alias provider → ce compartiment (§1.6-a-ter), édités sur la fiche SubFund."""
+    model = SubFundAlias
+    fields = ('feed', 'external_code', 'sub_tenant')
+    extra = 0
+
+
 @admin.register(SubFund)
 class SubFundAdmin(admin.ModelAdmin):
     """Référentiel pivot (§1.6-a) : onboarding manuel d'un sous-fonds."""
     list_display = ('key', 'status', 'sub_tenant')
     list_filter = ('status',)
     search_fields = ('key',)
+    inlines = [SubFundAliasInline]
+
+
+@admin.register(SubFundAlias)
+class SubFundAliasAdmin(admin.ModelAdmin):
+    """Alias code externe provider → SubFund canonique, scopé par Feed (§1.6-a-ter)."""
+    list_display = ('external_code', 'sub_fund', 'feed', 'sub_tenant')
+    list_filter = ('feed', 'sub_tenant')
+    search_fields = ('external_code', 'sub_fund__key')
 
 
 @admin.register(ReferentialEntry)

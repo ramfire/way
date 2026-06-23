@@ -760,6 +760,44 @@ class SubFund(models.Model):
         return self.key
 
 
+class SubFundAlias(models.Model):
+    """Alias d'un code externe provider vers le ``SubFund`` canonique, scopé par
+    ``Feed`` (le répertoire porte le système de codes). L'identité interne reste
+    ``SubFund.key`` (§1.6-a-ter).
+
+    Un même code externe peut désigner des compartiments différents dans deux feeds
+    distincts (namespaces séparés) ; il est unique au sein d'un ``(sub_tenant, feed)``.
+    a-ter n'apporte QUE cette table + son admin (saisie Steward) ; la résolution
+    alias→canonique au moteur, c'est §1.6-b-bis.
+    """
+
+    sub_fund = models.ForeignKey(
+        SubFund, on_delete=models.CASCADE, related_name='aliases',
+    )
+    # PROTECT : supprimer un Feed ne doit pas faire disparaître silencieusement les
+    # mappings d'alias qui en dépendent (le namespace de codes est porté par le Feed).
+    feed = models.ForeignKey(
+        'Feed', on_delete=models.PROTECT, related_name='subfund_aliases',
+    )
+    external_code = models.CharField(max_length=255, db_index=True)
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='subfund_aliases',
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['sub_tenant', 'feed', 'external_code'],
+                name='uniq_subfund_alias'),
+        ]
+        ordering = ['feed', 'external_code']
+
+    def __str__(self):
+        # Feed n'a pas de ``file_type`` (il vit sur IdentificationProfile) ; le
+        # namespace réel d'un Feed est son ``__str__`` (canal/sous-dossier).
+        return f'{self.external_code} → {self.sub_fund.key} ({self.feed})'
+
+
 class ReferentialEntry(models.Model):
     """Valeurs des référentiels subordonnés (existence seule). SubFund est un
     référentiel pivot dédié, hors de ce modèle.
