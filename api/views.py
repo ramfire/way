@@ -748,20 +748,25 @@ def monitoring_causes(request):
 
 def _admission_payload(rf):
     """Trace de contrôle d'un fichier : tous les événements de l'axe contrôles
-    (stages ``admission``, ``qualification``, ``routing`` **et** ``parsing`` — chaque
-    contrôle + le verdict de chaque stage), du plus ancien au plus récent. Forme
-    partagée par ``admission_detail`` (lecture), ``replay_admission`` et
-    ``enrol_feed`` (rejeu). Le stage ``triage`` (décision opérateur) est
-    volontairement exclu de la trace de contrôle.
+    (stages ``admission``, ``qualification``, ``routing``, ``parsing`` **et**
+    ``identification`` — chaque contrôle + le verdict de chaque stage), du plus
+    ancien au plus récent. Forme partagée par ``admission_detail`` (lecture),
+    ``replay_admission`` et ``enrol_feed`` (rejeu). Le stage ``triage`` (décision
+    opérateur) est volontairement exclu de la trace de contrôle.
+
+    Inclut ``identification`` (§1.6) : son contrôle alimente le ``control_class``
+    (worst-wins, badge du board) — l'exclure rendait le badge « inexpliqué » quand
+    seul l'identification était non-verte (modale toute verte, badge orange).
 
     Expose aussi de quoi proposer l'enrôlement d'une feed côté UI :
     ``subfolder`` (le dossier du fichier) et ``needs_feed`` (vrai si le
     fichier est admis mais que sa qualification est en ``recycle`` faute de
     feed — miroir de l'enrôlement partenaire pour l'admission)."""
+    from .admission import STAGE_IDENTIFICATION
     events = (Event.objects
               .filter(file=rf, stage__in=(
                   Event.Stage.ADMISSION, Event.Stage.QUALIFICATION,
-                  Event.Stage.ROUTING, Event.Stage.PARSING))
+                  Event.Stage.ROUTING, Event.Stage.PARSING, STAGE_IDENTIFICATION))
               .order_by('created_at', 'id'))
     last_qual = latest_qualification_event(rf)
     needs_feed = bool(

@@ -1237,3 +1237,33 @@ class RunIdRollupTests(ParsingTests):
         self.assertEqual(roll['monitoring_class'], Event.MonitoringClass.RECYCLE)
         self.assertEqual(roll['stage'], parsing.STAGE)
         self.assertEqual(roll['control'], parsing.CTRL_COLUMN_TYPE)
+
+
+class IdentificationInModalTests(TestCase):
+    """La modale (admission_detail) inclut le stage ``identification`` (§1.6).
+
+    Sinon le badge worst-wins est « inexpliqué » : un fichier dont seul le contrôle
+    d'identification est non-vert montrait une modale 100 % verte ET un badge orange
+    (cas NAV_002 : parsing push, mais feed sans profil → ``warning_action`` masqué)."""
+
+    def setUp(self):
+        self.staff = get_user_model().objects.create_user('staff_id', is_staff=True)
+
+    def test_identification_control_visible_in_payload(self):
+        from .admission import STAGE_IDENTIFICATION, file_identification
+        enrol('way')
+        add_feed('way', 'in/way', r'.+\.csv', route=add_route('way'))
+        rf = make_file(username='way', s3_key='in/way/data.csv')
+        file_admission(rf.pk)               # admis → qualifié → routé → parse (push)
+        file_identification(rf.pk)          # feed sans profil → warning_action §1.6
+        rf.refresh_from_db()
+        # Le badge est piloté par l'identification…
+        self.assertEqual(rf.control_class, Event.MonitoringClass.WARNING_ACTION)
+        # …et ce contrôle est désormais visible dans la modale (plus de badge orphelin).
+        self.client.force_login(self.staff)
+        events = self.client.get(f'/monitoring/admission/{rf.pk}/').json()['events']
+        id_events = [e for e in events if e['stage'] == STAGE_IDENTIFICATION]
+        self.assertTrue(id_events)
+        self.assertTrue(any(
+            e['monitoring_class'] == Event.MonitoringClass.WARNING_ACTION
+            for e in id_events))
