@@ -18,10 +18,8 @@ from django.views.decorators.http import require_POST
 from rest_framework.views import APIView
 from rest_framework.response import Response
 
-from .admission import STAGE as ADMISSION_STAGE
 from .qualification import (
-    CAUSE_NOMENCLATURE_NOT_FOUND, STAGE as QUALIFICATION_STAGE,
-    latest_qualification_event,
+    CAUSE_FEED_NOT_FOUND, latest_qualification_event,
 )
 from .models import (
     MONITORING_SEVERITY, OPERATOR_REJECTED, Event, Handled, ReceivedFile,
@@ -739,29 +737,33 @@ def monitoring_causes(request):
 
 
 def _admission_payload(rf):
-    """Trace de contrôle d'un fichier : tous les événements des stages ``admission``
-    **et** ``qualification`` (chaque contrôle + le verdict de chaque stage), du plus
-    ancien au plus récent. Forme partagée par ``admission_detail`` (lecture),
-    ``replay_admission`` et ``enrol_nomenclature`` (rejeu).
+    """Trace de contrôle d'un fichier : tous les événements de l'axe contrôles
+    (stages ``admission``, ``qualification``, ``routing`` **et** ``parsing`` — chaque
+    contrôle + le verdict de chaque stage), du plus ancien au plus récent. Forme
+    partagée par ``admission_detail`` (lecture), ``replay_admission`` et
+    ``enrol_feed`` (rejeu). Le stage ``triage`` (décision opérateur) est
+    volontairement exclu de la trace de contrôle.
 
-    Expose aussi de quoi proposer l'enrôlement d'une nomenclature côté UI :
-    ``subfolder`` (le dossier du fichier) et ``needs_nomenclature`` (vrai si le
+    Expose aussi de quoi proposer l'enrôlement d'une feed côté UI :
+    ``subfolder`` (le dossier du fichier) et ``needs_feed`` (vrai si le
     fichier est admis mais que sa qualification est en ``recycle`` faute de
-    nomenclature — miroir de l'enrôlement partenaire pour l'admission)."""
+    feed — miroir de l'enrôlement partenaire pour l'admission)."""
     events = (Event.objects
-              .filter(file=rf, stage__in=(ADMISSION_STAGE, QUALIFICATION_STAGE))
+              .filter(file=rf, stage__in=(
+                  Event.Stage.ADMISSION, Event.Stage.QUALIFICATION,
+                  Event.Stage.ROUTING, Event.Stage.PARSING))
               .order_by('created_at', 'id'))
     last_qual = latest_qualification_event(rf)
-    needs_nomenclature = bool(
+    needs_feed = bool(
         rf.channel_id and last_qual is not None
-        and last_qual.cause_code == CAUSE_NOMENCLATURE_NOT_FOUND)
+        and last_qual.cause_code == CAUSE_FEED_NOT_FOUND)
     return {
         'id': rf.pk,
         'filename': posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)',
         'username': rf.username,
         'state': rf.state,
         'subfolder': posixpath.dirname(rf.s3_key or rf.path or '').strip('/'),
-        'needs_nomenclature': needs_nomenclature,
+        'needs_feed': needs_feed,
         'events': [{
             'stage': e.stage,
             'control': e.control,
@@ -817,18 +819,18 @@ def replay_admission(request, pk):
 
 @require_POST
 @staff_member_required
-def enrol_nomenclature(request, pk):
-    """Action UI : **enrôler la nomenclature** d'un sous-dossier (le « recycle » de la
+def enrol_feed(request, pk):
+    """Action UI : **enrôler la feed** d'un sous-dossier (le « recycle » de la
     qualification, miroir de l'enrôlement partenaire côté admission).
 
     Déclenchée depuis la modale sur un fichier **admis** dont la qualification est en
-    ``recycle`` (``nomenclature_not_found``). Crée (ou réactive/aligne) la
-    ``Nomenclature`` du couple ``(canal, sous-dossier)`` du fichier — avec une
+    ``recycle`` (``feed_not_found``). Crée (ou réactive/aligne) la
+    ``Feed`` du couple ``(canal, sous-dossier)`` du fichier — avec une
     grammaire de nom **optionnelle** (regex ; vide = aucune contrainte) — puis
     **rejoue l'admission**, qui ré-enchaîne la qualification et rematérialise le
     rollup du board. Renvoie la trace rafraîchie (forme de ``admission_detail``).
     """
-    from .models import Nomenclature
+    from .models import Feed
     from .admission import file_admission
 
     rf = get_object_or_404(ReceivedFile, pk=pk)
@@ -847,16 +849,16 @@ def enrol_nomenclature(request, pk):
             return JsonResponse({'detail': f'regex invalide : {exc}'}, status=400)
     grammar = {'filename': filename_regex} if filename_regex else {}
 
-    # N Nomenclatures par (canal, sous-dossier) depuis §1.4 : la grammaire fait partie
+    # N Feeds par (canal, sous-dossier) depuis §1.4 : la grammaire fait partie
     # de la clé d'idempotence (une ligne par motif). La Route s'assigne séparément
     # (admin) ; un enrôlement sans route → qualifié puis recycle (route_not_configured).
-    nom, created = Nomenclature.objects.get_or_create(
+    nom, created = Feed.objects.get_or_create(
         channel_id=rf.channel_id, subfolder=subfolder, grammar=grammar,
         defaults={'sub_tenant_id': rf.sub_tenant_id, 'active': True})
     if not created and not nom.active:
         nom.active = True
         nom.save(update_fields=['active'])
-    logger.info('Enrôlement nomenclature #%s (canal=%s subfolder=%r created=%s) par %s',
+    logger.info('Enrôlement feed #%s (canal=%s subfolder=%r created=%s) par %s',
                 nom.pk, rf.channel_id, subfolder, created, request.user)
 
     verdict = file_admission(rf.pk)   # ré-enchaîne admission + qualification
@@ -866,7 +868,7 @@ def enrol_nomenclature(request, pk):
     payload = _admission_payload(rf)
     payload['ok'] = True
     payload['verdict'] = verdict
-    payload['nomenclature_created'] = created
+    payload['feed_created'] = created
     return JsonResponse(payload)
 
 

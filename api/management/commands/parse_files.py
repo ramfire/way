@@ -23,6 +23,12 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument(
+            '--file', type=int, action='append', dest='files', metavar='ID',
+            help='Déclenche le parser directement sur ce(s) fichier(s) par id '
+                 '(répétable ; pour les tests), sans passer par la sélection ni '
+                 'le filtre « déjà parsé ». file_parsing garde la cohérence '
+                 '(None si le fichier n\'est pas qualifié).')
+        parser.add_argument(
             '--force', action='store_true',
             help='Reparse aussi les fichiers déjà parsés (ex. après edit du layout).')
         parser.add_argument(
@@ -33,6 +39,13 @@ class Command(BaseCommand):
         force = opts['force']
         dry = opts['dry_run']
 
+        # Déclenchement direct (tests) : on parse les ids donnés tels quels, quel que
+        # soit leur état (déjà parsé ou non), sans la sélection des candidats.
+        if opts.get('files'):
+            qs = ReceivedFile.objects.filter(pk__in=opts['files'])
+            self._process(qs, dry)
+            return
+
         # .filter() puis .exclude() sur la relation `events` ⇒ deux jointures
         # distinctes : « a un event qualif qualified » ET « n'a aucun event parsing ».
         qs = (ReceivedFile.objects
@@ -42,6 +55,9 @@ class Command(BaseCommand):
         if not force:
             qs = qs.exclude(events__stage=PARSING_STAGE)
 
+        self._process(qs, dry)
+
+    def _process(self, qs, dry):
         parsed = recycled = skipped = 0
         for rf in qs.iterator():
             key = rf.path or rf.s3_key
@@ -55,7 +71,7 @@ class Command(BaseCommand):
             elif verdict == VERDICT_RECYCLE:
                 recycled += 1
             else:
-                # Plus qualifié au moment du run (re-qualif entre-temps), etc.
+                # Pas (ou plus) qualifié au moment du run → rien à parser.
                 skipped += 1
             self.stdout.write(f'  {key} -> {verdict}')
 

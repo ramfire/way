@@ -1,13 +1,13 @@
 """Étape **parsing** (§1.5) : décodage structurel d'un fichier qualifié.
 
 Quatrième producteur de l'axe contrôles. Une fois un fichier **qualifié** (une
-Nomenclature reconnaît son nom et porte sa spec de décodage ``layout``), le parsing
+Feed reconnaît son nom et porte sa spec de décodage ``layout``), le parsing
 **décode** l'objet S3 selon ce ``layout`` et valide sa **structure** — forme
 uniquement, jamais les valeurs métier :
 
   * **asynchrone** : exécuté hors du chemin webhook, par la commande ``parse_files``
     (worker/timer), car c'est le premier stage qui **lit le contenu** S3 ;
-  * **entrée** = la Nomenclature qui a qualifié le fichier (retrouvée via le dernier
+  * **entrée** = la Feed qui a qualifié le fichier (retrouvée via le dernier
     Event de qualification ``qualified``) ; son ``layout`` pilote tout le décodage ;
   * **frontières nettes** : ni complétude (``can_be_empty`` / nb attendu → §1.7), ni
     persistance des lignes décodées (→ load §1.6). Le parse se contente de rapporter
@@ -23,7 +23,7 @@ import logging
 
 from django.conf import settings
 
-from .models import Event, Nomenclature, ReceivedFile, refresh_control_class
+from .models import Event, Feed, ReceivedFile, refresh_control_class
 from .qualification import VERDICT_QUALIFIED, latest_qualification_event
 from .s3 import get_s3_client
 
@@ -39,7 +39,6 @@ VERDICT_PARSED = 'parsed'
 VERDICT_RECYCLE = 'recycle'
 
 # Causes normalisées (Event.cause_code).
-CAUSE_LAYOUT_NOT_DECLARED = 'layout_not_declared'   # layout {} : décode non configuré
 CAUSE_UNSUPPORTED_FORMAT = 'unsupported_format'
 CAUSE_TOO_LARGE = 'file_too_large'
 CAUSE_UNREADABLE = 'unreadable'                     # objet S3 illisible (transitoire)
@@ -86,6 +85,18 @@ def _parsed(rf, detail):
     return VERDICT_PARSED
 
 
+def _passthrough(rf, feed):
+    """``layout={}`` = « accepte tout » : push **sans** décodage (aucune lecture S3).
+
+    Une famille sans spec déclarée laisse passer ses fichiers (décision produit).
+    On émet un ``parsed`` marqué ``passthrough`` pour la traçabilité."""
+    _emit(rf, Event.Result.PASSED, Event.MonitoringClass.PUSH,
+          {'verdict': VERDICT_PARSED, 'passthrough': True,
+           'feed_id': feed.pk})
+    logger.info('Parsing PASSTHROUGH file=%s (layout non déclaré)', rf.pk)
+    return VERDICT_PARSED
+
+
 def _physical_key(rf):
     """Clé S3 réelle (idem presign/reconcile) : chemin physique, repli ``s3_key``."""
     return rf.path or (rf.s3_key or '').lstrip('/')
@@ -98,17 +109,17 @@ def _fetch_bytes(rf):
     return obj['Body'].read()
 
 
-def _parse(rf, nomenclature):
+def _parse(rf, feed):
     """Cœur du parsing (peut lever ; encapsulé par ``file_parsing``).
 
-    Décode l'objet selon ``nomenclature.layout`` et valide la **forme** : en-tête
+    Décode l'objet selon ``feed.layout`` et valide la **forme** : en-tête
     (présence + colonnes) puis nombre de champs par ligne de données. Émet un Event
     frais et renvoie le verdict. Aucune valeur métier inspectée."""
-    layout = nomenclature.layout if isinstance(nomenclature.layout, dict) else {}
+    layout = feed.layout if isinstance(feed.layout, dict) else {}
     if not layout:
-        # Layout pas encore déclaré → recycle (config gap), cf. §1.5.
-        return _recycle(rf, CAUSE_LAYOUT_NOT_DECLARED,
-                        {'nomenclature_id': nomenclature.pk})
+        # `{}` = « accepte tout » : aucune spec déclarée → passthrough (push), sans
+        # décodage ni lecture S3 (décision produit : layout non déclaré ⇒ on laisse passer).
+        return _passthrough(rf, feed)
 
     fmt = layout.get('format')
     if fmt not in SUPPORTED_FORMATS:
@@ -168,29 +179,40 @@ def _parse(rf, nomenclature):
 
     return _parsed(rf, {
         'format': fmt, 'column_count': column_count,
-        'record_count': len(data_lines), 'nomenclature_id': nomenclature.pk,
+        'record_count': len(data_lines), 'feed_id': feed.pk,
     })
 
 
-def _resolve_nomenclature(rf):
-    """Nomenclature courante du fichier, ou ``None`` si pas actuellement ``qualified``.
+def _resolve_feed(rf):
+    """Feed courante du fichier, ou ``None`` si pas actuellement ``qualified``.
 
     Source = dernier Event de qualification : on ne parse que si le verdict courant
     est ``qualified`` (sinon aucun contrat de décodage n'est applicable)."""
     ev = latest_qualification_event(rf)
     if ev is None or ev.detail.get('verdict') != VERDICT_QUALIFIED:
         return None
-    nom_id = ev.detail.get('nomenclature_id')
-    return Nomenclature.objects.filter(pk=nom_id).first() if nom_id else None
+    nom_id = ev.detail.get('feed_id')
+    return Feed.objects.filter(pk=nom_id).first() if nom_id else None
+
+
+def parse_file_no_refresh(file_id, feed):
+    """Parse via la ``feed`` fournie in-process **sans** refresh.
+
+    Réservé au **chaînage** depuis l'admission (juste après le routing), qui fait un
+    unique ``refresh_control_class`` couvrant tous les stages. Relit la ligne pour une
+    lecture fraîche. Peut lever (la garde non bloquante est dans l'admission)."""
+    rf = ReceivedFile.objects.get(pk=file_id)
+    return _parse(rf, feed)
 
 
 def parse_no_refresh(file_id):
     """Parse un fichier **sans** rematérialiser le board (peut lever).
 
-    Renvoie le verdict (``parsed`` / ``recycle``), ou ``None`` si le fichier n'est
-    pas actuellement qualifié (rien à parser)."""
+    Variante **autonome** (worker / ``--file``) : retrouve elle-même la Feed
+    via le dernier Event de qualification. Renvoie le verdict (``parsed`` /
+    ``recycle``), ou ``None`` si le fichier n'est pas actuellement qualifié."""
     rf = ReceivedFile.objects.get(pk=file_id)
-    nom = _resolve_nomenclature(rf)
+    nom = _resolve_feed(rf)
     if nom is None:
         return None
     return _parse(rf, nom)

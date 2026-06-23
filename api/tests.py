@@ -11,7 +11,7 @@ from .admission import (
 from . import qualification as qual
 from . import parsing
 from .models import (
-    Channel, Event, Handled, Nomenclature, Partner, ReceivedFile, Route,
+    Channel, Event, Handled, Feed, Partner, ReceivedFile, Route,
     SubTenant, current_control_rollup, refresh_control_class,
 )
 
@@ -49,8 +49,8 @@ def enrol(username, status=Partner.Status.ACTIVE, sub_tenant=None):
 def add_route(username, code=None, active=True):
     """Déclare une Route (descripteur transverse, non scopé locataire).
 
-    Réutilisable : on l'accroche ensuite à une (ou plusieurs) Nomenclature via
-    ``add_nomenclature(..., route=...)``. ``code`` dérivé de ``username`` par défaut
+    Réutilisable : on l'accroche ensuite à une (ou plusieurs) Feed via
+    ``add_feed(..., route=...)``. ``code`` dérivé de ``username`` par défaut
     (unicité **globale** sur ``code``).
     """
     route, _ = Route.objects.get_or_create(
@@ -61,16 +61,16 @@ def add_route(username, code=None, active=True):
     return route
 
 
-def add_nomenclature(username, subfolder, filename_regex=None, route=None, priority=0):
-    """Enrôle une Nomenclature (contrat de nommage fin) pour le canal de ``username``.
+def add_feed(username, subfolder, filename_regex=None, route=None, priority=0):
+    """Enrôle une Feed (contrat de nommage fin) pour le canal de ``username``.
 
     ``filename_regex=None`` ⇒ grammaire vide (attrape-tout). ``route`` (optionnel) =
     la Route portée par ce contrat : un fichier qualifié n'atteint ``push`` que si
-    sa Nomenclature porte une Route active (§1.4).
+    sa Feed porte une Route active (§1.4).
     """
     ch = Channel.objects.get(kind=Channel.Kind.SFTP, identifier=username)
     grammar = {'filename': filename_regex} if filename_regex is not None else {}
-    return Nomenclature.objects.create(
+    return Feed.objects.create(
         channel=ch, sub_tenant=ch.sub_tenant, subfolder=subfolder,
         grammar=grammar, route=route, priority=priority)
 
@@ -211,7 +211,7 @@ class ControlRollupTests(TestCase):
 
     def test_admis_rolls_up_to_push(self):
         enrol('acme')
-        add_nomenclature('acme', 'in/acme', r'.+', route=add_route('acme'))  # qualifié + routé → push
+        add_feed('acme', 'in/acme', r'.+', route=add_route('acme'))  # qualifié + routé → push
         rf = make_file(username='acme')
         file_admission(rf.pk)
 
@@ -238,7 +238,7 @@ class ControlRollupTests(TestCase):
         rf = make_file(username='newcomer')         # subfolder par défaut 'in/acme'
         file_admission(rf.pk)                       # recycle
         enrol('newcomer')
-        add_nomenclature('newcomer', 'in/acme', r'.+', route=add_route('newcomer'))  # admis + qualifié + routé → push
+        add_feed('newcomer', 'in/acme', r'.+', route=add_route('newcomer'))  # admis + qualifié + routé → push
         file_admission(rf.pk)                       # admis
 
         roll = current_control_rollup([rf.pk])[rf.pk]
@@ -255,7 +255,7 @@ class ControlRollupTests(TestCase):
     def test_refresh_handles_bulk_and_null(self):
         rf_none = make_file(s3_key='in/x/none.csv')        # aucun contrôle → NULL
         enrol('acme')
-        add_nomenclature('acme', 'in/acme', r'.+', route=add_route('acme'))  # admis + qualifié + routé → push
+        add_feed('acme', 'in/acme', r'.+', route=add_route('acme'))  # admis + qualifié + routé → push
         rf_admis = make_file(username='acme', s3_key='in/acme/a.csv')
         file_admission(rf_admis.pk)
 
@@ -301,9 +301,9 @@ class HandledTests(TestCase):
 
     def setUp(self):
         enrol('old', status=Partner.Status.REVOKED)
-        # Nomenclature permissive PORTANT une route : une fois le partenaire ré-activé,
+        # Feed permissive PORTANT une route : une fois le partenaire ré-activé,
         # le « Handle » peut atteindre push (admis + qualifié + routé, §1.4).
-        add_nomenclature('old', 'in/old', r'.+', route=add_route('old'))
+        add_feed('old', 'in/old', r'.+', route=add_route('old'))
         self.files = [make_file(username='old', s3_key=f'in/old/{i}.csv') for i in range(3)]
         for f in self.files:
             file_admission(f.pk)
@@ -374,9 +374,9 @@ class HandledTests(TestCase):
         file_admission(rf.pk)
         rf.refresh_from_db()
         self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
-        # On enrôle le partenaire (+ nomenclature : qualifie aussi), puis on traite.
+        # On enrôle le partenaire (+ feed : qualifie aussi), puis on traite.
         enrol('newcomer')
-        add_nomenclature('newcomer', 'in/acme', r'.+', route=add_route('newcomer'))  # subfolder par défaut + route
+        add_feed('newcomer', 'in/acme', r'.+', route=add_route('newcomer'))  # subfolder par défaut + route
         r = self._handle(rf)
         self.assertEqual(r['control_class'], Event.MonitoringClass.PUSH)
         self.assertTrue(r['handled'])
@@ -406,7 +406,7 @@ class ReplayAdmissionEndpointTests(TestCase):
         rf = make_file(username='newcomer')         # subfolder par défaut 'in/acme'
         self.assertEqual(file_admission(rf.pk), VERDICT_RECYCLE)
         enrol('newcomer')
-        add_nomenclature('newcomer', 'in/acme', r'.+', route=add_route('newcomer'))  # admis + qualifié + routé → push
+        add_feed('newcomer', 'in/acme', r'.+', route=add_route('newcomer'))  # admis + qualifié + routé → push
 
         self.client.force_login(self.staff)
         r = self.client.post(f'/monitoring/admission/{rf.pk}/replay/')
@@ -449,18 +449,18 @@ class QualificationTests(TestCase):
         rf.refresh_from_db()
         return rf
 
-    def test_no_nomenclature_recycles(self):
-        # Admis mais aucune Nomenclature pour (canal, sous-dossier) → recycle.
+    def test_no_feed_recycles(self):
+        # Admis mais aucune Feed pour (canal, sous-dossier) → recycle.
         rf = self._admit(s3_key='in/way/x.csv')   # subfolder 'in/way', non enrôlé
         ev = qual.latest_qualification_event(rf)
         self.assertEqual(ev.detail['verdict'], qual.VERDICT_RECYCLE)
-        self.assertEqual(ev.cause_code, qual.CAUSE_NOMENCLATURE_NOT_FOUND)
+        self.assertEqual(ev.cause_code, qual.CAUSE_FEED_NOT_FOUND)
         # worst-wins : recycle (30) prime sur les push de l'admission.
         self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
 
     def test_matching_filename_qualifies(self):
         enrol('way')
-        add_nomenclature('way', 'in/way', r'.+\.csv', route=add_route('way'))
+        add_feed('way', 'in/way', r'.+\.csv', route=add_route('way'))
         rf = self._admit(s3_key='in/way/data.csv')
         ev = qual.latest_qualification_event(rf)
         self.assertEqual(ev.detail['verdict'], qual.VERDICT_QUALIFIED)
@@ -468,44 +468,44 @@ class QualificationTests(TestCase):
         self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
 
     def test_unmatched_filename_recycles_not_rejects(self):
-        # Sous-dossier enrôlé mais le nom ne matche AUCUNE Nomenclature → recycle
+        # Sous-dossier enrôlé mais le nom ne matche AUCUNE Feed → recycle
         # (le moteur ne reject jamais : un humain tranche). PAS reject.
         enrol('way')
-        add_nomenclature('way', 'in/way', r'\d+\.csv')   # n'accepte que des chiffres
+        add_feed('way', 'in/way', r'\d+\.csv')   # n'accepte que des chiffres
         rf = self._admit(s3_key='in/way/abc.csv')
         ev = qual.latest_qualification_event(rf)
         self.assertEqual(ev.detail['verdict'], qual.VERDICT_RECYCLE)
-        self.assertEqual(ev.cause_code, qual.CAUSE_NOMENCLATURE_NO_MATCH)
+        self.assertEqual(ev.cause_code, qual.CAUSE_FEED_NO_MATCH)
         self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
 
-    def test_selects_matching_nomenclature_among_several(self):
-        # N Nomenclatures au même sous-dossier : la qualif retient celle qui matche.
+    def test_selects_matching_feed_among_several(self):
+        # N Feeds au même sous-dossier : la qualif retient celle qui matche.
         enrol('way')
         r_csv, r_txt = add_route('way', code='r-csv'), add_route('way', code='r-txt')
-        add_nomenclature('way', 'in/way', r'.+\.csv', route=r_csv)
-        add_nomenclature('way', 'in/way', r'.+\.txt', route=r_txt)
+        add_feed('way', 'in/way', r'.+\.csv', route=r_csv)
+        add_feed('way', 'in/way', r'.+\.txt', route=r_txt)
         rf = self._admit(s3_key='in/way/data.txt')
         self.assertEqual(qual.latest_qualification_event(rf).detail['verdict'],
                          qual.VERDICT_QUALIFIED)
         rf.refresh_from_db()
-        self.assertEqual(rf.route_id, r_txt.pk)        # routé via la nomenclature .txt
+        self.assertEqual(rf.route_id, r_txt.pk)        # routé via la feed .txt
 
-    def test_ambiguous_nomenclatures_recycle(self):
+    def test_ambiguous_feeds_recycle(self):
         # Deux grammaires matchent le même nom, même priorité → anomalie → recycle.
         enrol('way')
-        add_nomenclature('way', 'in/way', r'.+', priority=0)
-        add_nomenclature('way', 'in/way', r'.+\.csv', priority=0)
+        add_feed('way', 'in/way', r'.+', priority=0)
+        add_feed('way', 'in/way', r'.+\.csv', priority=0)
         rf = self._admit(s3_key='in/way/data.csv')
         ev = qual.latest_qualification_event(rf)
         self.assertEqual(ev.detail['verdict'], qual.VERDICT_RECYCLE)
-        self.assertEqual(ev.cause_code, qual.CAUSE_AMBIGUOUS_NOMENCLATURE)
+        self.assertEqual(ev.cause_code, qual.CAUSE_AMBIGUOUS_FEED)
 
     def test_priority_breaks_overlap(self):
         # Recouvrement résolu par priority (le + haut gagne) → qualifié, pas ambigu.
         enrol('way')
         r_hi = add_route('way', code='r-hi')
-        add_nomenclature('way', 'in/way', r'.+', priority=0)
-        add_nomenclature('way', 'in/way', r'.+\.csv', priority=10, route=r_hi)
+        add_feed('way', 'in/way', r'.+', priority=0)
+        add_feed('way', 'in/way', r'.+\.csv', priority=10, route=r_hi)
         rf = self._admit(s3_key='in/way/data.csv')
         self.assertEqual(qual.latest_qualification_event(rf).detail['verdict'],
                          qual.VERDICT_QUALIFIED)
@@ -514,14 +514,14 @@ class QualificationTests(TestCase):
 
     def test_no_filename_constraint_qualifies(self):
         enrol('way')
-        add_nomenclature('way', 'in/way')   # grammaire vide → pas de contrainte
+        add_feed('way', 'in/way')   # grammaire vide → pas de contrainte
         rf = self._admit(s3_key='in/way/anything.bin')
         self.assertEqual(qual.latest_qualification_event(rf).detail['verdict'],
                          qual.VERDICT_QUALIFIED)
 
     def test_invalid_regex_recycles(self):
         enrol('way')
-        add_nomenclature('way', 'in/way', '[')   # regex invalide (config)
+        add_feed('way', 'in/way', '[')   # regex invalide (config)
         rf = self._admit(s3_key='in/way/data.csv')
         ev = qual.latest_qualification_event(rf)
         self.assertEqual(ev.detail['verdict'], qual.VERDICT_RECYCLE)
@@ -535,11 +535,11 @@ class QualificationTests(TestCase):
         self.assertFalse(
             Event.objects.filter(file=rf, stage=qual.STAGE).exists())
 
-    def test_replay_requalifies_after_nomenclature_enrolled(self):
-        # 1er passage : admis mais pas de nomenclature → recycle. On enrôle, rejeu → qualifié.
+    def test_replay_requalifies_after_feed_enrolled(self):
+        # 1er passage : admis mais pas de feed → recycle. On enrôle, rejeu → qualifié.
         rf = self._admit(s3_key='in/way/data.csv')
         self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
-        add_nomenclature('way', 'in/way', r'.+\.csv', route=add_route('way'))  # + route → push après rejeu
+        add_feed('way', 'in/way', r'.+\.csv', route=add_route('way'))  # + route → push après rejeu
         from .admission import file_admission
         file_admission(rf.pk)                     # rejeu : admission + qualification
         rf.refresh_from_db()
@@ -552,20 +552,20 @@ class QualificationTests(TestCase):
 
     def test_subfolder_is_dirname_of_s3_key(self):
         enrol('way')
-        # Nomenclature sur le BON sous-dossier (dirname) → trouvée.
-        add_nomenclature('way', 'in/way/deep', r'.+')
+        # Feed sur le BON sous-dossier (dirname) → trouvée.
+        add_feed('way', 'in/way/deep', r'.+')
         rf = self._admit(s3_key='in/way/deep/f.txt')
         self.assertEqual(qual.latest_qualification_event(rf).detail['verdict'],
                          qual.VERDICT_QUALIFIED)
 
 
-class EnrolNomenclatureEndpointTests(TestCase):
-    """Bouton « Enrôler la nomenclature » de la modale (le recycle de la qualif)."""
+class EnrolFeedEndpointTests(TestCase):
+    """Bouton « Enrôler la feed » de la modale (le recycle de la qualif)."""
 
     def setUp(self):
         self.staff = get_user_model().objects.create_user('staff', is_staff=True)
 
-    def _admit_without_nomenclature(self, s3_key='in/way/data.csv'):
+    def _admit_without_feed(self, s3_key='in/way/data.csv'):
         enrol('way')
         rf = make_file(username='way', s3_key=s3_key)
         file_admission(rf.pk)                       # admis, mais qualif → recycle
@@ -573,34 +573,34 @@ class EnrolNomenclatureEndpointTests(TestCase):
         self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
         return rf
 
-    def test_payload_flags_needs_nomenclature(self):
+    def test_payload_flags_needs_feed(self):
         # La modale (admission_detail) expose le drapeau qui révèle le formulaire.
-        rf = self._admit_without_nomenclature()
+        rf = self._admit_without_feed()
         self.client.force_login(self.staff)
         body = self.client.get(f'/monitoring/admission/{rf.pk}/').json()
-        self.assertTrue(body['needs_nomenclature'])
+        self.assertTrue(body['needs_feed'])
         self.assertEqual(body['subfolder'], 'in/way')
 
-    def test_enrol_creates_nomenclature_then_route_to_push(self):
-        # L'enrôlement crée la Nomenclature SANS route → le fichier qualifie mais
+    def test_enrol_creates_feed_then_route_to_push(self):
+        # L'enrôlement crée la Feed SANS route → le fichier qualifie mais
         # recycle (route_not_configured). On assigne ensuite la route + rejeu → push.
-        rf = self._admit_without_nomenclature()
+        rf = self._admit_without_feed()
         self.client.force_login(self.staff)
-        r = self.client.post(f'/monitoring/nomenclature/{rf.pk}/enrol/',
+        r = self.client.post(f'/monitoring/feed/{rf.pk}/enrol/',
                              {'filename_regex': r'.+\.csv'})
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertTrue(body['ok'])
-        self.assertTrue(body['nomenclature_created'])
-        self.assertFalse(body['needs_nomenclature'])   # nomenclature désormais reconnue
-        nom = Nomenclature.objects.get(channel_id=rf.channel_id, subfolder='in/way')
+        self.assertTrue(body['feed_created'])
+        self.assertFalse(body['needs_feed'])   # feed désormais reconnue
+        nom = Feed.objects.get(channel_id=rf.channel_id, subfolder='in/way')
         self.assertEqual(nom.grammar, {'filename': r'.+\.csv'})
         # Qualifié mais pas encore routé → recycle (route_not_configured).
         rf.refresh_from_db()
         self.assertEqual(qual.latest_qualification_event(rf).detail['verdict'],
                          qual.VERDICT_QUALIFIED)
         self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
-        # On accroche une route à la nomenclature + rejeu → push.
+        # On accroche une route à la feed + rejeu → push.
         nom.route = add_route('way')
         nom.save(update_fields=['route'])
         file_admission(rf.pk)
@@ -609,42 +609,42 @@ class EnrolNomenclatureEndpointTests(TestCase):
         self.assertEqual(rf.route_id, nom.route_id)
 
     def test_enrol_without_regex_means_no_constraint(self):
-        rf = self._admit_without_nomenclature(s3_key='in/way/anything.bin')
+        rf = self._admit_without_feed(s3_key='in/way/anything.bin')
         self.client.force_login(self.staff)
-        r = self.client.post(f'/monitoring/nomenclature/{rf.pk}/enrol/', {})
+        r = self.client.post(f'/monitoring/feed/{rf.pk}/enrol/', {})
         self.assertEqual(r.status_code, 200)
-        nom = Nomenclature.objects.get(channel_id=rf.channel_id, subfolder='in/way')
+        nom = Feed.objects.get(channel_id=rf.channel_id, subfolder='in/way')
         self.assertEqual(nom.grammar, {})              # grammaire vide = pas de contrainte
         self.assertEqual(r.json()['verdict'], VERDICT_ADMIS)
 
     def test_enrol_rejects_invalid_regex(self):
-        rf = self._admit_without_nomenclature()
+        rf = self._admit_without_feed()
         self.client.force_login(self.staff)
-        r = self.client.post(f'/monitoring/nomenclature/{rf.pk}/enrol/',
+        r = self.client.post(f'/monitoring/feed/{rf.pk}/enrol/',
                              {'filename_regex': '['})
         self.assertEqual(r.status_code, 400)
-        self.assertFalse(Nomenclature.objects.exists())   # rien créé sur regex invalide
+        self.assertFalse(Feed.objects.exists())   # rien créé sur regex invalide
 
     def test_enrol_409_when_channel_unresolved(self):
         # Fichier non admis (partenaire non mappé) → pas de canal → 409, rien créé.
         rf = make_file(username='ghost', s3_key='in/ghost/x.csv')
         file_admission(rf.pk)
         self.client.force_login(self.staff)
-        r = self.client.post(f'/monitoring/nomenclature/{rf.pk}/enrol/', {})
+        r = self.client.post(f'/monitoring/feed/{rf.pk}/enrol/', {})
         self.assertEqual(r.status_code, 409)
-        self.assertFalse(Nomenclature.objects.exists())
+        self.assertFalse(Feed.objects.exists())
 
     def test_enrol_requires_staff(self):
-        rf = self._admit_without_nomenclature()
-        r = self.client.post(f'/monitoring/nomenclature/{rf.pk}/enrol/', {})
+        rf = self._admit_without_feed()
+        r = self.client.post(f'/monitoring/feed/{rf.pk}/enrol/', {})
         self.assertIn(r.status_code, (302, 403))
-        self.assertFalse(Nomenclature.objects.exists())
+        self.assertFalse(Feed.objects.exists())
 
     def test_enrol_rejects_get(self):
-        rf = self._admit_without_nomenclature()
+        rf = self._admit_without_feed()
         self.client.force_login(self.staff)
         self.assertEqual(
-            self.client.get(f'/monitoring/nomenclature/{rf.pk}/enrol/').status_code, 405)
+            self.client.get(f'/monitoring/feed/{rf.pk}/enrol/').status_code, 405)
 
 
 class RemediationEndpointTests(TestCase):
@@ -686,7 +686,7 @@ class RemediationEndpointTests(TestCase):
         rf.refresh_from_db()
         self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
         enrol('newcomer')
-        add_nomenclature('newcomer', 'in/acme', r'.+', route=add_route('newcomer'))  # corrige la cause + route
+        add_feed('newcomer', 'in/acme', r'.+', route=add_route('newcomer'))  # corrige la cause + route
         r = self.client.post(f'/monitoring/files/{rf.pk}/recycle/')
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()['verdict'], VERDICT_ADMIS)
@@ -695,7 +695,7 @@ class RemediationEndpointTests(TestCase):
 
     def test_actions_refused_on_ok_file(self):
         enrol('acme')
-        add_nomenclature('acme', 'in/acme', r'.+', route=add_route('acme'))  # route → push (fichier OK)
+        add_feed('acme', 'in/acme', r'.+', route=add_route('acme'))  # route → push (fichier OK)
         rf = make_file(username='acme', s3_key='in/acme/a.csv')
         file_admission(rf.pk)
         rf.refresh_from_db()
@@ -748,7 +748,7 @@ class RemediationEndpointTests(TestCase):
         # (control_class=recycle) → état affiché « failed » + remédiable. Le seul
         # `rejected` du board vient d'une décision opérateur (cf. test ci-dessous).
         enrol('way')
-        add_nomenclature('way', 'in/way', r'\d+\.csv')   # n'accepte que des chiffres
+        add_feed('way', 'in/way', r'\d+\.csv')   # n'accepte que des chiffres
         rf = make_file(username='way', s3_key='in/way/abc.csv')
         file_admission(rf.pk)
         rf.refresh_from_db()
@@ -763,14 +763,14 @@ class RemediationEndpointTests(TestCase):
         rf = make_file(username='newcomer')
         file_admission(rf.pk)
         enrol('newcomer')
-        add_nomenclature('newcomer', 'in/acme', r'.+', route=add_route('newcomer'))  # route → push
+        add_feed('newcomer', 'in/acme', r'.+', route=add_route('newcomer'))  # route → push
         self.client.post(f'/monitoring/files/{rf.pk}/recycle/')   # → push + Handled
         row = next(x for x in self.client.get('/monitoring/feed/?control=recycled')
                    .json()['rows'] if x['id'] == rf.pk)
         self.assertEqual(row['display_state'], 'recycled')
         self.assertFalse(row['can_remediate'])
         enrol('acme')
-        add_nomenclature('acme', 'in/acme', r'.+', route=add_route('acme'))  # route → ok
+        add_feed('acme', 'in/acme', r'.+', route=add_route('acme'))  # route → ok
         ok = make_file(username='acme', s3_key='in/acme/a.csv')
         file_admission(ok.pk)
         row = next(x for x in self.client.get('/monitoring/feed/').json()['rows']
@@ -779,9 +779,9 @@ class RemediationEndpointTests(TestCase):
 
 
 class RoutingStageTests(TestCase):
-    """Stage routing (§1.4) : pose la clé de dispatch = ``nomenclature.route``.
+    """Stage routing (§1.4) : pose la clé de dispatch = ``feed.route``.
 
-    Plus de RoutePattern ni de tokens : la Nomenclature matchée par la qualif porte
+    Plus de RoutePattern ni de tokens : la Feed matchée par la qualif porte
     sa Route. Jamais sticky, never-raise, le moteur ne reject jamais.
     """
     from . import routing as rout
@@ -790,13 +790,13 @@ class RoutingStageTests(TestCase):
                route=None, s3_key='in/way/data.csv'):
         if not Partner.objects.filter(code=username).exists():
             enrol(username)
-        add_nomenclature(username, subfolder, regex, route=route)
+        add_feed(username, subfolder, regex, route=route)
         rf = make_file(username=username, s3_key=s3_key)
         file_admission(rf.pk)
         rf.refresh_from_db()
         return rf
 
-    def test_nomenclature_route_sets_route_and_pushes(self):
+    def test_feed_route_sets_route_and_pushes(self):
         route = add_route('way') if enrol('way') else None
         rf = self._admit(route=route)
         self.assertEqual(rf.route_id, route.pk)
@@ -804,12 +804,12 @@ class RoutingStageTests(TestCase):
         self.assertEqual(ev.result, Event.Result.PASSED)
         self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
         self.assertEqual(ev.detail['route_code'], route.code)
-        self.assertEqual(ev.detail['nomenclature_id'],
-                         qual.latest_qualification_event(rf).detail['nomenclature_id'])
+        self.assertEqual(ev.detail['feed_id'],
+                         qual.latest_qualification_event(rf).detail['feed_id'])
         self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
 
     def test_route_not_configured_recycles(self):
-        rf = self._admit(route=None)   # Nomenclature sans route
+        rf = self._admit(route=None)   # Feed sans route
         self.assertIsNone(rf.route_id)
         ev = self.rout.latest_routing_event(rf)
         self.assertEqual(ev.cause_code, self.rout.CAUSE_ROUTE_NOT_CONFIGURED)
@@ -838,11 +838,11 @@ class RoutingStageTests(TestCase):
                          self.rout.CAUSE_ROUTE_INACTIVE)
 
     def test_recycle_loop_end_to_end(self):
-        # Nomenclature sans route → recycle ; on accroche la route + rejeu → push.
+        # Feed sans route → recycle ; on accroche la route + rejeu → push.
         enrol('way')
         rf = self._admit(route=None)
         self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
-        nom = Nomenclature.objects.get(channel__identifier='way', subfolder='in/way')
+        nom = Feed.objects.get(channel__identifier='way', subfolder='in/way')
         nom.route = add_route('way')
         nom.save(update_fields=['route'])
         file_admission(rf.pk)
@@ -851,7 +851,7 @@ class RoutingStageTests(TestCase):
         self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
 
     def test_routing_skipped_when_not_qualified(self):
-        # Admis mais aucune nomenclature → qualif recycle → AUCUN event routing.
+        # Admis mais aucune feed → qualif recycle → AUCUN event routing.
         enrol('way')
         rf = make_file(username='way', s3_key='in/way/data.csv')
         file_admission(rf.pk)
@@ -866,11 +866,11 @@ class RoutingStageTests(TestCase):
 
 
 class RoutingTeeScenarioTests(TestCase):
-    """Cas réel ``tee`` : root-dump multi-extensions, 3 Nomenclatures fines → 3 Routes.
+    """Cas réel ``tee`` : root-dump multi-extensions, 3 Feeds fines → 3 Routes.
 
-    Modèle final (§1.4) : une Nomenclature par forme (csv/txt/TI.dat) à la racine,
+    Modèle final (§1.4) : une Feed par forme (csv/txt/TI.dat) à la racine,
     chacune portant sa Route. Le ``.log`` (et le ``.dat`` non-TI) ne matche aucune
-    Nomenclature → recycle (le moteur ne reject jamais).
+    Feed → recycle (le moteur ne reject jamais).
     """
     from . import routing as rout
 
@@ -880,7 +880,7 @@ class RoutingTeeScenarioTests(TestCase):
     def _setup_tee(self):
         enrol('tee')
         for code, regex in self.SPECS:
-            add_nomenclature('tee', '', regex, route=add_route('tee', code=code))
+            add_feed('tee', '', regex, route=add_route('tee', code=code))
 
     def _admit(self, s3_key):
         rf = make_file(username='tee', s3_key=s3_key)
@@ -897,12 +897,12 @@ class RoutingTeeScenarioTests(TestCase):
             self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH, s3_key)
 
     def test_log_recycles_not_rejects(self):
-        # Le moteur ne reject jamais : `.log` ne matche aucune Nomenclature → recycle.
+        # Le moteur ne reject jamais : `.log` ne matche aucune Feed → recycle.
         self._setup_tee()
         rf = self._admit('/UNIFORM_3216.log')
         self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
         self.assertEqual(qual.latest_qualification_event(rf).cause_code,
-                         qual.CAUSE_NOMENCLATURE_NO_MATCH)
+                         qual.CAUSE_FEED_NO_MATCH)
         self.assertIsNone(rf.route_id)
         self.assertFalse(Event.objects.filter(file=rf, stage='routing').exists())
 
@@ -929,20 +929,25 @@ def _fake_s3(content_bytes):
 
 
 class ParsingTests(TestCase):
-    """Stage parsing (§1.5) : décodage structurel piloté par ``nomenclature.layout``."""
+    """Stage parsing (§1.5) : décodage structurel piloté par ``feed.layout``."""
 
     def _qualified_file(self, filename='NAV.txt', layout=PARSE_LAYOUT, file_size=None):
-        """Enrôle tee + une Nomenclature .txt (avec layout) et qualifie un fichier."""
+        """Enrôle tee + une Feed .txt et qualifie un fichier.
+
+        Le parsing étant chaîné dans ``file_admission``, on qualifie d'abord avec
+        ``layout={}`` (parse chaîné = passthrough, donc **pas de lecture S3**), PUIS
+        on pose le ``layout`` réel pour le test ciblé via ``file_parsing`` (S3 mocké).
+        """
         enrol('tee')
         route = add_route('tee')
-        nom = add_nomenclature('tee', subfolder='', filename_regex=r'.*\.txt', route=route)
-        nom.layout = layout
-        nom.save()
+        nom = add_feed('tee', subfolder='', filename_regex=r'.*\.txt', route=route)
         rf = make_file(username='tee', s3_key=f'/{filename}', path=f'tee/{filename}',
                        file_size=file_size)
-        file_admission(rf.pk)  # produit le verdict qualification `qualified`
+        file_admission(rf.pk)  # admis → qualifié → routé → parse passthrough (layout {})
         self.assertEqual(qual.latest_qualification_event(rf).detail['verdict'],
                          qual.VERDICT_QUALIFIED)
+        nom.layout = layout
+        nom.save()
         return rf, nom
 
     def _parse(self, rf, content):
@@ -987,12 +992,14 @@ class ParsingTests(TestCase):
         self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
                          parsing.CAUSE_HEADER_MISMATCH)
 
-    def test_layout_not_declared_recycles(self):
+    def test_layout_not_declared_passthrough(self):
+        # `{}` = accepte tout : la famille sans layout passe (push), sans décodage.
         rf, _ = self._qualified_file(layout={})
-        verdict = self._parse(rf, b'A\tB\tC\n1\t2\t3\n')
-        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
-        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
-                         parsing.CAUSE_LAYOUT_NOT_DECLARED)
+        verdict = self._parse(rf, b'anything at all')
+        self.assertEqual(verdict, parsing.VERDICT_PARSED)
+        ev = parsing.latest_parsing_event(rf)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+        self.assertTrue(ev.detail.get('passthrough'))
 
     def test_unsupported_format_recycles(self):
         rf, _ = self._qualified_file(layout={'format': 'xml'})
@@ -1031,7 +1038,8 @@ class ParsingTests(TestCase):
 
     def test_rerun_is_append_only(self):
         rf, _ = self._qualified_file()
+        before = Event.objects.filter(file=rf, stage=parsing.STAGE).count()
         self._parse(rf, b'A\tB\tC\n1\t2\t3\n')
         self._parse(rf, b'A\tB\tC\n1\t2\t3\n')
-        self.assertEqual(
-            Event.objects.filter(file=rf, stage=parsing.STAGE).count(), 2)
+        after = Event.objects.filter(file=rf, stage=parsing.STAGE).count()
+        self.assertEqual(after - before, 2)

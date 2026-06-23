@@ -3,16 +3,16 @@ from django.urls import reverse
 from django.utils.html import format_html
 
 from .models import (
-    Channel, Event, Handled, Nomenclature, Partner, ReceivedFile, Route,
+    Channel, Event, Handled, Feed, Partner, ReceivedFile, Route,
     SubTenant,
 )
 
 # Ordre d'affichage des modèles dans l'index admin (par défaut alphabétique).
 # On suit la hiérarchie du référentiel — tenant → partner → channel →
-# nomenclature → route — puis le runtime/journal (fichiers, événements, traités).
+# feed → route — puis le runtime/journal (fichiers, événements, traités).
 # But explicite : remonter « Sub tenants » tout en haut, au-dessus de « Channels ».
 _MODEL_ORDER = [
-    'SubTenant', 'Partner', 'Channel', 'Nomenclature', 'Route',
+    'SubTenant', 'Partner', 'Channel', 'Feed', 'Route',
     'ReceivedFile', 'Event', 'Handled',
 ]
 _ORDER_INDEX = {name: i for i, name in enumerate(_MODEL_ORDER)}
@@ -82,8 +82,8 @@ class ChannelAdmin(admin.ModelAdmin):
     ordering = ('kind', 'identifier')
 
 
-@admin.register(Nomenclature)
-class NomenclatureAdmin(admin.ModelAdmin):
+@admin.register(Feed)
+class FeedAdmin(admin.ModelAdmin):
     """Contrats de nommage (éditable) : grammaire + Route portée (§1.4)."""
     list_display = ('channel', 'subfolder', 'route', 'priority', 'active')
     list_filter = ('active', 'sub_tenant', 'route')
@@ -93,7 +93,7 @@ class NomenclatureAdmin(admin.ModelAdmin):
 
 @admin.register(Route)
 class RouteAdmin(admin.ModelAdmin):
-    """Descripteur de traitement réutilisable (§1.4), référencé par les Nomenclatures.
+    """Descripteur de traitement réutilisable (§1.4), référencé par les Feeds.
 
     Configurable à la main (pas d'UI IAM pour l'instant — cf. data_owner provisoire).
     Descripteur transverse (non scopé locataire).

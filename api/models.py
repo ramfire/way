@@ -17,7 +17,7 @@ def now_ms():
 class SubTenant(models.Model):
     """Locataire de premier niveau (entité cliente d'AlfaWay).
 
-    Racine de l'isolation multi-tenant : Partner, Channel, Nomenclature,
+    Racine de l'isolation multi-tenant : Partner, Channel, Feed,
     ReceivedFile, Event et Handled portent tous une FK ``sub_tenant``. ``code``
     est l'identifiant stable (court, unique) utilisé en référence ; ``name`` est
     le libellé humain. Un SubTenant par défaut (``GIL``) sert de cible de backfill
@@ -80,7 +80,7 @@ class ReceivedFile(models.Model):
         null=True, blank=True,
     )
     # Clé de dispatch posée par le stage **routing** (§1.4) : la Route portée par la
-    # Nomenclature qui a qualifié le fichier (``nomenclature.route``). Nullable par
+    # Feed qui a qualifié le fichier (``feed.route``). Nullable par
     # nature (fichier pas encore routé, ou route non configurée/inactive). ``PROTECT``
     # : une Route référencée ne peut être supprimée. **Jamais sticky** : recalculée OU
     # effacée à chaque rejeu de la chaîne (cf. ``api/routing.py``). FK ⇒ index auto.
@@ -246,23 +246,23 @@ def validate_layout(value):
                 )
 
 
-class Nomenclature(models.Model):
+class Feed(models.Model):
     """Contrat de nommage **fin** d'un (canal, sous-dossier) → porte sa Route (§1.4).
 
     Sert l'étape **qualification** : ``subfolder`` borne le périmètre, ``grammar``
     (regex de nom) **reconnaît** le fichier. Contrairement au modèle initial (1
-    Nomenclature par sous-dossier), il y a désormais **N Nomenclatures par
+    Feed par sous-dossier), il y a désormais **N Feeds par
     (canal, sous-dossier)** : une par motif précis (ex. ``POS*.csv`` vs ``TXN*.csv``).
     La qualification retient celle dont la grammaire matche le nom, ``priority``
-    départageant un éventuel recouvrement. La Nomenclature matchée porte la ``route``
+    départageant un éventuel recouvrement. La Feed matchée porte la ``route``
     (clé de dispatch posée par le routing). ``mandatory`` : différé.
     """
 
     channel = models.ForeignKey(
-        Channel, on_delete=models.CASCADE, related_name='nomenclatures',
+        Channel, on_delete=models.CASCADE, related_name='feeds',
     )
     sub_tenant = models.ForeignKey(
-        SubTenant, on_delete=models.PROTECT, related_name='nomenclatures',
+        SubTenant, on_delete=models.PROTECT, related_name='feeds',
     )
     subfolder = models.CharField(max_length=255, blank=True, default='')
     grammar = models.JSONField(default=dict, blank=True)
@@ -273,7 +273,7 @@ class Nomenclature(models.Model):
     # Route portée par ce contrat (§1.4). Nullable = pas encore configurée (→ recycle
     # au routing). PROTECT : une Route référencée ne peut être supprimée.
     route = models.ForeignKey(
-        'Route', on_delete=models.PROTECT, related_name='nomenclatures',
+        'Route', on_delete=models.PROTECT, related_name='feeds',
         null=True, blank=True, db_index=True,
     )
     # Spec de décodage de la famille (§1.5), consommée **plus tard** par le parsing.
@@ -284,11 +284,11 @@ class Nomenclature(models.Model):
     # défaut ; la vacuité doit être explicitement autorisée par famille.
     can_be_empty = models.BooleanField(default=False)
 
-    # Plus de UniqueConstraint(channel, subfolder) : N Nomenclatures par sous-dossier,
+    # Plus de UniqueConstraint(channel, subfolder) : N Feeds par sous-dossier,
     # départagées par grammaire (+ priority). L'unicité « par motif » n'est pas
     # exprimable en contrainte DB (la grammaire est un JSON regex) → gérée à l'usage.
     # La Route étant désormais transverse (pas de sub_tenant), plus de garde-fou
-    # « même locataire » : une Nomenclature peut référencer n'importe quelle Route.
+    # « même locataire » : une Feed peut référencer n'importe quelle Route.
 
     def save(self, *args, **kwargs):
         # Validation **au save** du seul ``layout`` (forme only) : un descripteur
@@ -305,12 +305,12 @@ class Nomenclature(models.Model):
 
 
 class Route(models.Model):
-    """Descripteur de traitement **réutilisable**, référencé par une Nomenclature (§1.4).
+    """Descripteur de traitement **réutilisable**, référencé par une Feed (§1.4).
 
     Une Route décrit *où va* un flux reconnu et *comment le charger* — sans embarquer
     aucune logique de parsing (déféré §1.5). Le routing se contente de poser la clé
-    (``ReceivedFile.route``) = ``nomenclature.route`` (au plus une route par
-    Nomenclature ; **n Nomenclatures → 1 Route** réutilisable). ``code`` est le slug
+    (``ReceivedFile.route``) = ``feed.route`` (au plus une route par
+    Feed ; **n Feeds → 1 Route** réutilisable). ``code`` est le slug
     stable (**unique globalement**). ``layout``/``layout_version`` décrivent la
     structure cible, ``target`` la destination déclarative, ``strategy`` le loader
     (``null`` = loader générique). ``data_type``/``business_domain``/``data_owner``
@@ -318,7 +318,7 @@ class Route(models.Model):
 
     **Non scopée locataire** : pas de ``sub_tenant`` ni de ``partner``. Une Route est
     un descripteur **réutilisable** transverse ; le rattachement à un partenaire/tenant
-    se fait via la Nomenclature qui la référence (``Nomenclature.route``).
+    se fait via la Feed qui la référence (``Feed.route``).
     """
 
     code = models.CharField(max_length=128, db_index=True)  # slug stable
