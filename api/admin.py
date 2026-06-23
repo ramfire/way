@@ -4,7 +4,8 @@ from django.utils.html import format_html
 
 from .models import (
     BusinessCalendar, CalendarException, CalendarHoliday,
-    Channel, Event, Handled, Feed, Partner, ReceivedFile, Route,
+    Channel, Event, Handled, Feed, IdentificationProfile, IdentificationRule,
+    Partner, ReceivedFile, Referential, ReferentialEntry, Route, SubFund,
     SubTenant,
 )
 
@@ -86,8 +87,12 @@ class ChannelAdmin(admin.ModelAdmin):
 @admin.register(Feed)
 class FeedAdmin(admin.ModelAdmin):
     """Contrats de nommage (éditable) : grammaire + Route portée (§1.4)."""
-    list_display = ('channel', 'subfolder', 'route', 'priority', 'active')
+    list_display = (
+        'channel', 'subfolder', 'route', 'identification_profile',
+        'priority', 'active',
+    )
     list_filter = ('active', 'sub_tenant', 'route')
+    list_select_related = ('channel', 'route', 'identification_profile')
     search_fields = ('subfolder',)
     autocomplete_fields = ('route',)
 
@@ -161,3 +166,40 @@ class CalendarHolidayAdmin(admin.ModelAdmin):
 @admin.register(CalendarException)
 class CalendarExceptionAdmin(admin.ModelAdmin):
     list_display = ('date', 'business_calendar', 'is_open', 'reason')
+
+
+@admin.register(Referential)
+class ReferentialAdmin(admin.ModelAdmin):
+    """Méta-référentiel (§1.6-a) : le Steward ajuste candidate/anomaly et ajoute
+    country/currency/… comme nouvelles lignes (liste ouverte)."""
+    list_display = ('code', 'label', 'absence_policy', 'sub_tenant')
+    list_filter = ('absence_policy',)
+
+
+@admin.register(SubFund)
+class SubFundAdmin(admin.ModelAdmin):
+    """Référentiel pivot (§1.6-a) : onboarding manuel d'un sous-fonds."""
+    list_display = ('key', 'status', 'sub_tenant')
+    list_filter = ('status',)
+    search_fields = ('key',)
+
+
+@admin.register(ReferentialEntry)
+class ReferentialEntryAdmin(admin.ModelAdmin):
+    """Valeurs des référentiels subordonnés (§1.6-a-bis) : saisie Steward."""
+    list_display = ('key', 'referential', 'status', 'sub_tenant')
+    list_filter = ('referential', 'status')
+    search_fields = ('key',)
+
+
+class IdentificationRuleInline(admin.TabularInline):
+    model = IdentificationRule
+    fields = ('field', 'referential', 'role', 'required')
+    extra = 0
+
+
+@admin.register(IdentificationProfile)
+class IdentificationProfileAdmin(admin.ModelAdmin):
+    """Descripteur d'identification (§1.6-a-bis) : règles éditables en inline."""
+    list_display = ('file_type', 'label', 'sub_tenant')
+    inlines = [IdentificationRuleInline]

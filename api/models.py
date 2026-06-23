@@ -283,6 +283,13 @@ class Feed(models.Model):
     # Contrat de complétude (§1.7), consommé **plus tard** : contenu attendu par
     # défaut ; la vacuité doit être explicitement autorisée par famille.
     can_be_empty = models.BooleanField(default=False)
+    # Descripteur d'identification (§1.6). Nullable : un feed sans profil ne casse
+    # pas ; le moteur (§1.6-b) tracera l'absence. SET_NULL : supprimer un profil
+    # n'efface pas le feed (le lien retombe à null).
+    identification_profile = models.ForeignKey(
+        'IdentificationProfile', on_delete=models.SET_NULL, related_name='feeds',
+        null=True, blank=True,
+    )
 
     # Plus de UniqueConstraint(channel, subfolder) : N Feeds par sous-dossier,
     # départagées par grammaire (+ priority). L'unicité « par motif » n'est pas
@@ -627,3 +634,155 @@ class CalendarException(models.Model):
 
     def __str__(self):
         return f'{self.date} ({self.reason})'
+
+
+class Referential(models.Model):
+    """Méta-référentiel : déclare un référentiel et sa politique d'absence (§1.6-a).
+
+    Liste **ouverte** de référentiels (``subfund``, ``share_class``, ``instrument``,
+    ``country``, ``currency``, …) ajoutables comme simples lignes, sans migration.
+    Porte uniformément l'``absence_policy`` consommée **plus tard** par le moteur
+    d'identification (§1.6-b). Aucun lien physique vers les valeurs : le pivot
+    ``SubFund`` ne référence PAS ce modèle ; le moteur résoudra sa policy via
+    ``Referential.objects.get(code='subfund')``.
+    """
+
+    class AbsencePolicy(models.TextChoices):
+        CANDIDATE = 'candidate', 'Candidate (onboarding)'
+        ANOMALY = 'anomaly', 'Anomalie (erreur)'
+
+    code = models.CharField(max_length=32, unique=True, db_index=True)
+    label = models.CharField(max_length=255)
+    absence_policy = models.CharField(
+        max_length=16, choices=AbsencePolicy.choices,
+        default=AbsencePolicy.CANDIDATE,
+        help_text=(
+            'entité absente du référentiel → candidate (onboarding, '
+            'warning_action) ou anomaly (erreur). Appliquée uniformément par le '
+            "moteur d'identification (§1.6-b)."
+        ),
+    )
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='referentials',
+    )
+
+    def __str__(self):
+        return self.code
+
+
+class SubFund(models.Model):
+    """Référentiel pivot (rôle partition de l'identification §1.6). Atome de
+    monitoring métier. absence_policy portée par Referential(code='subfund'),
+    résolue par le moteur.
+    """
+
+    class Status(models.TextChoices):
+        ACTIVE = 'active', 'Actif'
+        INACTIVE = 'inactive', 'Inactif'
+
+    key = models.CharField(max_length=255, db_index=True)
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.ACTIVE,
+    )
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='subfunds',
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['sub_tenant', 'key'], name='uniq_subfund_key_per_tenant'),
+        ]
+        ordering = ['key']
+
+    def __str__(self):
+        return self.key
+
+
+class ReferentialEntry(models.Model):
+    """Valeurs des référentiels subordonnés (existence seule). SubFund est un
+    référentiel pivot dédié, hors de ce modèle.
+    """
+
+    class Status(models.TextChoices):
+        ACTIVE = 'active', 'Actif'
+        INACTIVE = 'inactive', 'Inactif'
+
+    referential = models.ForeignKey(
+        Referential, on_delete=models.PROTECT, related_name='entries',
+    )
+    key = models.CharField(max_length=255, db_index=True)
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.ACTIVE,
+    )
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='referential_entries',
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['sub_tenant', 'referential', 'key'],
+                name='uniq_referential_entry'),
+        ]
+        ordering = ['referential', 'key']
+
+    def __str__(self):
+        return f'{self.referential}:{self.key}'
+
+
+class IdentificationProfile(models.Model):
+    """Descripteur d'identification d'un type de fichier (§1.6). Porte les règles
+    (``IdentificationRule``) qui mappent chaque champ du record vers son rôle et
+    son référentiel ; consommé **plus tard** par le moteur (§1.6-b).
+    """
+
+    file_type = models.CharField(max_length=255, db_index=True)
+    label = models.CharField(max_length=255)
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='identification_profiles',
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['sub_tenant', 'file_type'],
+                name='uniq_profile_per_filetype'),
+        ]
+
+    def __str__(self):
+        return self.file_type
+
+
+class IdentificationRule(models.Model):
+    """Règle déclarative : mappe un champ du record vers son rôle d'identification
+    et, le cas échéant, le référentiel qui le résout (§1.6).
+    """
+
+    class Role(models.TextChoices):
+        PARTITION = 'partition', 'Partition'
+        AXIS = 'axis', 'Axe'
+        SUBORDINATE = 'subordinate', 'Subordonné'
+
+    profile = models.ForeignKey(
+        IdentificationProfile, on_delete=models.CASCADE, related_name='rules',
+    )
+    field = models.CharField(max_length=255)
+    referential = models.ForeignKey(
+        Referential, on_delete=models.PROTECT, null=True, blank=True,
+        help_text=(
+            'référentiel résolu pour ce champ. Null pour un axis (ex. date) qui '
+            'ne résout aucun référentiel.'
+        ),
+    )
+    role = models.CharField(max_length=16, choices=Role.choices)
+    required = models.BooleanField(default=True)
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='identification_rules',
+    )
+
+    class Meta:
+        ordering = ['profile', 'role', 'field']
+
+    def __str__(self):
+        return f'{self.profile}:{self.field} ({self.role})'

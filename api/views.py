@@ -222,12 +222,22 @@ class SFTPWebhookView(APIView):
 
     @staticmethod
     def _run_admission(file_id):
-        """Appel d'admission garanti non bloquant (log + avale toute erreur)."""
+        """Admission + chaînage identification, garantis non bloquants (webhook 200).
+
+        Séparation des stages : le chaînage admission→identification (§1.6-b) vit
+        **ici, dans l'orchestrateur**, PAS dans ``file_admission``. L'identification
+        n'est lancée que si l'admission aboutit à un verdict **push**
+        (``control_class``) ; un recycle/reject n'identifie rien. Garde englobante :
+        ni l'admission ni l'identification ne peuvent affecter la réponse webhook."""
         try:
-            from .admission import file_admission
+            from .admission import file_admission, file_identification
             file_admission(file_id)
+            rf = ReceivedFile.objects.get(pk=file_id)
+            if rf.control_class == Event.MonitoringClass.PUSH:
+                file_identification(file_id)
         except Exception:
-            logger.exception('Admission: échec non bloquant pour file %s', file_id)
+            logger.exception(
+                'Admission/identification: échec non bloquant pour file %s', file_id)
 
     def _on_delete(self, p):
         """Fichier supprimé via SFTP : marquer les lignes ``stored`` en ``deleted``.

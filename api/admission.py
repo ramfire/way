@@ -14,11 +14,18 @@ Garanties (cf. CLAUDE.md, invariants) :
     S3) : un rejet d'admission laisse ``state = stored`` ;
   * elle **ne lève jamais** vers l'appelant (garde try/except englobante).
 """
+import csv
+import io
 import logging
+from datetime import date, datetime
 
 from django.conf import settings
 
-from .models import Channel, Event, Partner, ReceivedFile, refresh_control_class
+from .models import (
+    Channel, Event, Feed, IdentificationRule, Partner, ReceivedFile,
+    Referential, ReferentialEntry, SubFund, refresh_control_class,
+)
+from .s3 import get_s3_client
 
 logger = logging.getLogger(__name__)
 
@@ -279,4 +286,355 @@ def latest_admission_event(rf_or_id):
     """
     file_id = rf_or_id.pk if isinstance(rf_or_id, ReceivedFile) else rf_or_id
     return (Event.objects.filter(file_id=file_id, stage=STAGE)
+            .order_by('-created_at', '-id').first())
+
+
+# ===========================================================================
+# §1.6-b — Moteur d'**identification** (file_identification)
+# ===========================================================================
+# Fonction NOUVELLE et SÉPARÉE, co-localisée avec ``file_admission`` (décision
+# §1.6-b). Elle **ne modifie pas** ``file_admission`` ni ``ReceivedFile.state``.
+# Mêmes invariants que l'amont : rejouable, append-only (``Event``), **ne lève
+# JAMAIS** vers l'appelant, ``refresh_control_class`` en ``finally``.
+#
+# Le moteur consomme le descripteur ``IdentificationProfile``/``IdentificationRule``
+# (§1.6-a-bis) porté par la Feed et résout, par champ, l'EXISTENCE de l'entité
+# contre son ``Referential`` (policy ``candidate``/``anomaly``). Il n'introduit ni
+# ``blocking`` ni ``reject`` : tout écart est un signal Steward (``warning_action``).
+# **Calendar-free** : ``valuation_date`` (axis) n'est jamais confrontée à un
+# calendrier ni à une deadline — seule sa cohérence intra-record (parsabilité) est
+# vérifiée. Source des records = stub ``_extract_records`` (parsing §1.5 différé).
+
+STAGE_IDENTIFICATION = 'identification'
+
+# Noms de contrôles « globaux fichier » (non scopés partition ; board §1.6-c).
+CTRL_PROFILE_RESOLUTION = 'profile_resolution'
+CTRL_EXTRACTION = 'extraction'
+
+
+def _emit_identification(rf, control, result, mclass, detail):
+    """Append un ``Event`` de stage ``identification`` (audit, append-only).
+
+    Wrapper distinct du ``_emit`` d'admission (même module) ; réutilise les noms
+    RÉELS du modèle ``Event`` et hérite du ``sub_tenant`` du fichier (NOT NULL).
+    """
+    return Event.objects.create(
+        file=rf, stage=STAGE_IDENTIFICATION, control=(control or '')[:64],
+        result=result, monitoring_class=mclass, detail=detail or {},
+        sub_tenant_id=rf.sub_tenant_id,
+    )
+
+
+def _resolve_feed(rf):
+    """Feed résolue du fichier, ou ``None`` s'il n'est pas actuellement ``qualified``.
+
+    La ``Route`` posée sur ``rf.route_id`` est transverse (partagée par N Feeds) :
+    elle ne ramène pas une Feed unique. La Feed faisant autorité est celle que la
+    qualification a sélectionnée — on la relit via ``detail['feed_id']`` du dernier
+    Event de qualification ``qualified`` (même mécanisme que le parsing §1.5)."""
+    from .qualification import VERDICT_QUALIFIED, latest_qualification_event
+    ev = latest_qualification_event(rf)
+    if ev is None or ev.detail.get('verdict') != VERDICT_QUALIFIED:
+        return None
+    feed_id = ev.detail.get('feed_id')
+    return Feed.objects.filter(pk=feed_id).first() if feed_id else None
+
+
+def _read_s3_object(rf):
+    """Bytes de l'objet S3 via la clé **physique** ``rf.path`` (repli ``s3_key``).
+
+    Piège récurrent : la clé S3 réelle est le chemin **physique** (``path``), pas
+    ``s3_key`` (virtual_path). Réutilise le client de ``api/s3.py``. Peut lever :
+    l'appelant (``_extract_records``) avale et renvoie ``[]``."""
+    bucket = rf.bucket or settings.SCW_BUCKET_PREFIX
+    key = rf.path or (rf.s3_key or '').lstrip('/')
+    obj = get_s3_client().get_object(Bucket=bucket, Key=key)
+    return obj['Body'].read()
+
+
+def _extract_records(rf):
+    """Décode le fichier S3 en ``list[dict]`` aliasés selon ``feed.layout['columns']``.
+
+    Convention de structure portée par le JSONB ``layout`` (AUCUN nouveau modèle) :
+    chaque colonne ``{by, name|index, as}`` mappe une position/un en-tête physique
+    vers un alias **logique** (``as``). Le moteur d'identification ne lit ensuite
+    que les alias (``record['sub_fund']``), jamais le nom physique.
+
+    Cas supporté : **tabulaire délimité** (CSV). XML/fixed-width/multi-record-types
+    restent hors scope (parsing complet §1.5). Multi-lignes correct dès maintenant ;
+    le group-by partition est §1.6-b2b (la boucle moteur verra plus de records, sans
+    grouper). **Ne lève jamais** : layout absent/mal formé/colonne introuvable →
+    ``[]`` + log, jamais d'exception propagée."""
+    try:
+        feed = _resolve_feed(rf)
+        if feed is None or not feed.layout:
+            return []
+        layout = feed.layout
+        cols = layout.get('columns') or []
+        if not cols:
+            return []
+        delimiter = layout.get('delimiter', ',')
+        has_header = layout.get('has_header', True)
+        encoding = layout.get('encoding', 'utf-8')
+
+        raw_bytes = _read_s3_object(rf)
+        text = raw_bytes.decode(encoding, errors='replace')
+
+        reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+        rows = list(reader)
+        if not rows:
+            return []
+
+        header = rows[0] if has_header else None
+        data_rows = rows[1:] if has_header else rows
+
+        records = []
+        for row in data_rows:
+            rec = {}
+            for c in cols:
+                alias = c.get('as')
+                if not alias:
+                    continue
+                if c.get('by') == 'header' and header is not None:
+                    name = c.get('name')
+                    if name in header:
+                        idx = header.index(name)
+                        rec[alias] = row[idx] if idx < len(row) else None
+                    else:
+                        rec[alias] = None
+                elif c.get('by') == 'position':
+                    idx = c.get('index')
+                    rec[alias] = (row[idx] if (idx is not None and idx < len(row))
+                                  else None)
+            records.append(rec)
+        return records
+    except Exception:
+        logger.exception('_extract_records %s', getattr(rf, 'pk', '?'))
+        return []
+
+
+def _is_parsable_date(value):
+    """Cohérence intra-record d'un axis (ex. valuation_date) : date plausible ?
+
+    **Calendar-free** : on ne confronte la valeur à AUCUN calendrier/jour ouvré —
+    on vérifie seulement qu'elle est parsable comme une date (forme/plausibilité)."""
+    if value is None:
+        return False
+    if isinstance(value, (date, datetime)):
+        return True
+    s = str(value).strip()
+    if not s:
+        return False
+    for fmt in ('%Y-%m-%d', '%Y%m%d', '%d/%m/%Y', '%d-%m-%Y', '%Y/%m/%d'):
+        try:
+            datetime.strptime(s, fmt)
+            return True
+        except ValueError:
+            continue
+    try:
+        datetime.fromisoformat(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _entity_exists(referential, value, rf):
+    """EXISTENCE de la valeur dans le référentiel visé (active uniquement).
+
+    Le pivot ``subfund`` a sa table dédiée (``SubFund``, scopée locataire) ; les
+    référentiels subordonnés vivent dans ``ReferentialEntry`` (scopés par le
+    ``referential`` lui-même, déjà rattaché à un locataire)."""
+    key = str(value)
+    if referential.code == 'subfund':
+        return SubFund.objects.filter(
+            sub_tenant_id=rf.sub_tenant_id, key=key,
+            status=SubFund.Status.ACTIVE).exists()
+    return ReferentialEntry.objects.filter(
+        referential=referential, key=key,
+        status=ReferentialEntry.Status.ACTIVE).exists()
+
+
+def _ident_control(field, value, pkey):
+    """Bucket de rollup **scopé** ``(champ, sub_fund, valuation_date, valeur)``.
+
+    ``current_control_rollup`` ne retient qu'UN Event par ``(file, stage, control)``
+    (le plus récent). Un control = ``field`` seul ferait que des verdicts de
+    partitions/valeurs différentes se **masquent** (seul le dernier émis compterait
+    au worst-wins) — la classe fichier ne refléterait plus « au moins une partition
+    douteuse ». En scopant le control par la partition ET la valeur, chaque check
+    distinct est un bucket indépendant : worst-wins agrège toutes les partitions, et
+    un rejeu (même donnée → mêmes controls) supersède proprement, partition par
+    partition. Tronqué à 64 par ``_emit_identification`` (codes/ISIN/dates courts)."""
+    return f"{field}@{pkey.get('sub_fund')}|{pkey.get('valuation_date')}#{value}"
+
+
+def _resolve_existence(rf, rule, value, pkey):
+    """Résout l'EXISTENCE d'une ``value`` (partition sub_fund ou subordonné) dans son
+    référentiel, et émet un Event portant ``partition_key=pkey``.
+
+    Sémantique INCHANGÉE vs §1.6-b (existence + ``absence_policy``) ; seul change le
+    fait qu'on opère sur une valeur unique scopée à une partition."""
+    control = _ident_control(rule.field, value, pkey)
+    base = {'field': rule.field, 'role': rule.role, 'partition_key': pkey}
+
+    if value in (None, ''):
+        if rule.required:
+            _emit_identification(
+                rf, control, Event.Result.FAILED,
+                Event.MonitoringClass.WARNING_ACTION,
+                {**base, 'reason': 'missing_required_field'})
+        else:
+            _emit_identification(
+                rf, control, Event.Result.PASSED,
+                Event.MonitoringClass.WARNING_NOACTION,
+                {**base, 'reason': 'optional_absent'})
+        return
+
+    referential = rule.referential
+    if referential is None:
+        # partition/subordinate sans référentiel = trou de config (Steward).
+        _emit_identification(
+            rf, control, Event.Result.FAILED,
+            Event.MonitoringClass.WARNING_ACTION,
+            {**base, 'value': value, 'reason': 'no_referential_for_rule'})
+        return
+
+    if _entity_exists(referential, value, rf):
+        _emit_identification(
+            rf, control, Event.Result.PASSED, Event.MonitoringClass.PUSH,
+            {**base, 'value': value, 'referential': referential.code})
+        return
+
+    # Absente → la policy du référentiel distingue onboarding vs anomalie.
+    # Les deux sont warning_action ; la nuance vit dans ``reason`` (board §1.6-c).
+    if referential.absence_policy == Referential.AbsencePolicy.CANDIDATE:
+        reason = 'new_entity_candidate'
+    else:
+        reason = 'unknown_entity'
+    _emit_identification(
+        rf, control, Event.Result.FAILED, Event.MonitoringClass.WARNING_ACTION,
+        {**base, 'value': value, 'referential': referential.code, 'reason': reason})
+
+
+def _resolve_axis(rf, rule, value, pkey):
+    """Cohérence intra-record d'un axis (ex. ``valuation_date``) — **aucun**
+    référentiel, **calendar-free**. Émet un Event portant ``partition_key=pkey``.
+
+    Absence d'un axis requis traitée comme un champ manquant (sémantique §1.6-b)."""
+    control = _ident_control(rule.field, value, pkey)
+    base = {'field': rule.field, 'role': rule.role, 'partition_key': pkey}
+
+    if value in (None, ''):
+        if rule.required:
+            _emit_identification(
+                rf, control, Event.Result.FAILED,
+                Event.MonitoringClass.WARNING_ACTION,
+                {**base, 'reason': 'missing_required_field'})
+        else:
+            _emit_identification(
+                rf, control, Event.Result.PASSED,
+                Event.MonitoringClass.WARNING_NOACTION,
+                {**base, 'reason': 'optional_absent'})
+        return
+
+    if _is_parsable_date(value):
+        _emit_identification(
+            rf, control, Event.Result.PASSED, Event.MonitoringClass.PUSH,
+            {**base, 'value': value})
+    else:
+        _emit_identification(
+            rf, control, Event.Result.FAILED, Event.MonitoringClass.WARNING_ACTION,
+            {**base, 'value': value, 'reason': 'unparsable_axis'})
+
+
+def file_identification(file_id):
+    """Identifie un fichier (§1.6-b/b2b) : regroupe ses records par partition
+    ``(sub_fund, valuation_date)`` et résout chaque groupe.
+
+    Par groupe : existence du ``sub_fund`` (partition), cohérence des axis
+    (calendar-free), existence des subordonnés par **valeur distincte** (dédoublonné).
+    Chaque Event porte le ``partition_key`` de son groupe (projection §1.6-c). Un
+    fichier de N compartiments × M dates → jusqu'à N×M partitions.
+
+    **Autonome** (id seul, relit tout depuis la ligne), **rejouable**, append-only,
+    et **ne lève JAMAIS** vers l'appelant (garde englobante) ; rematérialise
+    ``control_class`` en ``finally``. Ne modifie ni ``state`` ni ``file_admission``.
+    Chaînée après l'admission par l'**orchestrateur** webhook
+    (``SFTPWebhookView._run_admission``, §1.6-b2a) lorsque le verdict est ``push`` ;
+    aussi déclenchable à la demande via ``manage.py run_identification``."""
+    try:
+        rf = ReceivedFile.objects.get(pk=file_id)
+    except ReceivedFile.DoesNotExist:
+        logger.exception('file_identification: fichier %s introuvable', file_id)
+        return
+    try:
+        feed = _resolve_feed(rf)
+        if feed is None or feed.identification_profile is None:
+            # Pas de profil applicable → rien à identifier ; on trace l'attente Steward.
+            _emit_identification(
+                rf, CTRL_PROFILE_RESOLUTION, Event.Result.FAILED,
+                Event.MonitoringClass.WARNING_ACTION,
+                {'reason': 'no_identification_profile',
+                 'feed_resolved': feed is not None,
+                 'partition_key': {'sub_fund': None, 'valuation_date': None,
+                                   'feed_id': feed.id if feed else None}})
+            return
+        profile = feed.identification_profile
+        rules = list(profile.rules.all())
+        records = _extract_records(rf)
+
+        if not records:
+            # Aucune ligne décodée (layout absent, fichier vide, lecture S3 KO) :
+            # rien à identifier — informationnel, non actionnable, mais tracé.
+            _emit_identification(
+                rf, CTRL_EXTRACTION, Event.Result.PASSED,
+                Event.MonitoringClass.WARNING_NOACTION,
+                {'reason': 'no_records',
+                 'partition_key': {'sub_fund': None, 'valuation_date': None,
+                                   'feed_id': feed.id}})
+            return
+
+        # Champs porteurs de la clé de partition (déduits des rules ; repli sur les
+        # alias conventionnels si le profil ne déclare pas explicitement le rôle).
+        part_rule = next(
+            (r for r in rules if r.role == IdentificationRule.Role.PARTITION), None)
+        axis_rules = [r for r in rules if r.role == IdentificationRule.Role.AXIS]
+        sub_rules = [r for r in rules if r.role == IdentificationRule.Role.SUBORDINATE]
+        part_field = part_rule.field if part_rule else 'sub_fund'
+        # Axe principal de partition = le 1er axis (valuation_date). Les axis
+        # supplémentaires restent de la cohérence intra-record, PAS des dimensions.
+        axis_field = axis_rules[0].field if axis_rules else 'valuation_date'
+
+        # --- GROUP BY (sub_fund, valuation_date) -------------------------------
+        groups = {}   # (sf, vd) -> list[record]
+        for rec in records:
+            sf = rec.get(part_field)
+            vd = rec.get(axis_field)
+            groups.setdefault((sf, vd), []).append(rec)
+
+        for (sf, vd), grp in groups.items():
+            # partition_key IDENTIQUE sur tous les Events du groupe (projection §1.6-c).
+            pkey = {'sub_fund': sf, 'valuation_date': vd, 'feed_id': feed.id}
+            # 1) partition : existence du sub_fund (UNE fois par groupe).
+            if part_rule:
+                _resolve_existence(rf, part_rule, sf, pkey)
+            # 2) axis : cohérence intra-record de la/les date(s) (UNE fois par groupe).
+            for ar in axis_rules:
+                _resolve_axis(rf, ar, grp[0].get(ar.field), pkey)
+            # 3) subordonnés : par VALEUR DISTINCTE dans le groupe (dédoublonnage).
+            for sr in sub_rules:
+                distinct_vals = {rec.get(sr.field) for rec in grp}
+                for val in distinct_vals:
+                    _resolve_existence(rf, sr, val, pkey)
+    except Exception:
+        logger.exception('file_identification: erreur inattendue pour file %s', file_id)
+    finally:
+        # Rollup worst-wins (read-model board), tous stages confondus. Toujours joué.
+        refresh_control_class([rf.pk])
+
+
+def latest_identification_event(rf_or_id):
+    """Dernier événement de stage ``identification`` d'un fichier (ou ``None``)."""
+    file_id = rf_or_id.pk if isinstance(rf_or_id, ReceivedFile) else rf_or_id
+    return (Event.objects.filter(file_id=file_id, stage=STAGE_IDENTIFICATION)
             .order_by('-created_at', '-id').first())
