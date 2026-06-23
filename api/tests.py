@@ -1432,6 +1432,47 @@ class IdentificationAliasResolutionTests(TestCase):
         # Board : la passe d'identification courante n'a plus de partition douteuse.
         self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
 
+    def _axis_event(self, rf):
+        return next(e for e in Event.objects.filter(file=rf, stage='identification')
+                    .order_by('-created_at', '-id')
+                    if e.detail.get('field') == 'valuation_date')
+
+    def test_axis_uses_declared_date_format(self):
+        # §1.6-c+ : format provider %d-%b-%Y (refusé par la liste fixe) validé via le
+        # column_contracts → axe push, partition entièrement verte.
+        canon = SubFund.objects.create(key='K', sub_tenant=self.t)
+        rf, feed = self._qualify('tee', self._profile())
+        SubFundAlias.objects.create(
+            sub_fund=canon, feed=feed, external_code='AL', sub_tenant=self.t)
+        feed.layout = {**feed.layout, 'column_contracts': [
+            {'as': 'valuation_date', 'name': 'VD', 'type': 'date',
+             'format': '%d-%b-%Y'}]}
+        feed.save()
+        self._identify(rf, b'SF;VD\nAL;25-Mar-2026\n')
+        self.assertEqual(self._axis_event(rf).monitoring_class,
+                         Event.MonitoringClass.PUSH)
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)   # tout vert
+
+    def test_axis_declared_format_mismatch_warns(self):
+        rf, feed = self._qualify('tee', self._profile())
+        feed.layout = {**feed.layout, 'column_contracts': [
+            {'as': 'valuation_date', 'name': 'VD', 'type': 'date',
+             'format': '%d-%b-%Y'}]}
+        feed.save()
+        self._identify(rf, b'SF;VD\nZ;2026-03-25\n')      # ISO ne matche pas %d-%b-%Y
+        ev = self._axis_event(rf)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.WARNING_ACTION)
+        self.assertEqual(ev.detail['reason'], 'unparsable_axis')
+        self.assertEqual(ev.detail['expected_format'], '%d-%b-%Y')
+
+    def test_axis_fallback_without_declared_format(self):
+        # Pas de column_contracts → repli liste fixe ; '2026-03-25' (ISO) plausible.
+        rf, _ = self._qualify('tee', self._profile())
+        self._identify(rf, b'SF;VD\nX;2026-03-25\n')
+        self.assertEqual(self._axis_event(rf).monitoring_class,
+                         Event.MonitoringClass.PUSH)
+
 
 class IdentificationPartitionProjectionTests(IdentificationAliasResolutionTests):
     """§1.6-c — projection matérialisée ``IdentificationPartition`` + board métier.

@@ -528,10 +528,26 @@ def _resolve_existence(rf, rule, value, pkey):
         {**base, 'value': value, 'referential': referential.code, 'reason': reason})
 
 
-def _resolve_axis(rf, rule, value, pkey):
+def _declared_date_format(feed, field):
+    """Format de date déclaré pour l'alias ``field`` dans le ``column_contracts`` du
+    layout (§1.5+ : ``{as, type:'date', format}``), ou ``None``.
+
+    Permet à l'axe §1.6 de valider la date avec **le même format que le parsing**
+    (déclaré une seule fois), au lieu d'une liste fixe de formats numériques/ISO."""
+    layout = feed.layout if isinstance(getattr(feed, 'layout', None), dict) else {}
+    for c in (layout.get('column_contracts') or []):
+        if c.get('as') == field and c.get('type') == 'date':
+            return c.get('format')
+    return None
+
+
+def _resolve_axis(rf, rule, value, pkey, feed):
     """Cohérence intra-record d'un axis (ex. ``valuation_date``) — **aucun**
     référentiel, **calendar-free**. Émet un Event portant ``partition_key=pkey``.
 
+    §1.6-c+ : si le ``column_contracts`` du feed déclare un ``format`` de date pour ce
+    champ (§1.5+), on valide la valeur **avec ce format** (réutilise la logique de
+    parsing) ; sinon repli sur la liste fixe ``_is_parsable_date`` (rétro-compat).
     Absence d'un axis requis traitée comme un champ manquant (sémantique §1.6-b)."""
     control = _ident_control(rule.field, value, pkey)
     base = {'field': rule.field, 'role': rule.role, 'partition_key': pkey}
@@ -549,14 +565,24 @@ def _resolve_axis(rf, rule, value, pkey):
                 {**base, 'reason': 'optional_absent'})
         return
 
-    if _is_parsable_date(value):
+    fmt = _declared_date_format(feed, rule.field)
+    if fmt:
+        from .parsing import _value_matches_type   # même validation que le parsing §1.5+
+        ok = _value_matches_type(str(value).strip(), 'date', fmt)
+    else:
+        ok = _is_parsable_date(value)
+
+    if ok:
         _emit_identification(
             rf, control, Event.Result.PASSED, Event.MonitoringClass.PUSH,
             {**base, 'value': value})
     else:
+        detail = {**base, 'value': value, 'reason': 'unparsable_axis'}
+        if fmt:
+            detail['expected_format'] = fmt
         _emit_identification(
             rf, control, Event.Result.FAILED, Event.MonitoringClass.WARNING_ACTION,
-            {**base, 'value': value, 'reason': 'unparsable_axis'})
+            detail)
 
 
 def _resolve_subfund_id(raw_value, feed, sub_tenant_id):
@@ -733,7 +759,7 @@ def _run_identification(file_id):
                                    pkey, feed)
             # 2) axis : cohérence intra-record de la/les date(s) (UNE fois par groupe).
             for ar in axis_rules:
-                _resolve_axis(rf, ar, grp[0].get(ar.field), pkey)
+                _resolve_axis(rf, ar, grp[0].get(ar.field), pkey, feed)
             # 3) subordonnés : par VALEUR DISTINCTE dans le groupe (dédoublonnage).
             #    INCHANGÉ — pas d'alias (réservé au pivot sub_fund, cf. exclusions).
             for sr in sub_rules:
