@@ -3,6 +3,7 @@ from django.urls import reverse
 from django.utils.html import format_html
 
 from .models import (
+    BusinessCalendar, CalendarException, CalendarHoliday,
     Channel, Event, Handled, Feed, Partner, ReceivedFile, Route,
     SubTenant,
 )
@@ -143,3 +144,20 @@ class HandledAdmin(admin.ModelAdmin):
 
     def has_change_permission(self, request, obj=None):
         return False
+
+
+@admin.register(BusinessCalendar)
+class BusinessCalendarAdmin(admin.ModelAdmin):
+    list_display = ('code', 'label', 'sub_tenant')
+
+
+@admin.register(CalendarHoliday)
+class CalendarHolidayAdmin(admin.ModelAdmin):
+    list_display = ('date', 'label', 'business_calendar', 'is_bank_holiday')
+    list_filter = ('business_calendar', 'is_bank_holiday')
+    date_hierarchy = 'date'
+
+
+@admin.register(CalendarException)
+class CalendarExceptionAdmin(admin.ModelAdmin):
+    list_display = ('date', 'business_calendar', 'is_open', 'reason')

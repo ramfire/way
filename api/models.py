@@ -542,3 +542,88 @@ def refresh_control_class(file_ids):
         by_class.setdefault(cls, []).append(fid)
     for cls, ids in by_class.items():
         ReceivedFile.objects.filter(pk__in=ids).update(control_class=cls)
+
+
+class BusinessCalendar(models.Model):
+    """Calendrier de jours ouvrés d'une place / convention (référentiel).
+
+    Regroupe les fériés (``holidays``) et les exceptions (``exceptions``) d'une
+    place donnée (ex. ``LU`` pour le Luxembourg / ABBL, ``TARGET2`` pour la place
+    interbancaire euro). Référentiel pur : aucun moteur de calcul de jours ouvrés
+    n'est implémenté ici. La précédence retenue (résolue **plus tard** par le futur
+    moteur, hors scope) est : exception sous-fonds > exception calendrier > férié de
+    place > week-end. Les week-ends ne sont **pas** stockés (règle déduite par le
+    moteur).
+    """
+
+    code = models.CharField(max_length=32, unique=True, db_index=True)
+    label = models.CharField(max_length=255)
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='business_calendars',
+    )
+
+    def __str__(self):
+        return self.code
+
+
+class CalendarHoliday(models.Model):
+    """Jour férié d'une place (jour entier fermé).
+
+    ``is_bank_holiday`` distingue le férié bancaire de convention collective (B,
+    True) du férié légal (P, False) — tracé pour audit, **aucune logique** dessus
+    dans ce batch. Les week-ends ne sont pas stockés ici. Une demi-journée (ex.
+    24/12 après-midi) se modélisera plus tard via ``CalendarException(is_open=...)``,
+    pas ici : 24/12 est un jour fermé entier dans ce référentiel.
+    """
+
+    business_calendar = models.ForeignKey(
+        BusinessCalendar, on_delete=models.CASCADE, related_name='holidays',
+    )
+    date = models.DateField(db_index=True)
+    label = models.CharField(max_length=255)
+    is_bank_holiday = models.BooleanField(default=False)
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='calendar_holidays',
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['business_calendar', 'date'], name='uniq_calendar_date'),
+        ]
+        ordering = ['date']
+
+    def __str__(self):
+        return f'{self.date} {self.label}'
+
+
+class CalendarException(models.Model):
+    """Exception bidirectionnelle au calendrier d'une place.
+
+    ``is_open=True`` ouvre un jour normalement fermé ; ``is_open=False`` ferme un
+    jour normalement ouvert. Précédence (résolue **plus tard** par le futur moteur,
+    hors scope) : exception sous-fonds > exception calendrier > férié de place >
+    week-end. Portée **calendrier uniquement** dans ce batch (FK
+    ``business_calendar``) ; la portée sous-fonds est différée (``SubFund`` n'existe
+    pas encore — §1.6).
+    """
+
+    business_calendar = models.ForeignKey(
+        BusinessCalendar, on_delete=models.CASCADE, related_name='exceptions',
+    )
+    date = models.DateField(db_index=True)
+    is_open = models.BooleanField()
+    reason = models.CharField(max_length=255)
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='calendar_exceptions',
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['business_calendar', 'date'],
+                name='uniq_calendar_exception_date'),
+        ]
+
+    def __str__(self):
+        return f'{self.date} ({self.reason})'
