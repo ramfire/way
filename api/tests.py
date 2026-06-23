@@ -1312,3 +1312,121 @@ class SubFundAliasTests(TestCase):
         admin = get_user_model().objects.create_superuser('root', 'r@x.io', 'pw')
         self.client.force_login(admin)
         self.assertEqual(self.client.get('/admin/api/subfundalias/').status_code, 200)
+
+
+class IdentificationAliasResolutionTests(TestCase):
+    """§1.6-b-bis — résolution alias→canonique + partition_key ancré sur le SubFund."""
+
+    def setUp(self):
+        from .models import Referential
+        self.t = default_tenant()
+        self.ref = Referential.objects.get_or_create(
+            code='subfund',
+            defaults={'label': 'SubFund', 'sub_tenant': self.t})[0]
+
+    def _profile(self, file_type='nav'):
+        from .models import IdentificationProfile, IdentificationRule
+        p = IdentificationProfile.objects.create(
+            file_type=file_type, label=file_type, sub_tenant=self.t)
+        IdentificationRule.objects.create(
+            profile=p, field='sub_fund', referential=self.ref,
+            role=IdentificationRule.Role.PARTITION, required=True, sub_tenant=self.t)
+        IdentificationRule.objects.create(
+            profile=p, field='valuation_date', referential=None,
+            role=IdentificationRule.Role.AXIS, required=True, sub_tenant=self.t)
+        return p
+
+    # Layout d'EXTRACTION §1.6 (colonnes {by,name,as}) — header SF/VD → alias logiques.
+    _COLS = [{'by': 'header', 'name': 'SF', 'as': 'sub_fund'},
+             {'by': 'header', 'name': 'VD', 'as': 'valuation_date'}]
+
+    def _qualify(self, username, profile, filename='NAV.txt'):
+        """Enrôle un canal + feed, qualifie un fichier, puis pose layout+profil."""
+        enrol(username)
+        feed = add_feed(username, subfolder='', filename_regex=r'.*\.txt',
+                        route=add_route(username))
+        rf = make_file(username=username, s3_key=f'/{filename}',
+                       path=f'{username}/{filename}')
+        file_admission(rf.pk)                       # qualifié (layout {} → passthrough)
+        feed.layout = {'delimiter': ';', 'has_header': True, 'columns': self._COLS}
+        feed.identification_profile = profile
+        feed.save()
+        return rf, feed
+
+    def _identify(self, rf, content):
+        from .admission import file_identification
+        with patch('api.admission.get_s3_client', return_value=_fake_s3(content)):
+            file_identification(rf.pk)
+
+    def _partition_event(self, rf):
+        """Dernier Event de stage identification portant la rule partition (sub_fund)."""
+        return next(
+            (e for e in Event.objects.filter(file=rf, stage='identification')
+             .order_by('-created_at', '-id')
+             if e.detail.get('field') == 'sub_fund'), None)
+
+    def test_known_alias_resolves_to_canonical(self):
+        canon = SubFund.objects.create(key='CANON1', sub_tenant=self.t)
+        rf, feed = self._qualify('tee', self._profile())
+        SubFundAlias.objects.create(
+            sub_fund=canon, feed=feed, external_code='EXTPP', sub_tenant=self.t)
+        self._identify(rf, b'SF;VD\nEXTPP;2026-03-25\n')
+        ev = self._partition_event(rf)
+        self.assertEqual(ev.result, Event.Result.PASSED)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+        self.assertEqual(ev.detail['partition_key']['sub_fund_id'], canon.id)
+        self.assertEqual(ev.detail['partition_key']['sub_fund_value'], 'EXTPP')
+
+    def test_cross_provider_collapse_same_canonical_id(self):
+        # Deux providers (feeds), deux codes externes distincts → même SubFund.
+        canon = SubFund.objects.create(key='SHARED', sub_tenant=self.t)
+        rf_a, feed_a = self._qualify('tee', self._profile('nav_a'))
+        rf_b, feed_b = self._qualify('way', self._profile('nav_b'))
+        SubFundAlias.objects.create(
+            sub_fund=canon, feed=feed_a, external_code='AAA', sub_tenant=self.t)
+        SubFundAlias.objects.create(
+            sub_fund=canon, feed=feed_b, external_code='BBB', sub_tenant=self.t)
+        self._identify(rf_a, b'SF;VD\nAAA;2026-03-25\n')
+        self._identify(rf_b, b'SF;VD\nBBB;2026-03-25\n')
+        id_a = self._partition_event(rf_a).detail['partition_key']['sub_fund_id']
+        id_b = self._partition_event(rf_b).detail['partition_key']['sub_fund_id']
+        self.assertEqual(id_a, canon.id)
+        self.assertEqual(id_b, canon.id)            # même ancrage canonique
+
+    def test_internal_key_fallback_resolves(self):
+        # Un feed livre directement SubFund.key (pas d'alias) → repli, present.
+        canon = SubFund.objects.create(key='PP001', sub_tenant=self.t)
+        rf, _ = self._qualify('tee', self._profile())
+        self._identify(rf, b'SF;VD\nPP001;2026-03-25\n')
+        ev = self._partition_event(rf)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+        self.assertEqual(ev.detail['partition_key']['sub_fund_id'], canon.id)
+
+    def test_unknown_code_is_candidate(self):
+        # Ni alias ni key → candidate (policy subfund=candidate), sub_fund_id null.
+        rf, feed = self._qualify('tee', self._profile())
+        self._identify(rf, b'SF;VD\nZZZ;2026-03-25\n')
+        ev = self._partition_event(rf)
+        self.assertEqual(ev.result, Event.Result.FAILED)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.WARNING_ACTION)
+        self.assertEqual(ev.detail['reason'], 'new_entity_candidate')
+        self.assertIsNone(ev.detail['partition_key']['sub_fund_id'])
+        self.assertEqual(ev.detail['external_code'], 'ZZZ')   # pour le Steward
+        self.assertEqual(ev.detail['feed_id'], feed.id)
+
+    def test_onboarding_then_replay_resolves(self):
+        # 1er passage : inconnu → candidate. Le Steward rattache l'alias, rejeu → present.
+        rf, feed = self._qualify('tee', self._profile())
+        self._identify(rf, b'SF;VD\nEXTNEW;2026-03-25\n')
+        self.assertEqual(self._partition_event(rf).monitoring_class,
+                         Event.MonitoringClass.WARNING_ACTION)
+        canon = SubFund.objects.create(key='CANON2', sub_tenant=self.t)
+        SubFundAlias.objects.create(
+            sub_fund=canon, feed=feed, external_code='EXTNEW', sub_tenant=self.t)
+        self._identify(rf, b'SF;VD\nEXTNEW;2026-03-25\n')   # rejeu (nouveau run)
+        ev = self._partition_event(rf)                       # le plus récent
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+        self.assertEqual(ev.detail['partition_key']['sub_fund_id'], canon.id)
+        rf.refresh_from_db()
+        # Board : la passe d'identification courante n'a plus de partition douteuse.
+        self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)

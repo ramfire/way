@@ -23,7 +23,8 @@ from django.conf import settings
 
 from .models import (
     Channel, Event, Feed, IdentificationRule, Partner, ReceivedFile,
-    Referential, ReferentialEntry, SubFund, refresh_control_class, run_scope,
+    Referential, ReferentialEntry, SubFund, SubFundAlias, refresh_control_class,
+    run_scope,
 )
 from .s3 import get_s3_client
 
@@ -458,7 +459,7 @@ def _entity_exists(referential, value, rf):
 
 
 def _ident_control(field, value, pkey):
-    """Bucket de rollup **scopé** ``(champ, sub_fund, valuation_date, valeur)``.
+    """Bucket de rollup **scopé** ``(champ, partition canonique, valeur)``.
 
     ``current_control_rollup`` ne retient qu'UN Event par ``(file, stage, control)``
     (le plus récent). Un control = ``field`` seul ferait que des verdicts de
@@ -467,8 +468,16 @@ def _ident_control(field, value, pkey):
     douteuse ». En scopant le control par la partition ET la valeur, chaque check
     distinct est un bucket indépendant : worst-wins agrège toutes les partitions, et
     un rejeu (même donnée → mêmes controls) supersède proprement, partition par
-    partition. Tronqué à 64 par ``_emit_identification`` (codes/ISIN/dates courts)."""
-    return f"{field}@{pkey.get('sub_fund')}|{pkey.get('valuation_date')}#{value}"
+    partition. Tronqué à 64 par ``_emit_identification`` (codes/ISIN/dates courts).
+
+    §1.6-b-bis : la partition est ancrée sur le **SubFund canonique** (``sub_fund_id``)
+    quand il est résolu ; sinon sur la valeur brute (``raw:<code>``) — deux inconnues
+    distinctes ne fusionnent pas, et deux alias d'un même canonique partagent bien
+    le même bucket."""
+    part = pkey.get('sub_fund_id')
+    if part is None:
+        part = f"raw:{pkey.get('sub_fund_value')}"
+    return f"{field}@{part}|{pkey.get('valuation_date')}#{value}"
 
 
 def _resolve_existence(rf, rule, value, pkey):
@@ -550,6 +559,78 @@ def _resolve_axis(rf, rule, value, pkey):
             {**base, 'value': value, 'reason': 'unparsable_axis'})
 
 
+def _resolve_subfund_id(raw_value, feed, sub_tenant_id):
+    """Résout une valeur brute de ``sub_fund`` vers l'id du ``SubFund`` canonique
+    **actif** (§1.6-b-bis). Ordre : (a) **alias** ``SubFundAlias`` scopé au ``feed``
+    (le répertoire porte le système de codes), (b) **repli** sur ``SubFund.key`` (un
+    feed peut livrer le code interne directement). ``None`` si ni l'un ni l'autre →
+    l'appelant tranche via l'``absence_policy``. **Détecte, ne crée JAMAIS.** Une
+    résolution par valeur DISTINCTE (pas par record)."""
+    if raw_value in (None, ''):
+        return None
+    key = str(raw_value)
+    alias_sf = (SubFundAlias.objects
+                .filter(sub_tenant_id=sub_tenant_id, feed=feed, external_code=key,
+                        sub_fund__status=SubFund.Status.ACTIVE)
+                .values_list('sub_fund_id', flat=True).first())
+    if alias_sf is not None:
+        return alias_sf
+    return (SubFund.objects
+            .filter(sub_tenant_id=sub_tenant_id, key=key,
+                    status=SubFund.Status.ACTIVE)
+            .values_list('id', flat=True).first())
+
+
+def _resolve_partition(rf, rule, raw_value, sub_fund_id, pkey, feed):
+    """Verdict de la rule ``partition`` (sub_fund) sur l'identité **canonique**
+    pré-résolue (alias→canonique, cf. ``_resolve_subfund_id``) — §1.6-b-bis.
+
+    ``present`` si résolu ; sinon ``candidate``/``anomaly`` selon l'``absence_policy``
+    (INCHANGÉE). **Détecte, ne crée jamais** : sur non-résolu, le ``detail`` porte
+    ``external_code`` (brut) + ``feed_id`` pour que le Steward tranche (rattacher
+    l'alias à un SubFund existant **ou** créer SubFund + alias), via rejeu."""
+    control = _ident_control(rule.field, raw_value, pkey)
+    base = {'field': rule.field, 'role': rule.role, 'partition_key': pkey}
+
+    if raw_value in (None, ''):
+        if rule.required:
+            _emit_identification(
+                rf, control, Event.Result.FAILED,
+                Event.MonitoringClass.WARNING_ACTION,
+                {**base, 'reason': 'missing_required_field'})
+        else:
+            _emit_identification(
+                rf, control, Event.Result.PASSED,
+                Event.MonitoringClass.WARNING_NOACTION,
+                {**base, 'reason': 'optional_absent'})
+        return
+
+    if sub_fund_id is not None:
+        _emit_identification(
+            rf, control, Event.Result.PASSED, Event.MonitoringClass.PUSH,
+            {**base, 'value': raw_value, 'sub_fund_id': sub_fund_id,
+             'referential': rule.referential.code if rule.referential else 'subfund'})
+        return
+
+    referential = rule.referential
+    if referential is None:
+        # partition sans référentiel = trou de config (Steward) — parité avec
+        # ``_resolve_existence`` (on ne peut pas trancher candidate/anomaly).
+        _emit_identification(
+            rf, control, Event.Result.FAILED, Event.MonitoringClass.WARNING_ACTION,
+            {**base, 'value': raw_value, 'reason': 'no_referential_for_rule'})
+        return
+    # Non résolu (ni alias ni key) → onboarding vs anomalie selon la policy du pivot.
+    if referential.absence_policy == Referential.AbsencePolicy.CANDIDATE:
+        reason = 'new_entity_candidate'
+    else:
+        reason = 'unknown_entity'
+    _emit_identification(
+        rf, control, Event.Result.FAILED, Event.MonitoringClass.WARNING_ACTION,
+        {**base, 'value': raw_value, 'external_code': raw_value, 'feed_id': feed.id,
+         'referential': referential.code, 'reason': reason})
+
+
 def file_identification(file_id):
     """Identifie un fichier (§1.6-b/b2b) : regroupe ses records par partition
     ``(sub_fund, valuation_date)`` et résout chaque groupe.
@@ -588,7 +669,8 @@ def _run_identification(file_id):
                 Event.MonitoringClass.WARNING_ACTION,
                 {'reason': 'no_identification_profile',
                  'feed_resolved': feed is not None,
-                 'partition_key': {'sub_fund': None, 'valuation_date': None,
+                 'partition_key': {'sub_fund_id': None, 'sub_fund_value': None,
+                                   'valuation_date': None,
                                    'feed_id': feed.id if feed else None}})
             return
         profile = feed.identification_profile
@@ -602,8 +684,8 @@ def _run_identification(file_id):
                 rf, CTRL_EXTRACTION, Event.Result.PASSED,
                 Event.MonitoringClass.WARNING_NOACTION,
                 {'reason': 'no_records',
-                 'partition_key': {'sub_fund': None, 'valuation_date': None,
-                                   'feed_id': feed.id}})
+                 'partition_key': {'sub_fund_id': None, 'sub_fund_value': None,
+                                   'valuation_date': None, 'feed_id': feed.id}})
             return
 
         # Champs porteurs de la clé de partition (déduits des rules ; repli sur les
@@ -617,23 +699,43 @@ def _run_identification(file_id):
         # supplémentaires restent de la cohérence intra-record, PAS des dimensions.
         axis_field = axis_rules[0].field if axis_rules else 'valuation_date'
 
-        # --- GROUP BY (sub_fund, valuation_date) -------------------------------
-        groups = {}   # (sf, vd) -> list[record]
-        for rec in records:
-            sf = rec.get(part_field)
-            vd = rec.get(axis_field)
-            groups.setdefault((sf, vd), []).append(rec)
+        # --- §1.6-b-bis : pré-résolution alias→canonique ------------------------
+        # Une résolution par valeur brute DISTINCTE de sub_fund (pas par record),
+        # AVANT le grouping. Deux codes externes pointant le même SubFund → même id
+        # canonique → une seule partition (collapse cross-provider, l'objectif).
+        resolved = {raw: _resolve_subfund_id(raw, feed, rf.sub_tenant_id)
+                    for raw in {rec.get(part_field) for rec in records}}
 
-        for (sf, vd), grp in groups.items():
-            # partition_key IDENTIQUE sur tous les Events du groupe (projection §1.6-c).
-            pkey = {'sub_fund': sf, 'valuation_date': vd, 'feed_id': feed.id}
-            # 1) partition : existence du sub_fund (UNE fois par groupe).
+        # --- GROUP BY (SubFund CANONIQUE, valuation_date) -----------------------
+        # Clé de groupe sur l'identité canonique ; une valeur non résolue forme sa
+        # propre partition candidate (sentinelle ``('raw', brut)`` pour que deux
+        # inconnues distinctes ne fusionnent pas).
+        groups = {}   # gkey -> {'records', 'raw', 'sub_fund_id'}
+        for rec in records:
+            raw = rec.get(part_field)
+            vd = rec.get(axis_field)
+            sfid = resolved.get(raw)
+            canon = ('id', sfid) if sfid is not None else ('raw', raw)
+            g = groups.setdefault((canon, vd),
+                                  {'records': [], 'raw': raw, 'sub_fund_id': sfid})
+            g['records'].append(rec)
+
+        for (_canon, vd), g in groups.items():
+            grp = g['records']
+            # partition_key ancré sur le CANONIQUE, IDENTIQUE sur tous les Events du
+            # groupe (contrat consommé par §1.6-c). ``sub_fund_value`` (brut) toujours
+            # présent (affichage/trace) ; ``sub_fund_id`` null si non résolu.
+            pkey = {'sub_fund_id': g['sub_fund_id'], 'sub_fund_value': g['raw'],
+                    'valuation_date': vd, 'feed_id': feed.id}
+            # 1) partition : résolution alias→canonique (UNE fois par groupe).
             if part_rule:
-                _resolve_existence(rf, part_rule, sf, pkey)
+                _resolve_partition(rf, part_rule, g['raw'], g['sub_fund_id'],
+                                   pkey, feed)
             # 2) axis : cohérence intra-record de la/les date(s) (UNE fois par groupe).
             for ar in axis_rules:
                 _resolve_axis(rf, ar, grp[0].get(ar.field), pkey)
             # 3) subordonnés : par VALEUR DISTINCTE dans le groupe (dédoublonnage).
+            #    INCHANGÉ — pas d'alias (réservé au pivot sub_fund, cf. exclusions).
             for sr in sub_rules:
                 distinct_vals = {rec.get(sr.field) for rec in grp}
                 for val in distinct_vals:
