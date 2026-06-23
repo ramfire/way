@@ -11,8 +11,9 @@ from .admission import (
 from . import qualification as qual
 from . import parsing
 from .models import (
-    Channel, Event, Handled, Feed, Partner, ReceivedFile, Route,
-    SubFund, SubFundAlias, SubTenant, current_control_rollup, refresh_control_class,
+    Channel, Event, Handled, Feed, IdentificationPartition, Partner, ReceivedFile,
+    Route, SubFund, SubFundAlias, SubTenant, current_control_rollup,
+    refresh_control_class,
 )
 
 
@@ -1430,3 +1431,74 @@ class IdentificationAliasResolutionTests(TestCase):
         rf.refresh_from_db()
         # Board : la passe d'identification courante n'a plus de partition douteuse.
         self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
+
+
+class IdentificationPartitionProjectionTests(IdentificationAliasResolutionTests):
+    """§1.6-c — projection matérialisée ``IdentificationPartition`` + board métier.
+
+    Réutilise les helpers de ``IdentificationAliasResolutionTests`` (``_qualify`` /
+    ``_identify`` / profil partition+axis, S3 mocké)."""
+
+    def test_projection_one_row_per_partition(self):
+        canon = SubFund.objects.create(key='K1', sub_tenant=self.t)
+        rf, feed = self._qualify('tee', self._profile())
+        SubFundAlias.objects.create(
+            sub_fund=canon, feed=feed, external_code='AL1', sub_tenant=self.t)
+        self._identify(rf, b'SF;VD\nAL1;2026-03-25\nZZZ;2026-03-25\n')
+        parts = {p.sub_fund_value: p for p in IdentificationPartition.objects.all()}
+        self.assertEqual(set(parts), {'AL1', 'ZZZ'})
+        # alias connu → canonique résolu, present/push, connu
+        self.assertEqual(parts['AL1'].sub_fund_id, canon.id)
+        self.assertTrue(parts['AL1'].is_known_subfund)
+        self.assertEqual(parts['AL1'].control_class, Event.MonitoringClass.PUSH)
+        self.assertEqual(parts['AL1'].valuation_date_value, '2026-03-25')
+        # inconnu → candidate, sub_fund null, non connu
+        self.assertIsNone(parts['ZZZ'].sub_fund_id)
+        self.assertFalse(parts['ZZZ'].is_known_subfund)
+        self.assertEqual(parts['ZZZ'].control_class,
+                         Event.MonitoringClass.WARNING_ACTION)
+
+    def test_onboarding_updates_same_row_no_duplicate(self):
+        # LE test clé : l'onboarding fait BOUGER la ligne (clé brute stable), pas un doublon.
+        rf, feed = self._qualify('tee', self._profile())
+        self._identify(rf, b'SF;VD\nNEW;2026-03-25\n')
+        before = IdentificationPartition.objects.count()
+        p = IdentificationPartition.objects.get(sub_fund_value='NEW')
+        self.assertFalse(p.is_known_subfund)
+        self.assertIsNone(p.sub_fund_id)
+
+        canon = SubFund.objects.create(key='KNEW', sub_tenant=self.t)
+        SubFundAlias.objects.create(
+            sub_fund=canon, feed=feed, external_code='NEW', sub_tenant=self.t)
+        self._identify(rf, b'SF;VD\nNEW;2026-03-25\n')          # rejeu post-onboarding
+
+        self.assertEqual(IdentificationPartition.objects.count(), before)  # PAS de doublon
+        p.refresh_from_db()
+        self.assertTrue(p.is_known_subfund)
+        self.assertEqual(p.sub_fund_id, canon.id)
+        self.assertEqual(p.control_class, Event.MonitoringClass.PUSH)
+
+    def test_business_feed_json_and_fails_filter(self):
+        staff = get_user_model().objects.create_user('bm', is_staff=True)
+        canon = SubFund.objects.create(key='KC', sub_tenant=self.t)
+        rf, feed = self._qualify('tee', self._profile())
+        SubFundAlias.objects.create(
+            sub_fund=canon, feed=feed, external_code='OK', sub_tenant=self.t)
+        self._identify(rf, b'SF;VD\nOK;2026-03-25\nBAD;2026-03-25\n')
+        self.client.force_login(staff)
+
+        data = self.client.get('/monitoring/business/feed/').json()
+        self.assertEqual(data['total'], 2)
+        self.assertEqual(data['fails_total'], 1)
+        rows = {r['sub_fund_value']: r for r in data['rows']}
+        self.assertEqual(rows['OK']['sub_fund_key'], 'KC')       # canonique exposé
+        self.assertTrue(rows['OK']['is_known_subfund'])
+        self.assertIsNone(rows['BAD']['sub_fund_key'])           # candidat → null
+
+        fails = self.client.get('/monitoring/business/feed/?control=fails').json()
+        self.assertEqual({r['sub_fund_value'] for r in fails['rows']}, {'BAD'})
+
+    def test_business_page_renders(self):
+        staff = get_user_model().objects.create_user('bm2', is_staff=True)
+        self.client.force_login(staff)
+        self.assertEqual(self.client.get('/monitoring/business/').status_code, 200)

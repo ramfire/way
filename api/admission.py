@@ -23,8 +23,8 @@ from django.conf import settings
 
 from .models import (
     Channel, Event, Feed, IdentificationRule, Partner, ReceivedFile,
-    Referential, ReferentialEntry, SubFund, SubFundAlias, refresh_control_class,
-    run_scope,
+    Referential, ReferentialEntry, SubFund, SubFundAlias,
+    recompute_identification_partitions, refresh_control_class, run_scope,
 )
 from .s3 import get_s3_client
 
@@ -743,8 +743,11 @@ def _run_identification(file_id):
     except Exception:
         logger.exception('file_identification: erreur inattendue pour file %s', file_id)
     finally:
-        # Rollup worst-wins (read-model board), tous stages confondus. Toujours joué.
+        # Rollup worst-wins (read-model board IT), tous stages confondus. Toujours joué.
         refresh_control_class([rf.pk])
+        # Projection par partition (read-model board métier §1.6-c), juste après le
+        # rollup. Lit le même journal Event ; ne lève jamais (englobée).
+        recompute_identification_partitions(rf)
 
 
 def latest_identification_event(rf_or_id):

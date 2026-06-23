@@ -22,8 +22,9 @@ from .qualification import (
     CAUSE_FEED_NOT_FOUND, latest_qualification_event,
 )
 from .models import (
-    MONITORING_SEVERITY, OPERATOR_REJECTED, Event, Handled, ReceivedFile,
-    default_sub_tenant_id, operator_rejected_ids, refresh_control_class, run_scope,
+    MONITORING_SEVERITY, OPERATOR_REJECTED, Event, Handled, IdentificationPartition,
+    ReceivedFile, default_sub_tenant_id, operator_rejected_ids,
+    refresh_control_class, run_scope,
 )
 from .s3 import PRESIGN_DEFAULT_EXPIRY, object_size, presigned_get_url
 
@@ -645,6 +646,79 @@ def monitoring_feed(request):
         'offset': offset,
         'matched_total': matched_total,
         'returned': len(qs),
+        'server_time': timezone.now().isoformat(),
+    })
+
+
+@staff_member_required
+def business_monitoring_page(request):
+    """Board **métier** (§1.6-c) : verdict d'identification par partition (sous-fonds
+    × valuation_date × feed). Polling JS, voir ``business_monitoring.html``."""
+    return render(request, 'business_monitoring.html',
+                  {'feed_limit': MONITORING_FEED_LIMIT})
+
+
+@staff_member_required
+def business_monitoring_feed(request):
+    """JSON du board métier : une page de partitions (projection ``IdentificationPartition``)
+    + compteurs par ``control_class``.
+
+    Lit la **projection matérialisée** (pas les Events : pas de worst-wins à chaud).
+    ``?control=`` filtre par classe (ou ``fails`` = échecs actionnables) ; ``?limit=``
+    (défaut 50, borné 500) / ``?offset=`` paginent ; tri par défaut = dernier événement.
+    Lecture seule, gardée staff. Pas de filtre ``sub_tenant`` en lecture — fidèle au
+    board IT (isolation stampée à l'écriture, mono-tenant GIL)."""
+    # Compteurs par classe sur TOUTE la projection (chips), cohérents avec le filtre.
+    per_class = {c.value: 0 for c in Event.MonitoringClass}
+    for row in (IdentificationPartition.objects
+                .values('control_class').annotate(n=Count('id'))):
+        per_class[row['control_class']] = row['n']
+    fails_total = sum(per_class[c] for c in TRIAGE_FAILURE_CLASSES)
+    total = sum(per_class.values())
+
+    qs = IdentificationPartition.objects.select_related('sub_fund', 'feed')
+    control = request.GET.get('control')
+    if control == 'fails':
+        qs = qs.filter(control_class__in=TRIAGE_FAILURE_CLASSES)
+    elif control in per_class:
+        qs = qs.filter(control_class=control)
+    else:
+        control = None
+    matched_total = qs.count()
+
+    try:
+        limit = int(request.GET.get('limit', MONITORING_FEED_LIMIT))
+    except (TypeError, ValueError):
+        limit = MONITORING_FEED_LIMIT
+    limit = max(1, min(limit, MONITORING_FEED_MAX))
+    try:
+        offset = max(0, int(request.GET.get('offset', 0)))
+    except (TypeError, ValueError):
+        offset = 0
+
+    rows = [{
+        'id': p.id,
+        'sub_fund_value': p.sub_fund_value,
+        # Canonique si résolu, sinon null (badge « candidat »).
+        'sub_fund_key': p.sub_fund.key if p.sub_fund_id else None,
+        'valuation_date_value': p.valuation_date_value,
+        'feed': str(p.feed),
+        'control_class': p.control_class,
+        'is_known_subfund': p.is_known_subfund,
+        'received_file_id': p.received_file_id,
+        'last_event_at': p.last_event_at.isoformat() if p.last_event_at else None,
+    } for p in qs[offset:offset + limit]]
+
+    return JsonResponse({
+        'rows': rows,
+        'per_class': per_class,
+        'fails_total': fails_total,
+        'total': total,
+        'control_filter': control,
+        'limit': limit,
+        'offset': offset,
+        'matched_total': matched_total,
+        'returned': len(rows),
         'server_time': timezone.now().isoformat(),
     })
 

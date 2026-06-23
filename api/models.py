@@ -1,10 +1,13 @@
 import contextvars
+import logging
 import uuid
 from contextlib import contextmanager
 
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 
 
 # --- Passe de traitement (« run ») -----------------------------------------
@@ -885,3 +888,115 @@ class IdentificationRule(models.Model):
 
     def __str__(self):
         return f'{self.profile}:{self.field} ({self.role})'
+
+
+class IdentificationPartition(models.Model):
+    """Projection matérialisée du verdict d'identification par partition (sous-fonds ×
+    valuation_date × feed) — §1.6-c.
+
+    Clé = la **valeur brute stable** ``(sub_tenant, feed, sub_fund_value,
+    valuation_date_value)`` : le code brut ne change jamais entre rejeux → l'onboarding
+    **met à jour la MÊME ligne** (le ``sub_fund`` canonique se remplit, ``is_known_subfund``
+    passe à True), aucun doublon ni orphelin. Source = le journal ``Event`` append-only ;
+    recalculée après chaque ``file_identification`` ; **jamais éditée à la main**.
+
+    Ne FUSIONNE PAS cross-feed/cross-provider (une ligne par feed) : c'est un verdict
+    d'IDENTIFICATION par partition, pas une complétude de bundle (écran différé)."""
+
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='identification_partitions',
+        db_index=True,
+    )
+    feed = models.ForeignKey(
+        'Feed', on_delete=models.CASCADE, related_name='identification_partitions',
+    )
+    # Canonique si résolu (depuis partition_key.sub_fund_id) ; null tant que candidate.
+    # PROTECT : un SubFund référencé par une projection ne peut être supprimé.
+    sub_fund = models.ForeignKey(
+        SubFund, on_delete=models.PROTECT, related_name='identification_partitions',
+        null=True, blank=True,
+    )
+    sub_fund_value = models.CharField(max_length=255, db_index=True)   # brut (clé + affichage)
+    # Brut (chaîne format provider) — cf. décision §1.6-c-6 : §1.5+ ne gate la date que
+    # si le feed le déclare, et le parsing ne normalise pas → on garde la valeur stable.
+    valuation_date_value = models.CharField(max_length=64, db_index=True)
+    control_class = models.CharField(
+        max_length=20, choices=Event.MonitoringClass.choices)   # worst-wins courant
+    is_known_subfund = models.BooleanField()
+    received_file = models.ForeignKey(
+        ReceivedFile, on_delete=models.CASCADE, related_name='identification_partitions')
+    last_event_at = models.DateTimeField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['sub_tenant', 'feed', 'sub_fund_value', 'valuation_date_value'],
+                name='uniq_identification_partition'),
+        ]
+        ordering = ['-last_event_at']
+
+    def __str__(self):
+        return f'{self.sub_fund_value}@{self.valuation_date_value} ({self.control_class})'
+
+
+def recompute_identification_partitions(rf):
+    """(Re)matérialise ``IdentificationPartition`` pour les partitions touchées par ``rf``.
+
+    Appelée dans le ``finally`` de ``file_identification``, APRÈS ``refresh_control_class``.
+    Pour chaque triplet ``(feed_id, sub_fund_value, valuation_date)`` émis par ``rf``
+    (depuis ``detail.partition_key``), on relit **TOUS** les Events ``identification``
+    de ce triplet (cross-fichiers/cross-rejeux), on prend le **dernier par control**,
+    puis **worst-wins** (échelle ``MONITORING_SEVERITY``, identique à ``control_class``).
+    ``update_or_create`` sur la clé brute stable → idempotent, le rejeu MET À JOUR (pas
+    de doublon). **Ne lève jamais** (englobe + log) : c'est un read-model, pas un gate."""
+    try:
+        STAGE_ID = 'identification'
+        # Triplets de partitions émis par CE fichier (on ignore les marqueurs fichier
+        # no_profile/no_records : sub_fund_value ET valuation_date nuls = pas une partition).
+        triplets = set()
+        for detail in (Event.objects.filter(file=rf, stage=STAGE_ID)
+                       .values_list('detail', flat=True)):
+            pk = (detail or {}).get('partition_key') or {}
+            fid = pk.get('feed_id')
+            sfv, vd = pk.get('sub_fund_value'), pk.get('valuation_date')
+            if fid is None or (sfv is None and vd is None):
+                continue
+            triplets.add((fid, sfv, vd))
+
+        for fid, sfv, vd in triplets:
+            # Tous les Events du triplet (cross-fichiers/rejeux). Pré-filtre SQL sur
+            # feed_id (JSONB), match EXACT de sfv/vd en Python (None-safe, sans
+            # ambiguïté JSON-null des lookups imbriqués).
+            evs = [e for e in Event.objects
+                   .filter(stage=STAGE_ID, detail__partition_key__feed_id=fid)
+                   .order_by('created_at', 'id')
+                   if (e.detail.get('partition_key') or {}).get('sub_fund_value') == sfv
+                   and (e.detail.get('partition_key') or {}).get('valuation_date') == vd]
+            if not evs:
+                continue
+            # État COURANT du triplet = sa **dernière passe** (``run_id`` du dernier
+            # Event). Indispensable : à la résolution, le nom du control partition
+            # change (``raw:<code>`` → ``<sub_fund_id>``) ; un simple « dernier par
+            # control » garderait l'ancien verdict candidate à côté du nouveau present
+            # (worst-wins → resterait orange). Le scope par run écarte la passe
+            # antérieure — même principe que ``current_control_rollup`` (board IT).
+            most_recent = evs[-1]
+            current_run = most_recent.run_id
+            run_events = [e for e in evs if e.run_id == current_run]
+            worst = max(run_events,
+                        key=lambda e: MONITORING_SEVERITY.get(e.monitoring_class, -1))
+            sub_fund_id = (most_recent.detail.get('partition_key') or {}).get('sub_fund_id')
+            IdentificationPartition.objects.update_or_create(
+                sub_tenant_id=rf.sub_tenant_id, feed_id=fid,
+                sub_fund_value='' if sfv is None else str(sfv),
+                valuation_date_value='' if vd is None else str(vd),
+                defaults={
+                    'sub_fund_id': sub_fund_id,
+                    'is_known_subfund': sub_fund_id is not None,
+                    'control_class': worst.monitoring_class,
+                    'received_file_id': most_recent.file_id,
+                    'last_event_at': most_recent.created_at,
+                })
+    except Exception:
+        logger.exception('recompute_identification_partitions: file %s',
+                         getattr(rf, 'pk', '?'))
