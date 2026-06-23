@@ -1,4 +1,5 @@
 import io
+from datetime import date, datetime, time, timezone as dt_timezone
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -11,7 +12,8 @@ from .admission import (
 from . import qualification as qual
 from . import parsing
 from .models import (
-    Channel, Event, Handled, Feed, IdentificationPartition, Partner, ReceivedFile,
+    BusinessCalendar, CalendarException, CalendarHoliday, Channel, Event, Handled,
+    Feed, IdentificationPartition, NavCalendarEntry, Partner, ReceivedFile,
     Route, SubFund, SubFundAlias, SubTenant, current_control_rollup,
     refresh_control_class,
 )
@@ -1543,3 +1545,167 @@ class IdentificationPartitionProjectionTests(IdentificationAliasResolutionTests)
         staff = get_user_model().objects.create_user('bm2', is_staff=True)
         self.client.force_login(staff)
         self.assertEqual(self.client.get('/monitoring/business/').status_code, 200)
+
+
+class CalendarEngineTests(TestCase):
+    """§3.8 — utilitaire jours ouvrés pur (week-end / férié / exception / décalage)."""
+
+    def setUp(self):
+        self.t = default_tenant()
+        self.cal = BusinessCalendar.objects.create(
+            code='TST', label='Test calendar', sub_tenant=self.t)
+
+    def test_weekend_closed_weekday_open(self):
+        from .calendar_engine import is_business_day
+        self.assertTrue(is_business_day(self.cal, date(2026, 6, 24)))    # mercredi
+        self.assertFalse(is_business_day(self.cal, date(2026, 6, 27)))   # samedi
+        self.assertFalse(is_business_day(self.cal, date(2026, 6, 28)))   # dimanche
+
+    def test_holiday_closes_weekday(self):
+        from .calendar_engine import is_business_day
+        CalendarHoliday.objects.create(
+            business_calendar=self.cal, date=date(2026, 6, 25), label='Férié',
+            sub_tenant=self.t)
+        self.assertFalse(is_business_day(self.cal, date(2026, 6, 25)))   # jeudi férié
+
+    def test_exception_opens_weekend(self):
+        from .calendar_engine import is_business_day
+        CalendarException.objects.create(
+            business_calendar=self.cal, date=date(2026, 6, 27), is_open=True,
+            reason='ouverture exceptionnelle', sub_tenant=self.t)
+        self.assertTrue(is_business_day(self.cal, date(2026, 6, 27)))    # samedi ouvert
+
+    def test_exception_closes_weekday(self):
+        from .calendar_engine import is_business_day
+        CalendarException.objects.create(
+            business_calendar=self.cal, date=date(2026, 6, 24), is_open=False,
+            reason='fermeture', sub_tenant=self.t)
+        self.assertFalse(is_business_day(self.cal, date(2026, 6, 24)))   # mercredi fermé
+
+    def test_add_skips_weekend(self):
+        from .calendar_engine import add_business_days
+        # vendredi 26 + 1 ouvré → lundi 29 (saute sam/dim)
+        self.assertEqual(add_business_days(self.cal, date(2026, 6, 26), 1),
+                         date(2026, 6, 29))
+
+    def test_add_skips_holiday(self):
+        from .calendar_engine import add_business_days
+        CalendarHoliday.objects.create(
+            business_calendar=self.cal, date=date(2026, 6, 25), label='Férié',
+            sub_tenant=self.t)
+        # mercredi 24 + 1 ouvré : 25 férié sauté → vendredi 26
+        self.assertEqual(add_business_days(self.cal, date(2026, 6, 24), 1),
+                         date(2026, 6, 26))
+
+    def test_add_zero_is_identity(self):
+        from .calendar_engine import add_business_days
+        self.assertEqual(add_business_days(self.cal, date(2026, 6, 24), 0),
+                         date(2026, 6, 24))
+
+    def test_subtract_is_reverse_of_add(self):
+        from .calendar_engine import BusinessDays
+        bd = BusinessDays(self.cal)
+        self.assertEqual(bd.subtract(date(2026, 6, 29), 1), date(2026, 6, 26))
+
+
+class ExpectedFeedTests(TestCase):
+    """§3.8 — feed du moniteur d'attente : verdicts on_time / late / missing /
+    unanchored / non_expansible, calcul à la volée, confrontation aux partitions."""
+
+    def setUp(self):
+        self.t = default_tenant()
+        self.cal = BusinessCalendar.objects.create(
+            code='TST', label='Test', sub_tenant=self.t)           # aucun férié
+        self.canon = SubFund.objects.create(key='AG001', sub_tenant=self.t)
+        partner = Partner.objects.create(code='P1', sub_tenant=self.t)
+        chan = Channel.objects.create(
+            partner=partner, sub_tenant=self.t, kind=Channel.Kind.SFTP,
+            identifier='acme')
+        self.feed = Feed.objects.create(channel=chan, sub_tenant=self.t)  # layout {}
+        staff = get_user_model().objects.create_user('be', is_staff=True)
+        self.client.force_login(staff)
+
+    def _entry(self, sub_fund=None, cadence=NavCalendarEntry.Cadence.DAILY, lag=2,
+               deadline=time(12, 0), calendar='set'):
+        return NavCalendarEntry.objects.create(
+            sub_tenant=self.t, sub_fund=sub_fund or self.canon, cadence=cadence,
+            lag=lag, deadline_time=deadline,
+            business_calendar=(self.cal if calendar == 'set' else None))
+
+    def _partition(self, valuation_iso, received_at):
+        """Crée une IdentificationPartition + son ReceivedFile, received_at forcé."""
+        rf = make_file(s3_key='in/acme/nav.csv')
+        ReceivedFile.objects.filter(pk=rf.pk).update(received_at=received_at)
+        return IdentificationPartition.objects.create(
+            sub_tenant=self.t, feed=self.feed, sub_fund=self.canon,
+            sub_fund_value='AG001', valuation_date_value=valuation_iso,
+            control_class=Event.MonitoringClass.PUSH, is_known_subfund=True,
+            received_file=rf, last_event_at=received_at)
+
+    def _feed(self, **params):
+        r = self.client.get('/monitoring/expected/feed/', params)
+        self.assertEqual(r.status_code, 200)
+        return r.json()
+
+    def _row(self, data):
+        self.assertEqual(len(data['rows']), 1)
+        return data['rows'][0]
+
+    def test_unanchored_when_no_calendar(self):
+        self._entry(calendar=None)
+        row = self._row(self._feed(date='2026-06-24'))
+        self.assertEqual(row['verdict'], 'unanchored')
+        self.assertIsNone(row['expected_valuation_date'])
+
+    def test_non_expansible_for_non_daily(self):
+        self._entry(cadence=NavCalendarEntry.Cadence.WEEKLY)
+        row = self._row(self._feed(date='2026-06-24'))
+        self.assertEqual(row['verdict'], 'non_expansible')
+
+    def test_not_due_on_weekend(self):
+        self._entry()
+        row = self._row(self._feed(date='2026-06-27'))   # samedi
+        self.assertEqual(row['verdict'], 'not_due')
+
+    def test_expected_valuation_is_delivery_minus_lag(self):
+        self._entry(lag=2)
+        # mercredi 24 − 2 ouvrés = lundi 22 (24→23 mar→22 lun)
+        row = self._row(self._feed(date='2026-06-24'))
+        self.assertEqual(row['expected_valuation_date'], '2026-06-22')
+        self.assertEqual(row['expected_delivery'], '2026-06-24')
+
+    def test_on_time_when_received_before_deadline(self):
+        self._entry(lag=2, deadline=time(12, 0))
+        # valo lundi 22 ; reçu mercredi 24 à 09:00 UTC (=11:00 Lux CEST) < 12:00 Lux
+        self._partition('2026-06-22',
+                        datetime(2026, 6, 24, 9, 0, tzinfo=dt_timezone.utc))
+        row = self._row(self._feed(date='2026-06-24'))
+        self.assertEqual(row['verdict'], 'on_time')
+        self.assertIsNotNone(row['received_file_id'])
+
+    def test_late_when_received_after_deadline(self):
+        self._entry(lag=2, deadline=time(12, 0))
+        # reçu 24 à 15:00 UTC (=17:00 Lux) > 12:00 Lux → late
+        self._partition('2026-06-22',
+                        datetime(2026, 6, 24, 15, 0, tzinfo=dt_timezone.utc))
+        row = self._row(self._feed(date='2026-06-24'))
+        self.assertEqual(row['verdict'], 'late')
+
+    def test_missing_when_nothing_received_and_past_deadline(self):
+        self._entry(lag=2, deadline=time(12, 0))
+        # date passée, aucune partition → échéance dépassée → missing
+        row = self._row(self._feed(date='2020-01-08'))   # mercredi 2020
+        self.assertEqual(row['verdict'], 'missing')
+        self.assertIsNone(row['received_file_id'])
+
+    def test_per_verdict_counters_and_filter(self):
+        self._entry()                         # daily, calendrier → un verdict daté
+        self._entry(sub_fund=SubFund.objects.create(key='ZZ9', sub_tenant=self.t),
+                    calendar=None)             # unanchored
+        data = self._feed(date='2020-01-08')
+        self.assertEqual(data['total'], 2)
+        self.assertEqual(data['per_verdict']['unanchored'], 1)
+        # filtre ?verdict=unanchored → ne reste qu'une ligne
+        only = self._feed(date='2020-01-08', verdict='unanchored')
+        self.assertEqual(only['returned'], 1)
+        self.assertEqual(only['rows'][0]['verdict'], 'unanchored')

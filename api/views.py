@@ -2,6 +2,8 @@ import logging
 import posixpath
 import re
 from collections import Counter
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.contrib.admin.views.decorators import staff_member_required
@@ -9,7 +11,7 @@ from django.db.models import (
     Case, CharField, Count, F, FloatField, Func, IntegerField, Value, When,
 )
 from django.db.models.fields.json import KeyTextTransform
-from django.db.models.functions import Cast, Coalesce, Lower, TruncDate
+from django.db.models.functions import Cast, Coalesce, Lower
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
@@ -18,6 +20,7 @@ from django.views.decorators.http import require_POST
 from rest_framework.views import APIView
 from rest_framework.response import Response
 
+from .calendar_engine import BusinessDays
 from .qualification import (
     CAUSE_FEED_NOT_FOUND, latest_qualification_event,
 )
@@ -676,15 +679,6 @@ def business_monitoring_feed(request):
     fails_total = sum(per_class[c] for c in TRIAGE_FAILURE_CLASSES)
     total = sum(per_class.values())
 
-    # Jours de RÉCEPTION DISTINCTS observés (peuple le dropdown). Même scope que les
-    # compteurs (toute la projection, mono-tenant GIL — pas de filtre sub_tenant en
-    # lecture). ``received_at`` est un timestamp → on agrège au jour (TIME_ZONE=UTC).
-    reception_dates = [d.isoformat() for d in (IdentificationPartition.objects
-                       .annotate(_rday=TruncDate('received_file__received_at'))
-                       .order_by('_rday')
-                       .values_list('_rday', flat=True)
-                       .distinct()) if d]
-
     # ``select_related('received_file')`` : la colonne « Date réception » lit
     # ``received_file.received_at`` → évite le N+1 sur la page de partitions.
     qs = IdentificationPartition.objects.select_related(
@@ -736,12 +730,170 @@ def business_monitoring_feed(request):
         'total': total,
         'control_filter': control,
         'reception_date_filter': reception_date,
-        'reception_dates': reception_dates,
         'limit': limit,
         'offset': offset,
         'matched_total': matched_total,
         'returned': len(rows),
         'server_time': timezone.now().isoformat(),
+    })
+
+
+# ── §3.8 — Moniteur d'attente VNI (lecture pure, calcul à la volée) ────────────
+# Confronte l'attente déclarative (§3.7 ``NavCalendarEntry``) aux arrivées réelles
+# (§1.6-c ``IdentificationPartition``). v1 : cadence ``daily`` seule (les autres sont
+# listées « non expansible »). AUCUNE écriture, AUCUNE projection matérialisée.
+EXPECTED_VERDICTS = ('missing', 'late', 'pending', 'on_time', 'not_due',
+                     'unanchored', 'non_expansible')
+LUX_TZ = ZoneInfo('Europe/Luxembourg')
+# Formats de repli si le feed ne déclare pas de ``format`` dans ``column_contracts``
+# (cf. admission._declared_date_format). Couvre l'ISO, le numérique et ``25-Mar-2026``.
+_FALLBACK_DATE_FORMATS = ('%Y-%m-%d', '%Y%m%d', '%d/%m/%Y', '%d-%m-%Y',
+                          '%Y/%m/%d', '%d-%b-%Y')
+
+
+def _declared_date_format(feed, field='valuation_date'):
+    """Format de date déclaré pour ``field`` dans le ``column_contracts`` du feed
+    (§1.5+), ou ``None`` — même source que le parsing/admission."""
+    layout = feed.layout if isinstance(getattr(feed, 'layout', None), dict) else {}
+    for c in (layout.get('column_contracts') or []):
+        if c.get('as') == field and c.get('type') == 'date':
+            return c.get('format')
+    return None
+
+
+def _parse_valuation_date(feed, raw):
+    """Parse la valeur brute de valo (chaîne format provider) en ``date`` réelle, via
+    le format déclaré puis repli. ``None`` si illisible (la partition ne matchera pas)."""
+    s = (raw or '').strip()
+    if not s:
+        return None
+    declared = _declared_date_format(feed)
+    for fmt in ([declared] if declared else []) + list(_FALLBACK_DATE_FORMATS):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+@staff_member_required
+def business_expected_page(request):
+    """Écran §3.8 : VNI attendues à une date donnée + verdict de timeliness.
+    Polling JS, voir ``business_expected.html``."""
+    return render(request, 'business_expected.html', {})
+
+
+@staff_member_required
+def business_expected_feed(request):
+    """JSON du moniteur d'attente : pour la date ``?date=`` (défaut aujourd'hui), une
+    ligne par ``NavCalendarEntry`` active avec sa valuation date attendue, son
+    expected_delivery (= valo + lag jours ouvrés) et son **verdict**.
+
+    Calcul **à la volée** (aucune table) ; lecture seule, gardée staff. v1 = cadence
+    ``daily`` ; ``weekly/monthly/quarterly`` → ``non_expansible`` (ancrage différé) ;
+    entrée sans calendrier → ``unanchored``. Confrontation aux arrivées réelles via
+    ``IdentificationPartition`` (parse de la valo brute avec le format déclaré)."""
+    from .models import NavCalendarEntry  # local : évite tout cycle d'import
+
+    raw_date = request.GET.get('date')
+    target = None
+    if raw_date:
+        try:
+            target = datetime.strptime(raw_date, '%Y-%m-%d').date()
+        except ValueError:
+            target = None
+    if target is None:
+        target = timezone.localdate()
+
+    now = timezone.now()
+    entries = list(NavCalendarEntry.objects
+                   .filter(status=NavCalendarEntry.Status.ACTIVE)
+                   .select_related('sub_fund', 'business_calendar')
+                   .order_by('sub_fund__key'))
+
+    # Un calculateur jours ouvrés par calendrier (mémoïsé : pas de N+1).
+    _bd_cache = {}
+
+    def days_for(cal):
+        if cal.id not in _bd_cache:
+            _bd_cache[cal.id] = BusinessDays(cal)
+        return _bd_cache[cal.id]
+
+    # Pré-charge les partitions des compartiments concernés → map des arrivées réelles
+    # (sub_fund_id, valo_iso) → (partition, received_at) la plus récemment reçue.
+    sf_ids = {e.sub_fund_id for e in entries}
+    actual = {}
+    for p in (IdentificationPartition.objects
+              .filter(sub_fund_id__in=sf_ids)
+              .select_related('feed', 'received_file')):
+        vd = _parse_valuation_date(p.feed, p.valuation_date_value)
+        if vd is None:
+            continue
+        ra = p.received_file.received_at if p.received_file_id else None
+        key = (p.sub_fund_id, vd)
+        cur = actual.get(key)
+        if cur is None or (ra and (cur[1] is None or ra > cur[1])):
+            actual[key] = (p, ra)
+
+    rows = []
+    for e in entries:
+        row = {
+            'id': e.id,
+            'sub_fund_key': e.sub_fund.key,
+            'cadence': e.cadence,
+            'lag': e.lag,
+            'deadline_time': e.deadline_time.strftime('%H:%M'),
+            'business_calendar': (e.business_calendar.code
+                                  if e.business_calendar_id else None),
+            'expected_valuation_date': None,
+            'expected_delivery': None,
+            'received_at': None,
+            'received_file_id': None,
+            'verdict': None,
+        }
+        if e.business_calendar_id is None:
+            row['verdict'] = 'unanchored'            # pas de calendrier → on ne devine pas
+        elif e.cadence != NavCalendarEntry.Cadence.DAILY:
+            row['verdict'] = 'non_expansible'        # ancrage non-daily différé (§3.8-b)
+        else:
+            bd = days_for(e.business_calendar)
+            if not bd.is_business_day(target):
+                row['verdict'] = 'not_due'           # D non ouvré → aucune livraison ce jour
+            else:
+                vd = bd.subtract(target, e.lag)      # valo attendue = D − lag ouvrés
+                # Échéance = expected_delivery (D) à l'heure limite, fuseau Luxembourg.
+                deadline = datetime.combine(target, e.deadline_time, tzinfo=LUX_TZ)
+                row['expected_valuation_date'] = vd.isoformat()
+                row['expected_delivery'] = target.isoformat()
+                hit = actual.get((e.sub_fund_id, vd))
+                if hit and hit[1] is not None:
+                    p, ra = hit
+                    row['received_at'] = ra.isoformat()
+                    row['received_file_id'] = p.received_file_id
+                    row['verdict'] = 'on_time' if ra <= deadline else 'late'
+                else:
+                    row['verdict'] = 'pending' if now <= deadline else 'missing'
+        rows.append(row)
+
+    per_verdict = {v: 0 for v in EXPECTED_VERDICTS}
+    for r in rows:
+        per_verdict[r['verdict']] = per_verdict.get(r['verdict'], 0) + 1
+
+    vfilter = request.GET.get('verdict')
+    if vfilter in per_verdict:
+        shown = [r for r in rows if r['verdict'] == vfilter]
+    else:
+        vfilter = None
+        shown = rows
+
+    return JsonResponse({
+        'date': target.isoformat(),
+        'rows': shown,
+        'per_verdict': per_verdict,
+        'total': len(rows),
+        'returned': len(shown),
+        'verdict_filter': vfilter,
+        'server_time': now.isoformat(),
     })
 
 

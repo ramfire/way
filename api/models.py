@@ -801,6 +801,67 @@ class SubFundAlias(models.Model):
         return f'{self.external_code} → {self.sub_fund.key} ({self.feed})'
 
 
+class NavCalendarEntry(models.Model):
+    """Attente VNI déclarative par compartiment : cadence de calcul, lag (jours
+    ouvrés valo→livraison), heure limite. Référentiel saisi par le Steward. Aucun
+    calcul ici — l'expansion en dates attendues et le verdict de timeliness sont
+    différés (§1.7/§3.8).
+    """
+
+    class Cadence(models.TextChoices):
+        DAILY = 'daily', 'Quotidienne'
+        WEEKLY = 'weekly', 'Hebdomadaire'
+        BIWEEKLY = 'biweekly', 'Bimensuelle'
+        MONTHLY = 'monthly', 'Mensuelle'
+        QUARTERLY = 'quarterly', 'Trimestrielle'
+
+    class Status(models.TextChoices):
+        ACTIVE = 'active', 'Actif'
+        INACTIVE = 'inactive', 'Inactif'
+
+    sub_tenant = models.ForeignKey(
+        SubTenant, on_delete=models.PROTECT, related_name='nav_calendar_entries',
+        db_index=True,
+    )
+    # PROTECT : un référentiel d'attente ne disparaît pas silencieusement avec son
+    # compartiment canonique. Ancré sur le SubFund (jamais une valeur brute, cf. b-bis).
+    sub_fund = models.ForeignKey(
+        SubFund, on_delete=models.PROTECT, related_name='nav_calendar_entries',
+    )
+    cadence = models.CharField(
+        max_length=16, choices=Cadence.choices,
+        help_text='fréquence de calcul VNI, déclarative (pas d\'expansion en dates ici).',
+    )
+    lag = models.PositiveSmallIntegerField(
+        help_text='jours ouvrés entre la date de valo et la livraison attendue.',
+    )
+    deadline_time = models.TimeField(
+        help_text=('fuseau Europe/Luxembourg supposé ; le calcul effectif est '
+                   'différé (§3.8).'),
+    )
+    # FK nullable : le lag en jours ouvrés se compte contre UN calendrier précis
+    # (§3.8 en aura besoin). SET_NULL — supprimer un calendrier ne doit pas effacer
+    # l'attente standing du compartiment (décision §3.7-5 ; défaut métier = ABBL).
+    business_calendar = models.ForeignKey(
+        BusinessCalendar, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='nav_calendar_entries',
+    )
+    status = models.CharField(
+        max_length=16, choices=Status.choices, default=Status.ACTIVE,
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['sub_tenant', 'sub_fund'], name='uniq_nav_calendar_entry'),
+        ]
+        ordering = ['sub_fund']
+
+    def __str__(self):
+        return (f'{self.sub_fund.key} · {self.cadence} · J+{self.lag} ouvrés · '
+                f'{self.deadline_time}')
+
+
 class ReferentialEntry(models.Model):
     """Valeurs des référentiels subordonnés (existence seule). SubFund est un
     référentiel pivot dédié, hors de ce modèle.

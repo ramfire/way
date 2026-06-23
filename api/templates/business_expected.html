@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AlfaWay — NAV Expected</title>
+  <style>
+    :root { --bg:#0f172a; --card:#1e293b; --txt:#e2e8f0; --mut:#94a3b8; --line:#334155; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--txt);
+           font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
+    header { padding:1rem 1.5rem; border-bottom:1px solid var(--line);
+             display:flex; align-items:center; gap:1.5rem; flex-wrap:wrap; }
+    h1 { font-size:1.15rem; margin:0; }
+    .spacer { flex:1; }
+    .meta { color:var(--mut); font-size:.8rem; display:flex; align-items:center; gap:.8rem; }
+    .dot { width:9px; height:9px; border-radius:50%; background:#22c55e; display:inline-block;
+           animation:pulse 2s infinite; }
+    .dot.error { background:#ef4444; animation:none; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+    a.navlink { color:var(--mut); font-size:.82rem; text-decoration:none; }
+    a.navlink:hover { color:#fff; }
+    button, select, input[type=date] { background:var(--card); color:var(--txt);
+             border:1px solid var(--line); border-radius:6px; padding:.35rem .7rem;
+             cursor:pointer; font-size:.8rem; }
+    button:hover, select:hover, input[type=date]:hover { border-color:var(--mut); }
+    .chips { display:flex; gap:.5rem; flex-wrap:wrap; padding:.8rem 1.5rem 0; }
+    .chip { background:var(--card); border:1px solid var(--line); border-radius:999px;
+            padding:.3rem .8rem; font-size:.8rem; cursor:pointer; }
+    .chip.active { outline:2px solid var(--mut); }
+    .chip b { font-size:.95rem; }
+    table { width:100%; border-collapse:collapse; font-size:.86rem; margin-top:.6rem; }
+    th, td { text-align:left; padding:.5rem .9rem; border-bottom:1px solid var(--line);
+             white-space:nowrap; }
+    th { color:var(--mut); font-weight:600; position:sticky; top:0; background:var(--bg); }
+    td.mono { font-family: ui-monospace, monospace; }
+    .badge { padding:.15rem .55rem; border-radius:999px; font-size:.75rem; font-weight:600; }
+    .v-missing        { background:#991b1b; color:#fee2e2; box-shadow:inset 2px 0 0 #ef4444; }
+    .v-late           { background:#9a3412; color:#ffedd5; }
+    .v-pending        { background:#854d0e; color:#fde68a; }
+    .v-on_time        { background:#14532d; color:#bbf7d0; }
+    .v-not_due        { background:#334155; color:#cbd5e1; }
+    .v-unanchored     { background:#3730a3; color:#e0e7ff; }
+    .v-non_expansible { background:#334155; color:#94a3b8; }
+    .empty { padding:2rem 1.5rem; color:var(--mut); }
+    .muted { color:var(--mut); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>AlfaWay — <span data-i18n="title">NAV expected</span></h1>
+    <a class="navlink" href="/monitoring/business/">← <span data-i18n="bizboard">Business board</span></a>
+    <a class="navlink" href="/monitoring/">← <span data-i18n="itboard">IT board</span></a>
+    <label class="meta">
+      <span data-i18n="ondate">On date</span>
+      <input type="date" id="date">
+    </label>
+    <span class="spacer"></span>
+    <div class="meta">
+      <span id="count"></span>
+      <span><span class="dot" id="dot"></span> <span data-i18n="live">live</span></span>
+      <button id="lang">FR</button>
+    </div>
+  </header>
+
+  <div class="chips" id="chips"></div>
+
+  <table>
+    <thead>
+      <tr>
+        <th data-i18n="subfund">Sub-fund</th>
+        <th data-i18n="cadence">Cadence</th>
+        <th data-i18n="lag">Lag</th>
+        <th data-i18n="expvaldate">Expected valuation date</th>
+        <th data-i18n="expdelivery">Expected delivery</th>
+        <th data-i18n="deadline">Deadline</th>
+        <th data-i18n="calendar">Calendar</th>
+        <th data-i18n="received">Received</th>
+        <th data-i18n="verdict">Verdict</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="empty" id="empty" hidden data-i18n="none">No NAV calendar entry.</div>
+
+<script>
+  const REFRESH_MS = 10000;                 // 10 s — aligné sur les autres boards
+  const FEED = '/monitoring/expected/feed/';
+  let verdict = null;                        // filtre verdict courant
+  let targetDate = null;                     // date cible (null = aujourd'hui côté serveur)
+
+  // Ordre/labels des verdicts (suit EXPECTED_VERDICTS côté serveur).
+  const VERDICTS = ['missing','late','pending','on_time','not_due','unanchored','non_expansible'];
+
+  const I18N = {
+    en: {title:'NAV expected', bizboard:'Business board', itboard:'IT board', live:'live',
+         ondate:'On date', subfund:'Sub-fund', cadence:'Cadence', lag:'Lag',
+         expvaldate:'Expected valuation date', expdelivery:'Expected delivery',
+         deadline:'Deadline', calendar:'Calendar', received:'Received', verdict:'Verdict',
+         none:'No NAV calendar entry.', all:'All', locale:'en-US',
+         missing:'missing', late:'late', pending:'pending', on_time:'on time',
+         not_due:'not due', unanchored:'no calendar', non_expansible:'non-daily'},
+    fr: {title:'VNI attendues', bizboard:'board métier', itboard:'board IT', live:'live',
+         ondate:'À la date', subfund:'Sous-fonds', cadence:'Cadence', lag:'Lag',
+         expvaldate:'Date de valo attendue', expdelivery:'Livraison attendue',
+         deadline:'Heure limite', calendar:'Calendrier', received:'Reçu', verdict:'Verdict',
+         none:'Aucune entrée de calendrier VNI.', all:'Tout', locale:'fr-FR',
+         missing:'manquant', late:'en retard', pending:'en attente', on_time:'à l’heure',
+         not_due:'non dû', unanchored:'sans calendrier', non_expansible:'non-quotidien'},
+  };
+  let lang = localStorage.getItem('be_lang') || 'en';
+
+  function vlabel(v) { return (I18N[lang][v] || v); }
+
+  function applyI18n() {
+    document.querySelectorAll('[data-i18n]').forEach(el => {
+      const k = el.getAttribute('data-i18n');
+      if (I18N[lang][k]) el.textContent = I18N[lang][k];
+    });
+    document.getElementById('lang').textContent = lang === 'en' ? 'FR' : 'EN';
+    document.documentElement.lang = lang;
+  }
+  document.getElementById('lang').onclick = () => {
+    lang = lang === 'en' ? 'fr' : 'en';
+    localStorage.setItem('be_lang', lang);
+    applyI18n(); poll();
+  };
+
+  function esc(s) { return (s == null ? '' : String(s)).replace(/[&<>]/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+  // Date+heure courte (cohérent avec le board métier : heure puis date).
+  function fmtTime(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso), loc = (I18N[lang] || I18N.en).locale;
+    return d.toLocaleTimeString(loc) + ' ' + d.toLocaleDateString(loc);
+  }
+  function fmtDay(iso) {
+    if (!iso) return '—';
+    return new Date(iso + 'T00:00:00').toLocaleDateString((I18N[lang] || I18N.en).locale);
+  }
+
+  document.getElementById('date').onchange = (e) => {
+    targetDate = e.target.value || null; poll();
+  };
+
+  function renderChips(per, total) {
+    const t = I18N[lang];
+    const box = document.getElementById('chips');
+    const items = [['', t.all, total]];
+    VERDICTS.forEach(v => { if (per[v]) items.push([v, vlabel(v), per[v]]); });
+    box.innerHTML = items.map(([key, label, n]) => {
+      const active = (key === '' && !verdict) || key === verdict ? ' active' : '';
+      const cls = key ? ` badge v-${key}` : '';
+      return `<span class="chip${active}" data-key="${key}">
+        <span class="${cls}">${esc(label)}</span> <b>${n}</b></span>`;
+    }).join('');
+    box.querySelectorAll('.chip').forEach(ch => ch.onclick = () => {
+      verdict = ch.getAttribute('data-key') || null; poll();
+    });
+  }
+
+  function renderRows(rows) {
+    const tb = document.getElementById('rows');
+    document.getElementById('empty').hidden = rows.length > 0;
+    tb.innerHTML = rows.map(r => {
+      const recv = r.received_file_id
+        ? `<span class="mono">#${r.received_file_id}</span> ${esc(fmtTime(r.received_at))}`
+        : '<span class="muted">—</span>';
+      return `<tr>
+        <td><b>${esc(r.sub_fund_key)}</b></td>
+        <td>${esc(r.cadence)}</td>
+        <td class="mono">J+${esc(r.lag)}</td>
+        <td class="mono">${esc(fmtDay(r.expected_valuation_date))}</td>
+        <td class="mono">${esc(fmtDay(r.expected_delivery))}</td>
+        <td class="mono">${esc(r.deadline_time)}</td>
+        <td>${r.business_calendar ? esc(r.business_calendar) : '<span class="muted">—</span>'}</td>
+        <td>${recv}</td>
+        <td><span class="badge v-${r.verdict}">${esc(vlabel(r.verdict))}</span></td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function poll() {
+    try {
+      const params = new URLSearchParams();
+      if (verdict) params.set('verdict', verdict);
+      if (targetDate) params.set('date', targetDate);
+      const url = FEED + (params.toString() ? `?${params}` : '');
+      const res = await fetch(url, {credentials: 'same-origin'});
+      if (!res.ok) throw new Error(res.status);
+      const data = await res.json();
+      // Reflète la date effective (aujourd'hui si non choisie), sans gêner la saisie.
+      const di = document.getElementById('date');
+      if (document.activeElement !== di) di.value = targetDate || data.date;
+      renderChips(data.per_verdict, data.total);
+      renderRows(data.rows);
+      document.getElementById('count').textContent = `${data.returned} / ${data.total}`;
+      document.getElementById('dot').classList.remove('error');
+    } catch (e) {
+      document.getElementById('dot').classList.add('error');
+    }
+  }
+
+  applyI18n();
+  poll();
+  setInterval(poll, REFRESH_MS);
+</script>
+</body>
+</html>

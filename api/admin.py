@@ -5,8 +5,8 @@ from django.utils.html import format_html
 from .models import (
     BusinessCalendar, CalendarException, CalendarHoliday,
     Channel, Event, Handled, Feed, IdentificationProfile, IdentificationRule,
-    Partner, ReceivedFile, Referential, ReferentialEntry, Route, SubFund,
-    SubFundAlias, SubTenant,
+    NavCalendarEntry, Partner, ReceivedFile, Referential, ReferentialEntry, Route,
+    SubFund, SubFundAlias, SubTenant,
 )
 
 # Ordre d'affichage des modèles dans l'index admin (par défaut alphabétique).
@@ -183,13 +183,31 @@ class SubFundAliasInline(admin.TabularInline):
     extra = 0
 
 
+class NavCalendarEntryInline(admin.TabularInline):
+    """Attente VNI de ce compartiment (§3.7), éditée sur la fiche SubFund."""
+    model = NavCalendarEntry
+    fields = ('cadence', 'lag', 'deadline_time', 'business_calendar', 'status',
+              'sub_tenant')
+    extra = 0
+
+
 @admin.register(SubFund)
 class SubFundAdmin(admin.ModelAdmin):
     """Référentiel pivot (§1.6-a) : onboarding manuel d'un sous-fonds."""
     list_display = ('key', 'status', 'sub_tenant')
     list_filter = ('status',)
     search_fields = ('key',)
-    inlines = [SubFundAliasInline]
+    inlines = [SubFundAliasInline, NavCalendarEntryInline]
+
+
+@admin.register(NavCalendarEntry)
+class NavCalendarEntryAdmin(admin.ModelAdmin):
+    """Calendrier VNI déclaratif par compartiment (§3.7) : le Steward saisit
+    cadence / lag (jours ouvrés) / heure limite. Aucun calcul ici (différé §3.8)."""
+    list_display = ('sub_fund', 'cadence', 'lag', 'deadline_time', 'status',
+                    'sub_tenant')
+    list_filter = ('cadence', 'status', 'sub_tenant')
+    search_fields = ('sub_fund__key',)
 
 
 @admin.register(SubFundAlias)
