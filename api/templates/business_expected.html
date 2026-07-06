@@ -1,56 +1,20 @@
-<!doctype html>
+{% load static %}<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AlfaWay — NAV Expected</title>
+  <link rel="stylesheet" href="{% static 'css/monitoring_shared.css' %}">
   <style>
-    :root { --bg:#0f172a; --card:#1e293b; --txt:#e2e8f0; --mut:#94a3b8; --line:#334155; }
-    * { box-sizing: border-box; }
-    body { margin:0; background:var(--bg); color:var(--txt);
-           font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
-    header { padding:1rem 1.5rem; border-bottom:1px solid var(--line);
-             display:flex; align-items:center; gap:1.5rem; flex-wrap:wrap; }
-    h1 { font-size:1.15rem; margin:0; }
-    .spacer { flex:1; }
-    .meta { color:var(--mut); font-size:.8rem; display:flex; align-items:center; gap:.8rem; }
-    .dot { width:9px; height:9px; border-radius:50%; background:#22c55e; display:inline-block;
-           animation:pulse 2s infinite; }
-    .dot.error { background:#ef4444; animation:none; }
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
-    a.navlink { color:var(--mut); font-size:.82rem; text-decoration:none; }
-    a.navlink:hover { color:#fff; }
-    button, select, input[type=date] { background:var(--card); color:var(--txt);
-             border:1px solid var(--line); border-radius:6px; padding:.35rem .7rem;
-             cursor:pointer; font-size:.8rem; }
-    button:hover, select:hover, input[type=date]:hover { border-color:var(--mut); }
-    .chips { display:flex; gap:.5rem; flex-wrap:wrap; padding:.8rem 1.5rem 0; }
-    .chip { background:var(--card); border:1px solid var(--line); border-radius:999px;
-            padding:.3rem .8rem; font-size:.8rem; cursor:pointer; }
-    .chip.active { outline:2px solid var(--mut); }
-    .chip b { font-size:.95rem; }
-    table { width:100%; border-collapse:collapse; font-size:.86rem; margin-top:.6rem; }
-    th, td { text-align:left; padding:.5rem .9rem; border-bottom:1px solid var(--line);
-             white-space:nowrap; }
-    th { color:var(--mut); font-weight:600; position:sticky; top:0; background:var(--bg); }
-    td.mono { font-family: ui-monospace, monospace; }
-    .badge { padding:.15rem .55rem; border-radius:999px; font-size:.75rem; font-weight:600; }
-    .v-missing        { background:#991b1b; color:#fee2e2; box-shadow:inset 2px 0 0 #ef4444; }
-    .v-late           { background:#9a3412; color:#ffedd5; }
-    .v-pending        { background:#854d0e; color:#fde68a; }
-    .v-on_time        { background:#14532d; color:#bbf7d0; }
-    .v-not_due        { background:#334155; color:#cbd5e1; }
-    .v-unanchored     { background:#3730a3; color:#e0e7ff; }
-    .v-non_expansible { background:#334155; color:#94a3b8; }
-    .empty { padding:2rem 1.5rem; color:var(--mut); }
-    .muted { color:var(--mut); }
+    /* Chrome, chips et badges de verdict (.v-*, mappés sur l'échelle de sévérité)
+       viennent du CSS partagé (monitoring_shared.css). Spécifique : marge de table. */
+    table { margin-top:.6rem; }
   </style>
 </head>
 <body>
   <header>
     <h1>AlfaWay — <span data-i18n="title">NAV expected</span></h1>
-    <a class="navlink" href="/monitoring/business/">← <span data-i18n="bizboard">Business board</span></a>
-    <a class="navlink" href="/monitoring/">← <span data-i18n="itboard">IT board</span></a>
+    {% include 'partials/monitoring_nav.html' with active='expected' %}
     <label class="meta">
       <span data-i18n="ondate">On date</span>
       <input type="date" id="date">
@@ -83,6 +47,7 @@
   </table>
   <div class="empty" id="empty" hidden data-i18n="none">No NAV calendar entry.</div>
 
+<script src="{% static 'js/monitoring_shared.js' %}"></script>
 <script>
   const REFRESH_MS = 10000;                 // 10 s — aligné sur les autres boards
   const FEED = '/monitoring/expected/feed/';
@@ -118,6 +83,7 @@
       if (I18N[lang][k]) el.textContent = I18N[lang][k];
     });
     document.getElementById('lang').textContent = lang === 'en' ? 'FR' : 'EN';
+    MShared.localizeNav(lang);   // nav croisée partagée (libellés structurels)
     document.documentElement.lang = lang;
   }
   document.getElementById('lang').onclick = () => {
@@ -126,19 +92,11 @@
     applyI18n(); poll();
   };
 
-  function esc(s) { return (s == null ? '' : String(s)).replace(/[&<>]/g,
-    c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
-
-  // Date+heure courte (cohérent avec le board métier : heure puis date).
-  function fmtTime(iso) {
-    if (!iso) return '—';
-    const d = new Date(iso), loc = (I18N[lang] || I18N.en).locale;
-    return d.toLocaleTimeString(loc) + ' ' + d.toLocaleDateString(loc);
-  }
-  function fmtDay(iso) {
-    if (!iso) return '—';
-    return new Date(iso + 'T00:00:00').toLocaleDateString((I18N[lang] || I18N.en).locale);
-  }
+  // Échappement + formatage date PARTAGÉS (MShared) : mêmes conventions d'affichage
+  // que les autres boards (décision §5).
+  const esc = MShared.esc;
+  function fmtTime(iso) { return MShared.fmtTime(iso, (I18N[lang] || I18N.en).locale); }
+  function fmtDay(iso) { return MShared.fmtDay(iso, (I18N[lang] || I18N.en).locale); }
 
   document.getElementById('date').onchange = (e) => {
     targetDate = e.target.value || null; poll();

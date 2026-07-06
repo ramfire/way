@@ -1195,3 +1195,52 @@ def reject_file(request, pk):
     rf.refresh_from_db()
     logger.info('Reject (triage) ReceivedFile %s (%s) par %s', pk, rf.s3_key, request.user)
     return JsonResponse({'ok': True, 'id': rf.pk, 'control_class': rf.control_class})
+
+
+@require_POST
+@staff_member_required
+def replay_all_controls(request, pk):
+    """Action UI : **relancer TOUTE la chaîne de contrôles** d'un fichier.
+
+    Déclenchée au double-clic sur le badge de contrôle du board. Rejoue la chaîne
+    complète — ``file_admission`` (admission→qualification→routing→parsing) **puis**
+    ``file_identification`` (§1.6) — à l'image de l'orchestrateur webhook
+    (``SFTPWebhookView._run_admission``). Contrairement à ``replay_admission``
+    (admission seule), couvre l'identification : c'est le geste self-service qui
+    remplace ``manage.py run_identification`` après un correctif de config amont
+    (profil d'identification, référentiel, alias). Non bloquant, append-only,
+    idempotent ; les deux moteurs rematérialisent ``control_class`` en ``finally``.
+    Sans effet sur ``ReceivedFile.state``. Renvoie la classe de contrôle rafraîchie.
+
+    ⚠️ Le ré-jeu de l'identification est gardé par la **qualification**, PAS par
+    ``control_class`` : après ``file_admission``, la passe d'identification la plus
+    récente reste la PRÉCÉDENTE (stale) tant qu'on ne l'a pas rejouée, donc le
+    worst-wins ``control_class`` refléterait encore son ``warning_action`` et — si on
+    gardait le ``== PUSH`` de l'orchestrateur — empêcherait justement le re-jeu qui
+    la corrige. On identifie donc dès que le fichier est (re)qualifié (feed
+    résoluble), miroir du gardien interne de ``file_identification``.
+    """
+    from .admission import VERDICT_ADMIS, file_admission, file_identification
+    from .qualification import VERDICT_QUALIFIED
+
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    verdict = file_admission(rf.pk)
+    if verdict is None:
+        # file_admission avale ses exceptions et renvoie None ; voir django.log.
+        return JsonResponse({'detail': 'rejeu impossible (voir les logs)'}, status=502)
+    # Identification re-jouée ssi CETTE passe d'admission aboutit à ``admis`` ET que
+    # le fichier est (re)qualifié. Le double garde-fou est nécessaire : ``file_admission``
+    # ne ré-émet la qualification QUE si son verdict est ``admis`` (cf. admission.py) ;
+    # sans le test ``verdict == VERDICT_ADMIS``, un fichier basculé en recycle/quarantine
+    # par le re-jeu (partenaire révoqué, canal supprimé) garderait son ANCIEN Event
+    # ``QUALIFIED`` (append-only, latest-wins) → on identifierait un fichier qui n'est
+    # PLUS admis, divergeant de l'orchestrateur webhook (gardé sur ``control_class==PUSH``).
+    ql = latest_qualification_event(rf)
+    if (verdict == VERDICT_ADMIS and ql is not None
+            and ql.detail.get('verdict') == VERDICT_QUALIFIED):
+        file_identification(rf.pk)   # ne lève jamais ; rematérialise control_class
+    rf.refresh_from_db()
+    logger.info('Replay ALL controls ReceivedFile %s (%s) -> %s par %s',
+                pk, rf.s3_key, verdict, request.user)
+    return JsonResponse({'ok': True, 'id': rf.pk,
+                         'control_class': rf.control_class, 'verdict': verdict})

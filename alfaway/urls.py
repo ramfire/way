@@ -36,6 +36,7 @@ from api.views import (
     recycle_file,
     reject_file,
     replay_admission,
+    replay_all_controls,
     restore_received_file,
 )
 
@@ -61,5 +62,7 @@ urlpatterns = [
     path('monitoring/feed/<int:pk>/enrol/', enrol_feed, name='monitoring-feed-enrol'),
     path('monitoring/files/<int:pk>/recycle/', recycle_file, name='monitoring-file-recycle'),
     path('monitoring/files/<int:pk>/reject/', reject_file, name='monitoring-file-reject'),
+    path('monitoring/files/<int:pk>/replay-all/', replay_all_controls,
+         name='monitoring-file-replay-all'),
     path('healthz/', lambda r: JsonResponse({'status': 'ok'})),
 ]

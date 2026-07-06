@@ -1,17 +1,13 @@
-<!doctype html>
+{% load static %}<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AlfaWay — Monitoring</title>
+  <link rel="stylesheet" href="{% static 'css/monitoring_shared.css' %}">
   <style>
-    :root { --bg:#0f172a; --card:#1e293b; --txt:#e2e8f0; --mut:#94a3b8; --line:#334155; }
-    * { box-sizing: border-box; }
-    body { margin:0; background:var(--bg); color:var(--txt);
-           font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
-    header { padding:1rem 1.5rem; border-bottom:1px solid var(--line);
-             display:flex; align-items:center; gap:1.5rem; flex-wrap:wrap; }
-    h1 { font-size:1.15rem; margin:0; }
+    /* Chrome commun (variables, body/header/table, badges .mc-*/.ds-*, .dot…) :
+       monitoring_shared.css. Ici, UNIQUEMENT le spécifique board fichier. */
     .tabs { display:flex; gap:.3rem; }
     .tab { font-size:.82rem; }
     .tab.active { background:#334155; border-color:var(--mut); color:#fff; font-weight:600; }
@@ -19,47 +15,17 @@
     .stat { background:var(--card); border:1px solid var(--line); border-radius:8px;
             padding:.35rem .7rem; font-size:.85rem; }
     .stat b { font-size:1.05rem; }
-    .spacer { flex:1; }
-    .meta { color:var(--mut); font-size:.8rem; display:flex; align-items:center; gap:.8rem; }
-    .dot { width:9px; height:9px; border-radius:50%; background:#22c55e; display:inline-block;
-           animation:pulse 2s infinite; }
-    .dot.paused { background:#eab308; animation:none; }
-    .dot.error { background:#ef4444; animation:none; }
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
-    button, select { background:var(--card); color:var(--txt); border:1px solid var(--line);
-             border-radius:6px; padding:.35rem .7rem; cursor:pointer; font-size:.8rem; }
-    button:hover, select:hover { border-color:var(--mut); }
-    table { width:100%; border-collapse:collapse; font-size:.86rem; }
-    th, td { text-align:left; padding:.5rem .75rem; border-bottom:1px solid var(--line);
-             white-space:nowrap; }
-    th { color:var(--mut); font-weight:600; position:sticky; top:0; background:var(--bg); }
     td.file { font-family: ui-monospace, monospace; }
-    .badge { padding:.15rem .55rem; border-radius:999px; font-size:.75rem; font-weight:600; }
+    /* Axe STOCKAGE — badges d'état propres au board fichier (distincts de l'échelle
+       de sévérité ; voir design §8). */
     .receiving { background:#1e3a8a; color:#bfdbfe; }
     .stored    { background:#14532d; color:#bbf7d0; }
     .failed    { background:#7f1d1d; color:#fecaca; }
     .deleted   { background:#374151; color:#d1d5db; }
     .missing   { background:#78350f; color:#fed7aa; }
     .archived  { background:#312e81; color:#c7d2fe; }
-    /* Axe contrôles — badge « worst-wins » par classe de monitoring (générique,
-       tous stages/contrôles). Couleurs par sévérité décroissante (design §5).
-       NB: distinct de .archived (axe stockage) — voir design §8. */
-    .mc-blocking         { background:#991b1b; color:#fee2e2; box-shadow:inset 2px 0 0 #ef4444; }
-    .mc-warning_action   { background:#9a3412; color:#ffedd5; }
-    .mc-recycle          { background:#854d0e; color:#fde68a; }
-    .mc-reject           { background:#7f1d1d; color:#fecaca; }
-    .mc-warning_noaction { background:#334155; color:#cbd5e1; }
-    .mc-push             { background:#14532d; color:#bbf7d0; }
-    .mc-none             { color:var(--mut); }
-    /* États affichés (board) : 4 valeurs sans ambiguïté verdict↔décision. */
-    .ds-ok       { background:#14532d; color:#bbf7d0; }
-    .ds-failed   { background:#9a3412; color:#ffedd5; box-shadow:inset 2px 0 0 #f97316; }
-    .ds-recycled { background:#1e3a8a; color:#dbeafe; }
-    .ds-rejected { background:#7f1d1d; color:#fecaca; }
-    /* « All » : filtre de remise à zéro → teinte NEUTRE (ardoise), pas sémantique.
-       Slate-800 inactif / slate-600 actif ; on neutralise aussi le surlignage bleu
-       par défaut de .stat.active (spécificité 3 classes > .stat.active). */
-    .ds-all { background:#1e293b; color:#cbd5e1; }
+    /* Chip « All » : neutralise le surlignage bleu par défaut de .stat.active
+       (spécificité 3 classes > .stat.active) ; `.ds-all` vient du CSS partagé. */
     .stat.chip-all.active { background:#0f172a; border-color:#64748b; }
     .stat.chip-all.active .ds-all { background:#475569; color:#e2e8f0; }
     /* Barre de filtre par classe de contrôle (chips, axe contrôles). */
@@ -101,6 +67,17 @@
     .pager .pg-pages { margin-left:auto; }
     /* Lignes du board : cliquables (double-clic → détail d'admission). */
     tbody tr[data-id] { cursor:pointer; }
+    /* Badge de l'axe contrôles : double-clic = relancer TOUTE la chaîne de
+       contrôles (≠ double-clic ailleurs sur la ligne = détail). `user-select:none`
+       pour que le double-clic ne sélectionne pas le texte au lieu d'agir. */
+    tbody tr[data-id] .ctrl-badge { cursor:pointer; user-select:none; }
+    tbody tr[data-id] .ctrl-badge:hover { outline:2px solid var(--mut); outline-offset:1px; }
+    /* Toast transitoire (confirmation d'une relance de contrôles). */
+    .toast { position:fixed; left:50%; bottom:2.2rem; transform:translateX(-50%);
+             background:var(--card); border:1px solid var(--line); border-radius:8px;
+             padding:.6rem 1rem; font-size:.85rem; box-shadow:0 6px 24px rgba(0,0,0,.45);
+             opacity:0; pointer-events:none; transition:opacity .2s; z-index:60; }
+    .toast.show { opacity:1; }
     /* Modale détail d'admission (ouverte au double-clic, pour le support). */
     .modal-bg { display:none; position:fixed; inset:0; background:rgba(0,0,0,.62);
                 align-items:flex-start; justify-content:center; z-index:50; }
@@ -124,6 +101,7 @@
 <body>
   <header>
     <h1>📡 <span id="t-title"></span></h1>
+    {% include 'partials/monitoring_nav.html' with active='files' %}
     <div class="tabs">
       <button id="tab-live" class="tab active"></button>
       <button id="tab-history" class="tab"></button>
@@ -166,6 +144,7 @@
     <tbody id="rows"></tbody>
   </table>
   <div class="pager" id="pager"></div>
+  <div class="toast" id="toast"></div>
 
   <div class="modal-bg" id="modal-bg">
     <div class="modal">
@@ -180,8 +159,11 @@
     </div>
   </div>
 
+  <script src="{% static 'js/monitoring_shared.js' %}"></script>
   <script>
     // --- Dictionnaire de traductions (défaut : anglais) ------------------------
+    // Le vocabulaire MÉTIER du board fichier reste ici ; les libellés STRUCTURELS
+    // communs (nav croisée) et les formatters viennent de MShared (js partagé).
     const I18N = {
       en: {
         locale: 'en-US',
@@ -216,6 +198,7 @@
         adm_r_passed: 'passed', adm_r_failed: 'failed',
         adm_replay: '↻ Replay admission', adm_replaying: 'Replaying…',
         adm_replayed: 'Replayed → {v}',
+        replay_running: 'Re-running all controls…', replay_done: 'Controls re-run → {cls}',
         ctrl_partner_recognised: 'Partner recognised', ctrl_partner_status: 'Partner status',
         ctrl_channel_authorised: 'Channel authorised', ctrl_verdict: 'Verdict',
         ctrl_feed_recognised: 'Feed recognised', ctrl_filename_grammar: 'Filename grammar',
@@ -269,6 +252,7 @@
         adm_r_passed: 'réussi', adm_r_failed: 'échoué',
         adm_replay: '↻ Rejouer l’admission', adm_replaying: 'Rejeu…',
         adm_replayed: 'Rejoué → {v}',
+        replay_running: 'Relance de tous les contrôles…', replay_done: 'Contrôles relancés → {cls}',
         ctrl_partner_recognised: 'Partenaire reconnu', ctrl_partner_status: 'Statut partenaire',
         ctrl_channel_authorised: 'Canal autorisé', ctrl_verdict: 'Verdict',
         ctrl_feed_recognised: 'Feed reconnu', ctrl_filename_grammar: 'Grammaire du nom',
@@ -321,6 +305,7 @@
         adm_r_passed: 'riuscito', adm_r_failed: 'fallito',
         adm_replay: '↻ Rigioca ammissione', adm_replaying: 'In corso…',
         adm_replayed: 'Rigiocata → {v}',
+        replay_running: 'Ri-esecuzione di tutti i controlli…', replay_done: 'Controlli rieseguiti → {cls}',
         ctrl_partner_recognised: 'Partner riconosciuto', ctrl_partner_status: 'Stato partner',
         ctrl_channel_authorised: 'Canale autorizzato', ctrl_verdict: 'Verdetto',
         ctrl_feed_recognised: 'Feed riconosciuto', ctrl_filename_grammar: 'Grammatica del nome',
@@ -385,32 +370,19 @@
 
     const $ = (id) => document.getElementById(id);
 
+    // Formatters PARTAGÉS (MShared) : mêmes conventions d'affichage sur les trois
+    // boards (décision §5). On passe la locale + les libellés d'unités traduits.
     function fmtBytes(n) {
-      if (n == null) return '—';
       const L = I18N[lang] || I18N.en;
-      if (n < 1024) return n + ' ' + L.bytes_unit;
-      let i = -1;
-      do { n /= 1024; i++; } while (n >= 1024 && i < L.units.length - 1);
-      return n.toLocaleString(L.locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })
-             + ' ' + L.units[i];
+      return MShared.fmtBytes(n, L.locale, L);
     }
     function fmtTime(iso) {
-      if (!iso) return '—';
-      const d = new Date(iso), loc = (I18N[lang] || I18N.en).locale;
-      return d.toLocaleTimeString(loc) + ' ' + d.toLocaleDateString(loc);
+      return MShared.fmtTime(iso, (I18N[lang] || I18N.en).locale);
     }
     function fmtDuration(ms) {
-      if (ms == null) return '—';
-      const loc = (I18N[lang] || I18N.en).locale;
-      const num = (v, d) => v.toLocaleString(loc, { minimumFractionDigits: d, maximumFractionDigits: d });
-      if (ms < 1000) return ms + ' ms';
-      if (ms < 60000) return num(ms / 1000, 2) + ' s';
-      return Math.floor(ms / 60000) + ' min ' + Math.round((ms % 60000) / 1000) + ' s';
+      return MShared.fmtDuration(ms, (I18N[lang] || I18N.en).locale);
     }
-    function esc(s) {
-      return (s == null ? '' : String(s)).replace(/[&<>"]/g,
-        c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-    }
+    const esc = MShared.esc;
     function stateLabel(state) {
       return t('s_' + state) || state;
     }
@@ -442,6 +414,7 @@
       document.documentElement.lang = lang;
       document.title = 'AlfaWay — ' + t('title');
       $('t-title').textContent = t('title');
+      MShared.localizeNav(lang);   // nav croisée partagée (libellés structurels)
       // Libellés des colonnes (dans le span .lbl, la flèche de tri vit dans .arr).
       COLS.forEach(c => {
         const label = (c.id === 'th-stored')
@@ -498,8 +471,8 @@
       // ok / failed / recycled / rejected. `none` = aucun contrôle encore passé.
       const s = r.display_state;
       return (!s || s === 'none')
-        ? `<span class="mc-none">${esc(t('mc_none'))}</span>`
-        : `<span class="badge ds-${esc(s)}">${esc(t('ds_' + s) || s)}</span>`;
+        ? `<span class="ctrl-badge mc-none">${esc(t('mc_none'))}</span>`
+        : `<span class="ctrl-badge badge ds-${esc(s)}">${esc(t('ds_' + s) || s)}</span>`;
     }
 
     // Chips de filtre par classe de monitoring (axe contrôles), ordonnés du plus
@@ -938,10 +911,50 @@
       }
     }
     function closeModal() { $('modal-bg').classList.remove('open'); }
+    // Toast transitoire (confirmation d'une relance de contrôles).
+    let toastTimer = null;
+    function toast(msg) {
+      const el = $('toast'); el.textContent = msg; el.classList.add('show');
+      if (toastTimer) clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+    }
+    // Relance TOUTE la chaîne de contrôles d'un fichier (double-clic sur le badge
+    // de l'axe contrôles). POST idempotent/append-only ; toast + repoll pour
+    // refléter la nouvelle classe (le badge se met à jour, l'action de triage
+    // disparaît si le re-contrôle repasse OK). Couvre l'identification (§1.6) —
+    // remplace le `manage.py run_identification` manuel après un correctif amont.
+    async function replayAllControls(id) {
+      toast(t('replay_running'));
+      try {
+        const res = await fetch(`/monitoring/files/${id}/replay-all/`, {
+          method: 'POST',
+          headers: { 'X-CSRFToken': getCookie('csrftoken') },
+          credentials: 'same-origin',
+        });
+        if (res.redirected || res.status === 403 || res.status === 302) throw new Error(t('err_session'));
+        if (!res.ok) {
+          let msg = 'HTTP ' + res.status;
+          try { const j = await res.json(); if (j.detail) msg = j.detail; } catch (_) {}
+          throw new Error(msg);
+        }
+        const data = await res.json();
+        const cls = data.control_class ? (t('mc_' + data.control_class) || data.control_class) : '—';
+        toast(t('replay_done').replace('{cls}', cls));
+        $('err').style.display = 'none';
+        poll();   // badge/compteurs à jour (identification incluse)
+      } catch (e) {
+        $('toast').classList.remove('show');
+        $('err').textContent = '⚠ ' + e.message;
+        $('err').style.display = 'block';
+      }
+    }
     // Double-clic sur une ligne (délégation : tbody re-rendu via innerHTML).
+    // Sur le badge de l'axe contrôles → relance TOUTE la chaîne ; ailleurs → détail.
     $('rows').addEventListener('dblclick', (e) => {
       const tr = e.target.closest('tr[data-id]');
-      if (tr) openAdmission(tr.dataset.id);
+      if (!tr) return;
+      if (e.target.closest('.ctrl-badge')) replayAllControls(tr.dataset.id);
+      else openAdmission(tr.dataset.id);
     });
     // Délégation : modal-body est re-rendu via innerHTML (le bouton est recréé).
     $('modal-body').addEventListener('click', (e) => {
