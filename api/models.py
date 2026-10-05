@@ -534,7 +534,7 @@ def operator_rejected_ids(file_ids):
                .values_list('file_id', flat=True))
 
 
-def current_control_rollup(file_ids):
+def current_control_rollup(file_ids, exclude_stages=()):
     """Rollup « worst-wins » de l'axe contrôles, par fichier (générique).
 
     Pour chaque fichier, on ne considère que la **dernière passe de chaque stage**
@@ -551,6 +551,9 @@ def current_control_rollup(file_ids):
     ``warning_action`` « partenaire révoqué qui émet » (plus sévère que le verdict
     ``reject``), au lieu de l'enterrer (cf. docs/admission-monitoring-design.md §5/§7).
 
+    ``exclude_stages`` : stages ignorés (ex. ``('load',)`` pour savoir si l'amont
+    du chargement est push sans que l'ancien verdict de chargement ne le masque).
+
     Renvoie ``{file_id: {'monitoring_class', 'stage', 'control', 'result'}}`` ;
     un fichier sans aucun événement est simplement absent du mapping.
     """
@@ -563,6 +566,7 @@ def current_control_rollup(file_ids):
     # passe sont contigus dans cet ordre, jamais entrelacés avec une passe antérieure.
     events = (Event.objects
               .filter(file_id__in=file_ids)
+              .exclude(stage__in=list(exclude_stages))
               .order_by('file_id', 'stage', '-created_at', '-id')
               .values('file_id', 'stage', 'control', 'monitoring_class',
                       'result', 'run_id'))
@@ -714,6 +718,12 @@ class Referential(models.Model):
     class AbsencePolicy(models.TextChoices):
         CANDIDATE = 'candidate', 'Candidate (onboarding)'
         ANOMALY = 'anomaly', 'Anomalie (erreur)'
+        # Flux source : l'entité absente sera créée en aval (loader) → pas bloquant.
+        CREATE = 'create', 'À créer (flux source)'
+
+    class Backend(models.TextChoices):
+        LOCAL = 'local', 'Local (SubFund / ReferentialEntry)'
+        ACTA = 'acta', 'Acta (API, codes externes SOURCE_CODE)'
 
     code = models.CharField(max_length=32, unique=True, db_index=True)
     label = models.CharField(max_length=255)
@@ -722,10 +732,13 @@ class Referential(models.Model):
         default=AbsencePolicy.CANDIDATE,
         help_text=(
             'entité absente du référentiel → candidate (onboarding, '
-            'warning_action) ou anomaly (erreur). Appliquée uniformément par le '
-            "moteur d'identification (§1.6-b)."
+            'warning_action), anomaly (erreur) ou create (flux source : créée en '
+            "aval, push). Appliquée uniformément par le moteur d'identification (§1.6-b)."
         ),
     )
+    # Où vit la vérité : base locale, ou Acta (référentiel maître, via API).
+    backend = models.CharField(
+        max_length=16, choices=Backend.choices, default=Backend.LOCAL)
     sub_tenant = models.ForeignKey(
         SubTenant, on_delete=models.PROTECT, related_name='referentials',
     )

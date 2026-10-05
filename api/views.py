@@ -232,13 +232,18 @@ class SFTPWebhookView(APIView):
         **ici, dans l'orchestrateur**, PAS dans ``file_admission``. L'identification
         n'est lancée que si l'admission aboutit à un verdict **push**
         (``control_class``) ; un recycle/reject n'identifie rien. Garde englobante :
-        ni l'admission ni l'identification ne peuvent affecter la réponse webhook."""
+        ni l'admission ni l'identification ne peuvent affecter la réponse webhook.
+
+        Puis chargement (``acta_nav.maybe_load``) : seulement si la Route porte la
+        stratégie ``acta_nav`` et que l'amont est ``push`` ; ne lève jamais."""
         try:
+            from .acta_nav import maybe_load
             from .admission import file_admission, file_identification
             file_admission(file_id)
             rf = ReceivedFile.objects.get(pk=file_id)
             if rf.control_class == Event.MonitoringClass.PUSH:
                 file_identification(file_id)
+                maybe_load(file_id)
         except Exception:
             logger.exception(
                 'Admission/identification: échec non bloquant pour file %s', file_id)
@@ -1239,6 +1244,8 @@ def replay_all_controls(request, pk):
     if (verdict == VERDICT_ADMIS and ql is not None
             and ql.detail.get('verdict') == VERDICT_QUALIFIED):
         file_identification(rf.pk)   # ne lève jamais ; rematérialise control_class
+        from .acta_nav import maybe_load
+        maybe_load(rf.pk)            # chargement (stratégie de la Route), non bloquant
     rf.refresh_from_db()
     logger.info('Replay ALL controls ReceivedFile %s (%s) -> %s par %s',
                 pk, rf.s3_key, verdict, request.user)

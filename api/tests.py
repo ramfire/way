@@ -1709,3 +1709,256 @@ class ExpectedFeedTests(TestCase):
         only = self._feed(date='2020-01-08', verdict='unanchored')
         self.assertEqual(only['returned'], 1)
         self.assertEqual(only['rows'][0]['verdict'], 'unanchored')
+
+
+class IdentificationActaBackendTests(TestCase):
+    """Référentiel ``backend='acta'`` : l'existence du compartiment se lit dans Acta
+    (codes SOURCE_CODE de la source AlfaWay), le client HTTP est simulé."""
+
+    def setUp(self):
+        from .models import Referential
+        self.t = default_tenant()
+        self.ref = Referential.objects.create(
+            code='acta_fund', label='Fonds Acta', sub_tenant=self.t,
+            backend=Referential.Backend.ACTA,
+            absence_policy=Referential.AbsencePolicy.CREATE)
+
+    def _qualify(self):
+        from .models import IdentificationProfile, IdentificationRule
+        p = IdentificationProfile.objects.create(
+            file_type='lu_po_nav', label='LU_PO_NAV', sub_tenant=self.t)
+        IdentificationRule.objects.create(
+            profile=p, field='sub_fund', referential=self.ref,
+            role=IdentificationRule.Role.PARTITION, required=True, sub_tenant=self.t)
+        IdentificationRule.objects.create(
+            profile=p, field='valuation_date', referential=None,
+            role=IdentificationRule.Role.AXIS, required=True, sub_tenant=self.t)
+        enrol('way')
+        feed = add_feed('way', subfolder='', filename_regex=r'.*\.csv',
+                        route=add_route('way'))
+        rf = make_file(username='way', s3_key='/LU_PO_NAV_20261002.csv',
+                       path='way/LU_PO_NAV_20261002.csv')
+        file_admission(rf.pk)
+        feed.layout = {'delimiter': ';', 'has_header': False, 'columns': [
+            {'by': 'position', 'index': 0, 'as': 'sub_fund'},
+            {'by': 'position', 'index': 1, 'as': 'valuation_date'}]}
+        feed.identification_profile = p
+        feed.save()
+        return rf
+
+    def _identify(self, rf, content, codes=None, error=None):
+        from .acta import ActaError
+        from .admission import file_identification
+        with patch('api.admission.get_s3_client', return_value=_fake_s3(content)), \
+                patch('api.acta.ActaClient') as client:
+            if error:
+                client.return_value.source_codes.side_effect = ActaError(error)
+            else:
+                client.return_value.source_codes.return_value = codes or {}
+            file_identification(rf.pk)
+
+    def _partition_events(self, rf):
+        return {e.detail.get('value'): e for e in
+                Event.objects.filter(file=rf, stage='identification')
+                if e.detail.get('field') == 'sub_fund'}
+
+    def test_known_in_acta_is_push_with_uid(self):
+        rf = self._qualify()
+        self._identify(rf, b'FX0001;20261001\n', codes={'FX0001': 'uid-1'})
+        ev = self._partition_events(rf)['FX0001']
+        self.assertEqual(ev.result, Event.Result.PASSED)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+        self.assertEqual(ev.detail['acta_uid'], 'uid-1')
+
+    def test_absent_with_create_policy_is_push_to_create(self):
+        rf = self._qualify()
+        self._identify(rf, b'FX0001;20261001\nFX0002;20261001\n',
+                       codes={'FX0001': 'uid-1'})
+        ev = self._partition_events(rf)['FX0002']
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+        self.assertEqual(ev.detail['reason'], 'to_create_in_acta')
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
+
+    def test_absent_with_candidate_policy_is_warning(self):
+        from .models import Referential
+        self.ref.absence_policy = Referential.AbsencePolicy.CANDIDATE
+        self.ref.save()
+        rf = self._qualify()
+        self._identify(rf, b'FX0009;20261001\n', codes={})
+        ev = self._partition_events(rf)['FX0009']
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.WARNING_ACTION)
+        self.assertEqual(ev.detail['reason'], 'new_entity_candidate')
+
+    def test_acta_unreachable_is_recycle(self):
+        rf = self._qualify()
+        self._identify(rf, b'FX0001;20261001\n', error='connexion refusée')
+        ev = Event.objects.get(file=rf, stage='identification', control='acta_lookup')
+        self.assertEqual(ev.result, Event.Result.FAILED)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.RECYCLE)
+        self.assertEqual(ev.detail['reason'], 'acta_unreachable')
+        self.assertEqual(self._partition_events(rf), {})   # pas de verdict fonds
+
+
+class ActaNavLoaderTests(TestCase):
+    """Loader APINAV (api/acta_nav.py) : plan, taux au sens Acta, écriture API."""
+
+    NAMES = ['Fund_code', 'Fund_name', 'Fund_currency', 'Share_code', 'Share_type',
+             'ISIN_code', 'Share_currency', 'NAV_date', 'NAV_Type', 'Price_share_CCY',
+             'FX_Rate', 'Nb_of_outstanding_shares', 'TNA_of_the_share_in_share_CCY',
+             'TNA_of_the_share_in_fund_CCY']
+    CCYS = {'EUR': {'quote_priority': 100, 'nav_per_unit_decimals': 2, 'minor_units': 2},
+            'USD': {'quote_priority': 80, 'nav_per_unit_decimals': 2, 'minor_units': 2}}
+    # FX0001 (USD) : classe EUR, taux fichier 0.887705 EUR/USD → Acta EURUSD 1.1265.
+    CONTENT = (b'FX0001;Fonds 1;USD;900001;DH2;XX0000000010;EUR;20261001;O;62.774;'
+               b'.887705;4466565.97;280383090.41;315851551.35\n'
+               b'FX0001;Fonds 1;USD;900002;C1;XX0000000028;USD;20260930;O;10;1;100;1000;1000\n')
+
+    def _file(self):
+        enrol('way')
+        feed = add_feed('way', subfolder='', filename_regex=r'.*\.csv',
+                        route=add_route('way'))
+        rf = make_file(username='way', s3_key='/LU_PO_NAV_20261002.csv',
+                       path='way/LU_PO_NAV_20261002.csv')
+        file_admission(rf.pk)
+        feed.layout = {'format': 'csv', 'delimiter': ';',
+                       'header': {'present': False, 'columns': self.NAMES}}
+        feed.save()
+        return rf, feed
+
+    def _client(self, known=None, ingest_status='created'):
+        from unittest.mock import MagicMock
+        c = MagicMock()
+        c.source_codes.return_value = known or {}
+        c.currencies.return_value = self.CCYS
+        c.share_classes_of.return_value = set()
+        uids = iter(f'uid-{i}' for i in range(100))
+
+        def send(method, path, payload):
+            if path == '/api/v1/entities/':
+                return 201, {'uid': next(uids)}
+            if path == '/api/v1/ingest/':
+                return 200, {'counts': {ingest_status: len(payload['records'])},
+                             'results': [{'status': ingest_status, 'index': i}
+                                         for i, _ in enumerate(payload['records'])]}
+            return 201, {}
+        c.send_json.side_effect = send
+        return c
+
+    def _plan(self, known=None):
+        from .acta_nav import build_plan
+        rf, feed = self._file()
+        with patch('api.parsing.get_s3_client', return_value=_fake_s3(self.CONTENT)):
+            return build_plan(rf, feed, self._client(known))
+
+    def test_plan_inverts_fx_when_class_is_base_currency(self):
+        plan = self._plan()
+        nav = plan.navs[0]
+        self.assertEqual(nav['fx_rate'], '1.1265')
+        self.assertEqual(nav['nav_type'], 'OFFICIAL')
+        self.assertEqual(nav['nav_date'], '2026-10-01')
+        self.assertEqual(nav['fund'], {'code': 'FX0001'})
+        self.assertEqual(plan.warnings, [])
+
+    def test_fund_valid_from_is_earliest_nav_date(self):
+        plan = self._plan()
+        self.assertEqual(plan.funds['FX0001']['valid_from'], '2026-09-30')
+        self.assertEqual(len(plan.classes), 2)
+
+    def test_known_codes_are_not_recreated(self):
+        plan = self._plan(known={'FX0001': 'f-uid', '900001': 'c-uid'})
+        self.assertEqual(plan.funds['FX0001']['uid'], 'f-uid')
+        self.assertEqual(plan.classes['900001']['uid'], 'c-uid')
+        self.assertIsNone(plan.classes['900002']['uid'])
+
+    def test_load_creates_entities_links_then_ingests(self):
+        from .acta_nav import load_file
+        rf, _ = self._file()
+        client = self._client()
+        with patch('api.parsing.get_s3_client', return_value=_fake_s3(self.CONTENT)):
+            _, res = load_file(rf.pk, client=client)
+        self.assertEqual(len(res['created']), 3)          # 1 fonds + 2 classes
+        self.assertEqual(len(res['links']), 2)
+        self.assertEqual(res['nav_counts'], {'created': 2})
+        paths = [c.args[1] for c in client.send_json.call_args_list]
+        self.assertLess(paths.index('/api/v1/entity-relationships/'),
+                        paths.index('/api/v1/ingest/'))
+        ev = Event.objects.get(file=rf, stage='load', control='acta_nav')
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+
+    def test_rejected_navs_are_warning_action(self):
+        from .acta_nav import load_file
+        rf, _ = self._file()
+        with patch('api.parsing.get_s3_client', return_value=_fake_s3(self.CONTENT)):
+            load_file(rf.pk, client=self._client(ingest_status='rejected'))
+        ev = Event.objects.get(file=rf, stage='load', control='acta_nav')
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.WARNING_ACTION)
+        self.assertEqual(len(ev.detail['rejected']), 2)
+
+    def test_external_code_refused_rolls_back_entity(self):
+        from .acta_nav import load_file
+        rf, _ = self._file()
+        client = self._client()
+        base = client.send_json.side_effect
+
+        def send(method, path, payload):
+            if path == '/api/v1/entity-external-codes/':
+                return 400, {'code': ['déjà utilisé']}
+            return base(method, path, payload)
+        client.send_json.side_effect = send
+        with patch('api.parsing.get_s3_client', return_value=_fake_s3(self.CONTENT)):
+            _, res = load_file(rf.pk, client=client)
+        self.assertEqual(res['created'], [])
+        self.assertEqual(res['failures'][0]['rolled_back'], 'uid-0')
+        self.assertIn(('DELETE', '/api/v1/entities/uid-0/', None),
+                      [c.args for c in client.send_json.call_args_list])
+
+    # --- chaînage automatique (maybe_load) ----------------------------------
+    def _routed_file(self, strategy='acta_nav'):
+        rf, feed = self._file()
+        feed.route.strategy = strategy
+        feed.route.save()
+        with patch('api.parsing.get_s3_client', return_value=_fake_s3(self.CONTENT)):
+            file_admission(rf.pk)      # rejoue jusqu'au parsing → amont push
+        return rf
+
+    def test_maybe_load_runs_when_strategy_and_upstream_push(self):
+        from .acta_nav import maybe_load
+        rf = self._routed_file()
+        with patch('api.acta_nav.load_file', return_value=('ok', None)) as lf:
+            self.assertEqual(maybe_load(rf.pk), ('ok', None))
+        lf.assert_called_once_with(rf.pk)
+
+    def test_maybe_load_skips_other_strategy(self):
+        from .acta_nav import maybe_load
+        rf = self._routed_file(strategy=None)
+        with patch('api.acta_nav.load_file') as lf:
+            self.assertIsNone(maybe_load(rf.pk))
+        lf.assert_not_called()
+
+    def test_maybe_load_skips_when_upstream_not_push(self):
+        from .acta_nav import maybe_load
+        rf = self._routed_file()
+        Event.objects.create(file=rf, stage='identification', control='x',
+                             result=Event.Result.FAILED, sub_tenant_id=rf.sub_tenant_id,
+                             monitoring_class=Event.MonitoringClass.WARNING_ACTION)
+        with patch('api.acta_nav.load_file') as lf:
+            self.assertIsNone(maybe_load(rf.pk))
+        lf.assert_not_called()
+
+    def test_maybe_load_ignores_previous_load_rejection(self):
+        from .acta_nav import maybe_load
+        rf = self._routed_file()
+        Event.objects.create(file=rf, stage='load', control='acta_nav',
+                             result=Event.Result.FAILED, sub_tenant_id=rf.sub_tenant_id,
+                             monitoring_class=Event.MonitoringClass.WARNING_ACTION)
+        refresh_control_class([rf.pk])
+        with patch('api.acta_nav.load_file', return_value=('ok', None)) as lf:
+            maybe_load(rf.pk)
+        lf.assert_called_once_with(rf.pk)
+
+    def test_maybe_load_never_raises(self):
+        from .acta_nav import maybe_load
+        rf = self._routed_file()
+        with patch('api.acta_nav.load_file', side_effect=RuntimeError('boom')):
+            self.assertIsNone(maybe_load(rf.pk))

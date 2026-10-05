@@ -314,6 +314,7 @@ STAGE_IDENTIFICATION = 'identification'
 # Noms de contrôles « globaux fichier » (non scopés partition ; board §1.6-c).
 CTRL_PROFILE_RESOLUTION = 'profile_resolution'
 CTRL_EXTRACTION = 'extraction'
+CTRL_ACTA_LOOKUP = 'acta_lookup'
 
 
 def _emit_identification(rf, control, result, mclass, detail):
@@ -657,6 +658,45 @@ def _resolve_partition(rf, rule, raw_value, sub_fund_id, pkey, feed):
          'referential': referential.code, 'reason': reason})
 
 
+def _resolve_partition_acta(rf, rule, raw_value, acta_codes, pkey):
+    """Verdict de la rule ``partition`` quand le référentiel vit dans **Acta**.
+
+    Présent = le code est un ``SOURCE_CODE`` courant de la source AlfaWay dans Acta
+    (``detail.acta_uid``). Absent → selon l'``absence_policy`` : ``create`` (flux
+    source, l'entité sera créée en aval par le loader) = **push**, motif
+    ``to_create_in_acta`` ; sinon candidate/anomaly comme en local."""
+    control = _ident_control(rule.field, raw_value, pkey)
+    referential = rule.referential
+    base = {'field': rule.field, 'role': rule.role, 'partition_key': pkey,
+            'referential': referential.code}
+
+    if raw_value in (None, ''):
+        _emit_identification(
+            rf, control, Event.Result.FAILED, Event.MonitoringClass.WARNING_ACTION,
+            {**base, 'reason': 'missing_required_field'})
+        return
+
+    uid = acta_codes.get(str(raw_value))
+    if uid is not None:
+        _emit_identification(
+            rf, control, Event.Result.PASSED, Event.MonitoringClass.PUSH,
+            {**base, 'value': raw_value, 'acta_uid': uid})
+        return
+
+    if referential.absence_policy == Referential.AbsencePolicy.CREATE:
+        _emit_identification(
+            rf, control, Event.Result.PASSED, Event.MonitoringClass.PUSH,
+            {**base, 'value': raw_value, 'external_code': raw_value,
+             'reason': 'to_create_in_acta'})
+        return
+    reason = ('new_entity_candidate'
+              if referential.absence_policy == Referential.AbsencePolicy.CANDIDATE
+              else 'unknown_entity')
+    _emit_identification(
+        rf, control, Event.Result.FAILED, Event.MonitoringClass.WARNING_ACTION,
+        {**base, 'value': raw_value, 'external_code': raw_value, 'reason': reason})
+
+
 def file_identification(file_id):
     """Identifie un fichier (§1.6-b/b2b) : regroupe ses records par partition
     ``(sub_fund, valuation_date)`` et résout chaque groupe.
@@ -732,6 +772,29 @@ def _run_identification(file_id):
         resolved = {raw: _resolve_subfund_id(raw, feed, rf.sub_tenant_id)
                     for raw in {rec.get(part_field) for rec in records}}
 
+        # Référentiel maître externe (Acta) : l'existence se lit dans Acta (codes
+        # SOURCE_CODE de la source AlfaWay), lus UNE fois pour le fichier. Acta
+        # injoignable → recycle (rejouable), jamais un « inconnu » silencieux.
+        acta_codes = None
+        if (part_rule and part_rule.referential
+                and part_rule.referential.backend == Referential.Backend.ACTA):
+            from .acta import ActaClient, ActaError
+            try:
+                acta_codes = ActaClient().source_codes(settings.ACTA_SOURCE)
+            except ActaError as e:
+                _emit_identification(
+                    rf, CTRL_ACTA_LOOKUP, Event.Result.FAILED,
+                    Event.MonitoringClass.RECYCLE,
+                    {'reason': 'acta_unreachable', 'error': str(e)[:500],
+                     'partition_key': {'sub_fund_id': None, 'sub_fund_value': None,
+                                       'valuation_date': None, 'feed_id': feed.id}})
+                return
+            _emit_identification(
+                rf, CTRL_ACTA_LOOKUP, Event.Result.PASSED, Event.MonitoringClass.PUSH,
+                {'source': settings.ACTA_SOURCE, 'codes': len(acta_codes),
+                 'partition_key': {'sub_fund_id': None, 'sub_fund_value': None,
+                                   'valuation_date': None, 'feed_id': feed.id}})
+
         # --- GROUP BY (SubFund CANONIQUE, valuation_date) -----------------------
         # Clé de groupe sur l'identité canonique ; une valeur non résolue forme sa
         # propre partition candidate (sentinelle ``('raw', brut)`` pour que deux
@@ -754,7 +817,9 @@ def _run_identification(file_id):
             pkey = {'sub_fund_id': g['sub_fund_id'], 'sub_fund_value': g['raw'],
                     'valuation_date': vd, 'feed_id': feed.id}
             # 1) partition : résolution alias→canonique (UNE fois par groupe).
-            if part_rule:
+            if part_rule and acta_codes is not None:
+                _resolve_partition_acta(rf, part_rule, g['raw'], acta_codes, pkey)
+            elif part_rule:
                 _resolve_partition(rf, part_rule, g['raw'], g['sub_fund_id'],
                                    pkey, feed)
             # 2) axis : cohérence intra-record de la/les date(s) (UNE fois par groupe).

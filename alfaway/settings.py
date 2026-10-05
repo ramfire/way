@@ -165,6 +165,15 @@ SCW_BUCKET_PREFIX = config('SCW_BUCKET_PREFIX', default='alfaway')
 SFTPGO_WEBHOOK_TOKEN = config('SFTPGO_WEBHOOK_TOKEN', default='')
 INTERNAL_TOKEN = config('INTERNAL_TOKEN', default='')
 
+# Acta (référentiel d'entités maître) — compte de service, session Django (cf. api/acta.py)
+ACTA_URL = config('ACTA_URL', default='')
+ACTA_HOST = config('ACTA_HOST', default='acta.algotech.lu')
+ACTA_USER = config('ACTA_USER', default='')
+ACTA_PASSWORD = config('ACTA_PASSWORD', default='')
+ACTA_TIMEOUT = config('ACTA_TIMEOUT', default=10, cast=int)
+# Source sous laquelle AlfaWay pose ses codes externes (SOURCE_CODE) dans Acta.
+ACTA_SOURCE = config('ACTA_SOURCE', default='ALFAWAY')
+
 # Admission — règles MINIMALES d'autorisation de canal/chemin par partenaire.
 # Mapping {username: [prefixes de chemin autorisés]}. **Absence de règle pour un
 # partenaire ⇒ tout autorisé** (l'admission est de l'observation, pas un blocage).
