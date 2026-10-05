@@ -19,8 +19,10 @@ fonds » ; Acta attend la **cotation de marché** (devise de base = plus haute
 ``quote_priority``) et choisit × ou ÷ lui-même. Classe base → Acta multiplie →
 taux = 1 / taux fichier ; sinon Acta divise → taux = taux fichier.
 
-``dry_run`` n'écrit rien (ni Acta ni Event) et rejoue localement les contrôles
-arithmétiques d'Acta (``entities/nav_import._check_arithmetic``).
+``dry_run`` n'écrit rien (ni Acta ni Event). AlfaWay ne fait **aucun contrôle
+métier** (arithmétique VNI/TNA, cohérence de taux…) : c'est le rôle de Trail ; le
+plan ne vérifie que la forme (champs présents, nombres et dates lisibles, devises
+connues d'Acta).
 """
 import logging
 from collections import OrderedDict
@@ -74,7 +76,6 @@ class Plan:
     classes: dict = field(default_factory=OrderedDict)   # share_code → attrs
     navs: list = field(default_factory=list)              # records SDF
     errors: list = field(default_factory=list)            # (ligne, motif) bloquants
-    warnings: list = field(default_factory=list)          # contrôles Acta rejoués
 
 
 def _rows(rf, feed):
@@ -115,11 +116,11 @@ def build_plan(rf, feed, client, known_codes=None, currencies=None):
 
         # Taux au sens Acta (cf. docstring).
         if fund_ccy == class_ccy:
-            fx, method = Decimal(1), 'x'
+            fx = Decimal(1)
         elif ccys[class_ccy]['quote_priority'] > ccys[fund_ccy]['quote_priority']:
-            fx, method = (Decimal(1) / fx_file).quantize(Decimal('0.000001')), 'x'
+            fx = (Decimal(1) / fx_file).quantize(Decimal('0.000001'))
         else:
-            fx, method = fx_file, '/'
+            fx = fx_file
 
         f = plan.funds.setdefault(fund, {
             'code': fund, 'name': r.get('Fund_name', '').strip(), 'currency': fund_ccy,
@@ -133,8 +134,6 @@ def build_plan(rf, feed, client, known_codes=None, currencies=None):
         c['valid_from'] = min(c['valid_from'], nav_date)
         f['valid_from'] = min(f['valid_from'], c['valid_from'])
 
-        _check_arithmetic(plan, n, ccys, class_ccy, units, nav, amt_class, amt_fund,
-                          fx, method)
         plan.navs.append({
             'record_type': 'SHARE_CLASS_NAV',
             'source_record_id': f'{share}-{nav_date}-{nav_type}',
@@ -146,24 +145,6 @@ def build_plan(rf, feed, client, known_codes=None, currencies=None):
             'total_nav_fund_ccy': _plain(amt_fund), 'fx_rate': _plain(fx),
         })
     return plan
-
-
-def _check_arithmetic(plan, n, ccys, class_ccy, units, nav, amt_class, amt_fund, fx,
-                      method):
-    """Rejeu local (indicatif) des contrôles d'Acta, sans surcharge par fonds."""
-    c = ccys[class_ccy]
-    half_nav = Decimal(5).scaleb(-(c.get('nav_per_unit_decimals', 2) + 1))
-    half_amt = Decimal(5).scaleb(-(c.get('minor_units', 2) + 1))
-    tol = units * half_nav + half_amt
-    if abs(units * nav - amt_class) > tol:
-        plan.warnings.append((n, f'parts×VNI={units * nav} ≠ TNA classe {amt_class} (tol {tol})'))
-    rate_err = Decimal(5).scaleb(-(max(0, -fx.as_tuple().exponent) + 1))
-    if method == 'x':
-        conv, spread = amt_class * fx, amt_class * rate_err + half_amt * fx
-    else:
-        conv, spread = amt_class / fx, amt_class * rate_err / (fx * fx) + half_amt / fx
-    if abs(conv - amt_fund) > half_amt + spread:
-        plan.warnings.append((n, f'TNA classe {method} taux={conv:.2f} ≠ TNA fonds {amt_fund}'))
 
 
 # --- écriture ---------------------------------------------------------------
@@ -277,8 +258,6 @@ def load_file(file_id, dry_run=False, client=None):
         'classes_total': len(plan.classes),
         'classes_to_create': sum(1 for c in plan.classes.values() if c['uid'] is None),
         'navs': len(plan.navs), 'errors': plan.errors[:20],
-        'local_check_warnings': plan.warnings[:20],
-        'local_check_warning_count': len(plan.warnings),
     }
     if dry_run:
         return summary, plan

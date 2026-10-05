@@ -1858,7 +1858,6 @@ class ActaNavLoaderTests(TestCase):
         self.assertEqual(nav['nav_type'], 'OFFICIAL')
         self.assertEqual(nav['nav_date'], '2026-10-01')
         self.assertEqual(nav['fund'], {'code': 'FX0001'})
-        self.assertEqual(plan.warnings, [])
 
     def test_fund_valid_from_is_earliest_nav_date(self):
         plan = self._plan()
