@@ -339,6 +339,7 @@ MONITORING_FEED_MAX = 500    # borne dure (?limit=) : protège le payload / la D
 # ils sont calculés en base via annotations (voir `monitoring_feed`) pour que le
 # tri porte sur TOUTE la table et pas seulement sur la page renvoyée.
 SORT_KEYS = frozenset({
+    'id',        # PK (BigAutoField) : ordre d'ingest, exposé comme 1re colonne du board
     'state', 'filename', 'username', 'protocol', 'ip',
     'file_size', 'elapsed_ms', 'received_at', 'stored_at',
     'control',   # colonne « Contrôles » : tri par SÉVÉRITÉ (pas alphabétique)
@@ -540,6 +541,7 @@ def monitoring_feed(request):
     direction = 'desc' if request.GET.get('dir') == 'desc' else 'asc'
     if sort in SORT_KEYS:
         source = {
+            'id': F('id'),
             'state': F('state'),
             'filename': F('_filename'),
             'username': Lower('username'),

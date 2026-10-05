@@ -16,6 +16,7 @@
             padding:.35rem .7rem; font-size:.85rem; }
     .stat b { font-size:1.05rem; }
     td.file { font-family: ui-monospace, monospace; }
+    td.fid { font-family: ui-monospace, monospace; color:var(--mut); }
     /* Axe STOCKAGE — badges d'état propres au board fichier (distincts de l'échelle
        de sévérité ; voir design §8). */
     .receiving { background:#1e3a8a; color:#bfdbfe; }
@@ -46,6 +47,8 @@
     button.act, button.rem-act { padding:.2rem .55rem; font-size:.76rem; }
     a.dl { color:#7dd3fc; text-decoration:none; }
     a.dl:hover { text-decoration:underline; }
+    a.ev { color:#a5b4fc; text-decoration:none; cursor:pointer; }
+    a.ev:hover { text-decoration:underline; }
     tr.new td { animation:flash 2.5s ease-out; }
     @keyframes flash { from{background:#3730a3} to{background:transparent} }
     tr.row-failed td { background:rgba(239,68,68,.14); }
@@ -128,6 +131,7 @@
   <table>
     <thead>
       <tr id="head">
+        <th id="th-id" class="sortable" data-key="id"><span class="lbl"></span><span class="arr"></span></th>
         <th id="th-state" class="sortable" data-key="state"><span class="lbl"></span><span class="arr"></span></th>
         <th id="th-file" class="sortable" data-key="filename"><span class="lbl"></span><span class="arr"></span></th>
         <th id="th-user" class="sortable" data-key="username"><span class="lbl"></span><span class="arr"></span></th>
@@ -170,6 +174,7 @@
         title: 'Received files monitoring',
         tab_live: 'Live', tab_history: 'History',
         total: 'Total', receiving: 'receiving', stored: 'stored', failed: 'failed',
+        th_id: 'ID',
         th_state: 'Status', th_file: 'File', th_user: 'User', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Size', th_transfer: 'Transfer', th_received: 'Received',
         th_stored: 'Stored', th_archived: 'Archived', th_controls: 'Controls',
@@ -217,6 +222,7 @@
         updated: 'updated {s}s ago',
         loading: 'Loading…', empty: 'No files received.', empty_history: 'History is empty.',
         empty_filter: 'No files match this filter.',
+        events: '📋 Events',
         download: '⬇ Download', archive: '🗄 Archive', restore: '↩ Restore',
         err_session: 'session expired — sign in to the admin again',
         // libellés d'état (clé stable r.state)
@@ -229,6 +235,7 @@
         title: 'Monitoring fichiers reçus',
         tab_live: 'Live', tab_history: 'Historique',
         total: 'Total', receiving: 'réception', stored: 'stockés', failed: 'échecs',
+        th_id: 'ID',
         th_state: 'État', th_file: 'Fichier', th_user: 'Utilisateur', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Taille', th_transfer: 'Transfert', th_received: 'Reçu',
         th_stored: 'Stocké', th_archived: 'Archivé', th_controls: 'Contrôles',
@@ -271,6 +278,7 @@
         updated: 'màj il y a {s}s',
         loading: 'Chargement…', empty: 'Aucun fichier reçu.', empty_history: 'Historique vide.',
         empty_filter: 'Aucun fichier ne correspond à ce filtre.',
+        events: '📋 Événements',
         download: '⬇ Télécharger', archive: '🗄 Archiver', restore: '↩ Restaurer',
         err_session: 'session expirée — reconnecte-toi à l’admin',
         s_receiving: 'réception', s_stored: 'stocké', s_failed: 'échec',
@@ -282,6 +290,7 @@
         title: 'Monitoraggio file ricevuti',
         tab_live: 'Live', tab_history: 'Cronologia',
         total: 'Totale', receiving: 'in ricezione', stored: 'archiviati', failed: 'falliti',
+        th_id: 'ID',
         th_state: 'Stato', th_file: 'File', th_user: 'Utente', th_proto: 'Proto',
         th_ip: 'IP', th_size: 'Dimensione', th_transfer: 'Trasferimento', th_received: 'Ricevuto',
         th_stored: 'Archiviato', th_archived: 'Archiviato il', th_controls: 'Controlli',
@@ -324,6 +333,7 @@
         updated: 'agg. {s}s fa',
         loading: 'Caricamento…', empty: 'Nessun file ricevuto.', empty_history: 'Cronologia vuota.',
         empty_filter: 'Nessun file corrisponde a questo filtro.',
+        events: '📋 Eventi',
         download: '⬇ Scarica', archive: '🗄 Archivia', restore: '↩ Ripristina',
         err_session: 'sessione scaduta — accedi di nuovo all’admin',
         s_receiving: 'in ricezione', s_stored: 'archiviato', s_failed: 'fallito',
@@ -348,6 +358,7 @@
     // Colonnes triables : id du <th>, clé de tri (champ de la ligne), clé i18n du libellé.
     // 'th-stored' a un libellé spécial (Stored en Live / Archivé en History) → i18n null.
     const COLS = [
+      { id:'th-id',       key:'id',         i18n:'th_id' },
       { id:'th-state',    key:'state',      i18n:'th_state' },
       { id:'th-file',     key:'filename',   i18n:'th_file' },
       { id:'th-user',     key:'username',   i18n:'th_user' },
@@ -512,7 +523,7 @@
       if (!rows.length) {
         const msg = stateFilter ? t('empty_filter')
           : (view === 'history') ? t('empty_history') : t('empty');
-        $('rows').innerHTML = `<tr><td colspan="11" class="empty">${msg}</td></tr>`;
+        $('rows').innerHTML = `<tr><td colspan="12" class="empty">${msg}</td></tr>`;
         return;
       }
       $('rows').innerHTML = rows.map(r => {
@@ -520,6 +531,11 @@
         const cls = [isNew ? 'new' : '', r.state === 'failed' ? 'row-failed' : '']
           .filter(Boolean).join(' ');
         const acts = [];
+        // Lien « Events » : ouvre la trace de contrôles du fichier (modale). TOUJOURS
+        // disponible — accès explicite aux événements quel que soit l'état affiché
+        // (ok/recycled/rejected inclus), là où le double-clic sur le badge ne fait que
+        // relancer les contrôles (sans effet visible sur un état terminal).
+        acts.push(`<a class="ev" data-events="${r.id}">${t('events')}</a>`);
         if (r.downloadable)
           acts.push(`<a class="dl" href="/files/${r.id}/download/">${t('download')}</a>`);
         if (view === 'live' && r.can_archive)
@@ -543,6 +559,7 @@
         const lastTime = (view === 'history')
           ? (r.archived_at || r.deleted_at || r.stored_at) : r.stored_at;
         return `<tr class="${cls}" data-id="${r.id}">
+          <td class="fid">#${esc(r.id)}</td>
           <td><span class="badge ${esc(r.state)}">${esc(stateLabel(r.state))}</span></td>
           <td class="file" title="${esc(r.path)}">${esc(r.filename)}</td>
           <td>${esc(r.username)}</td>
@@ -647,7 +664,7 @@
       seen.clear(); firstLoad = true;       // pas de « flash nouveau » au changement de vue
       applyStaticText();
       renderTabs(lastData);
-      $('rows').innerHTML = `<tr><td colspan="11" class="empty">${t('loading')}</td></tr>`;
+      $('rows').innerHTML = `<tr><td colspan="12" class="empty">${t('loading')}</td></tr>`;
       poll();
     }
 
@@ -769,6 +786,8 @@
     }
     // Délégation : les lignes sont re-rendues via innerHTML, on écoute le tbody.
     $('rows').addEventListener('click', (e) => {
+      const evl = e.target.closest('a.ev');
+      if (evl) { openAdmission(evl.dataset.events); return; }
       const rem = e.target.closest('button.rem-act');
       if (rem) { doRemediate(rem.dataset.rem, rem.dataset.id); return; }
       const btn = e.target.closest('button.act');
@@ -1043,7 +1062,7 @@
 
     applyStaticText();
     renderTabs(null);
-    $('rows').innerHTML = `<tr><td colspan="11" class="empty">${t('loading')}</td></tr>`;
+    $('rows').innerHTML = `<tr><td colspan="12" class="empty">${t('loading')}</td></tr>`;
     poll();
     schedule();
     setInterval(tickAgo, 1000);
