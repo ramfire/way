@@ -23,5 +23,15 @@ class Command(BaseCommand):
         self.stdout.write(json.dumps(summary, ensure_ascii=False, indent=1, default=str))
         if res is not None and not opts['dry_run']:
             self.stdout.write(json.dumps(
-                {k: (v if k in ('nav_counts',) else len(v)) for k, v in res.items()},
+                {k: _brief(k, v) for k, v in res.items()},
                 ensure_ascii=False))
+
+
+def _brief(key, value):
+    """Résumé d'un champ du résultat : listes → leur taille, compteurs tels quels."""
+    if key == 'journal' and value:
+        return {k: value.get(k) for k in ('imports', 'rows', 'rejected', 'mismatch', 'unavailable')
+                if k in value}
+    if key == 'nav_counts' or value is None or isinstance(value, int):
+        return value
+    return len(value)

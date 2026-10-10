@@ -16,8 +16,10 @@ classe, leurs codes externes ``SOURCE_CODE`` (source ``ACTA_SOURCE``) et le lien
      Le lot porte ``file_ref`` (``alfaway:<id>:<path>``) et chaque VNI sa ligne
      d'origine (``source_line_no``) ; Acta les trace dans son journal
      (``/api/v1/nav-imports/``), **relu** après l'ingest : imports créés, NAV
-     reçues / stockées / inchangées / refusées, lignes refusées et motif. Écart entre
-     NAV envoyées et journalisées → ``warning_action`` (``acta_journal_mismatch``).
+     reçues / stockées / inchangées / refusées, lignes refusées et motif ;
+  4. **compte** (dernier contrôle, ``acta_count``) : chaque VNI envoyée doit revenir
+     dans la réponse de l'API (``api_count_mismatch`` sinon) et, si le journal a été
+     relu, y être journalisée (``acta_journal_mismatch``) → ``warning_action``.
 
 Taux de change : le fichier donne « devise de la part pour 1 unité de devise du
 fonds » ; Acta attend la **cotation de marché** (devise de base = plus haute
@@ -47,6 +49,7 @@ STAGE = 'load'
 CTRL_ENTITIES = 'acta_entities'
 CTRL_NAV = 'acta_nav'
 CTRL_PLAN = 'acta_plan'
+CTRL_COUNT = 'acta_count'
 
 NAV_TYPES = {'O': 'OFFICIAL', 'E': 'ESTIMATED', 'T': 'TECHNICAL'}
 INGEST_BATCH = 1000
@@ -247,14 +250,21 @@ def apply_plan(client, plan, file_ref=None):
     envelope = {'schema_version': '1', 'source': settings.ACTA_SOURCE}
     if file_ref:
         envelope['file_ref'] = file_ref
+    returned, missing = 0, []
     for i in range(0, len(plan.navs), INGEST_BATCH):
+        records = plan.navs[i:i + INGEST_BATCH]
         status, body = client.send_json('POST', '/api/v1/ingest/', {
-            **envelope, 'records': plan.navs[i:i + INGEST_BATCH]})
+            **envelope, 'records': records})
         if status != 200:
             raise ActaError(f'ingest refusé (HTTP {status}) : {str(body)[:500]}')
         for k, v in (body.get('counts') or {}).items():
             counts[k] = counts.get(k, 0) + v
-        rejected += [r for r in body.get('results') or [] if r.get('status') == 'rejected']
+        results = body.get('results') or []
+        rejected += [r for r in results if r.get('status') == 'rejected']
+        # Compte au retour de l'API : un résultat par enregistrement envoyé.
+        returned += len(results)
+        echoed = {r.get('source_record_id') for r in results}
+        missing += [r['source_record_id'] for r in records if r['source_record_id'] not in echoed]
     # Relecture du journal Acta : jamais bloquante (Acta antérieur à 0020, réseau…).
     journal = None
     if after_id is not None:
@@ -263,7 +273,23 @@ def apply_plan(client, plan, file_ref=None):
         except ActaError as e:
             journal = {'unavailable': str(e)[:300]}
     return {'created': created, 'links': links, 'failures': failures,
-            'nav_counts': counts, 'nav_rejected': rejected, 'journal': journal}
+            'nav_counts': counts, 'nav_rejected': rejected, 'journal': journal,
+            'sent': len(plan.navs), 'returned': returned, 'missing': missing}
+
+
+def count_check(res):
+    """Dernier contrôle du chargement : **compte des enregistrements au retour de
+    l'API**. Chaque VNI envoyée doit revenir avec un résultat (``results`` de
+    l'ingest, même ``source_record_id``) ; et, si le journal Acta a pu être relu, il
+    doit avoir journalisé autant de VNI qu'envoyées. → ``(ok, detail)``."""
+    journal = res['journal'] or {}
+    detail = {'sent': res['sent'], 'returned': res['returned'],
+              'missing': res['missing'][:50], 'journal_rows': journal.get('rows')}
+    if res['returned'] != res['sent'] or res['missing']:
+        detail['reason'] = 'api_count_mismatch'
+    elif journal.get('mismatch'):
+        detail['reason'] = 'acta_journal_mismatch'
+    return 'reason' not in detail, detail
 
 
 def _emit(rf, control, result, mclass, detail):
@@ -334,17 +360,20 @@ def load_file(file_id, dry_run=False, client=None):
               {'created': len(res['created']), 'links': len(res['links']),
                'failures': res['failures'][:50], 'created_list': res['created']})
         journal = res['journal'] or {}
-        ok_nav = not res['nav_rejected'] and not journal.get('mismatch')
+        ok_nav = not res['nav_rejected']
         detail = {'counts': res['nav_counts'], 'rejected': res['nav_rejected'][:50],
                   'file_ref': file_ref_of(rf)}
         if res['journal'] is not None:
             detail['journal'] = {**journal, 'rejected_lines': journal.get('rejected_lines', [])[:50]}
-        if journal.get('mismatch'):
-            detail['reason'] = 'acta_journal_mismatch'
         _emit(rf, CTRL_NAV,
               Event.Result.PASSED if ok_nav else Event.Result.FAILED,
               Event.MonitoringClass.PUSH if ok_nav else Event.MonitoringClass.WARNING_ACTION,
               detail)
+        ok_count, count_detail = count_check(res)
+        _emit(rf, CTRL_COUNT,
+              Event.Result.PASSED if ok_count else Event.Result.FAILED,
+              Event.MonitoringClass.PUSH if ok_count else Event.MonitoringClass.WARNING_ACTION,
+              count_detail)
         refresh_control_class([rf.pk])
     logger.info('Load Acta file=%s created=%s links=%s navs=%s rejected=%s',
                 rf.pk, len(res['created']), len(res['links']), res['nav_counts'],

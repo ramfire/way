@@ -1826,7 +1826,8 @@ class ActaNavLoaderTests(TestCase):
         feed.save()
         return rf, feed
 
-    def _client(self, known=None, ingest_status='created', journal=None, journal_gap=0):
+    def _client(self, known=None, ingest_status='created', journal=None, journal_gap=0,
+                api_gap=0):
         from unittest.mock import MagicMock
         c = MagicMock()
         c.source_codes.return_value = known or {}
@@ -1853,9 +1854,11 @@ class ActaNavLoaderTests(TestCase):
                     {'line_no': i + 1, 'source_line_no': r.get('source_line_no'),
                      'source_record_id': r['source_record_id'], 'outcome': 'REJECTED',
                      'reason': 'classe inconnue'} for i, r in enumerate(records)] if refused else []
-                return 200, {'counts': {ingest_status: len(records)},
-                             'results': [{'status': ingest_status, 'index': i}
-                                         for i, _ in enumerate(records)]}
+                echoed = records[:len(records) - api_gap]
+                return 200, {'counts': {ingest_status: len(echoed)},
+                             'results': [{'status': ingest_status, 'index': i,
+                                          'source_record_id': r['source_record_id']}
+                                         for i, r in enumerate(echoed)]}
             return 201, {}
         c.send_json.side_effect = send
         c.nav_imports.side_effect = lambda ref: iter(
@@ -1954,11 +1957,44 @@ class ActaNavLoaderTests(TestCase):
         self.assertEqual([(l['source_line_no'], l['reason']) for l in lines],
                          [(1, 'classe inconnue'), (2, 'classe inconnue')])
 
+    # --- dernier contrôle : compte des enregistrements au retour de l'API -----
+    def _count_event(self, rf):
+        return Event.objects.get(file=rf, stage='load', control='acta_count')
+
+    def test_count_check_is_the_last_load_control(self):
+        rf, _ = self._load(self._client())
+        last = Event.objects.filter(file=rf, stage='load').order_by('-id').first()
+        self.assertEqual(last.control, 'acta_count')
+        self.assertEqual(last.monitoring_class, Event.MonitoringClass.PUSH)
+        self.assertEqual((last.detail['sent'], last.detail['returned'], last.detail['missing']),
+                         (2, 2, []))
+        self.assertEqual(last.detail['journal_rows'], 2)
+
+    def test_missing_api_result_is_warning_action(self):
+        rf, nav_ev = self._load(self._client(api_gap=1))
+        ev = self._count_event(rf)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.WARNING_ACTION)
+        self.assertEqual(ev.detail['reason'], 'api_count_mismatch')
+        self.assertEqual((ev.detail['sent'], ev.detail['returned']), (2, 1))
+        self.assertEqual(ev.detail['missing'], ['900002-2026-09-30-OFFICIAL'])
+        self.assertEqual(nav_ev.monitoring_class, Event.MonitoringClass.PUSH)   # aucun rejet
+
     def test_journal_mismatch_is_warning_action(self):
-        _, ev = self._load(self._client(journal_gap=1))
+        rf, nav_ev = self._load(self._client(journal_gap=1))
+        ev = self._count_event(rf)
         self.assertEqual(ev.monitoring_class, Event.MonitoringClass.WARNING_ACTION)
         self.assertEqual(ev.detail['reason'], 'acta_journal_mismatch')
-        self.assertTrue(ev.detail['journal']['mismatch'])
+        self.assertEqual(ev.detail['journal_rows'], 1)
+        self.assertTrue(nav_ev.detail['journal']['mismatch'])
+
+    def test_count_check_without_journal_relies_on_the_api(self):
+        from .acta import ActaError
+        client = self._client()
+        client.nav_imports.side_effect = ActaError('HTTP 404')
+        rf, _ = self._load(client)
+        ev = self._count_event(rf)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+        self.assertIsNone(ev.detail['journal_rows'])
 
     def test_unreadable_journal_never_blocks_the_load(self):
         from .acta import ActaError
