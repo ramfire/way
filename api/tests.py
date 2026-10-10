@@ -1826,7 +1826,7 @@ class ActaNavLoaderTests(TestCase):
         feed.save()
         return rf, feed
 
-    def _client(self, known=None, ingest_status='created'):
+    def _client(self, known=None, ingest_status='created', journal=None, journal_gap=0):
         from unittest.mock import MagicMock
         c = MagicMock()
         c.source_codes.return_value = known or {}
@@ -1834,15 +1834,33 @@ class ActaNavLoaderTests(TestCase):
         c.share_classes_of.return_value = set()
         uids = iter(f'uid-{i}' for i in range(100))
 
+        # Journal Acta simulé : un import par lot ingéré (cf. Acta /api/v1/nav-imports/).
+        c.journal, c.journal_lines = list(journal or []), {}
+
         def send(method, path, payload):
             if path == '/api/v1/entities/':
                 return 201, {'uid': next(uids)}
             if path == '/api/v1/ingest/':
-                return 200, {'counts': {ingest_status: len(payload['records'])},
+                records = payload['records']
+                imp_id = max((i['id'] for i in c.journal), default=0) + 1
+                refused = ingest_status == 'rejected'
+                c.journal.append({
+                    'id': imp_id, 'file_ref': payload.get('file_ref', ''),
+                    'rows': len(records) - journal_gap,
+                    'stored': 0 if refused else len(records), 'unchanged': 0,
+                    'rejected': len(records) if refused else 0})
+                c.journal_lines[imp_id] = [
+                    {'line_no': i + 1, 'source_line_no': r.get('source_line_no'),
+                     'source_record_id': r['source_record_id'], 'outcome': 'REJECTED',
+                     'reason': 'classe inconnue'} for i, r in enumerate(records)] if refused else []
+                return 200, {'counts': {ingest_status: len(records)},
                              'results': [{'status': ingest_status, 'index': i}
-                                         for i, _ in enumerate(payload['records'])]}
+                                         for i, _ in enumerate(records)]}
             return 201, {}
         c.send_json.side_effect = send
+        c.nav_imports.side_effect = lambda ref: iter(
+            [i for i in reversed(c.journal) if i['file_ref'] == ref])
+        c.nav_import_lines.side_effect = lambda imp_id, outcome=None: iter(c.journal_lines[imp_id])
         return c
 
     def _plan(self, known=None):
@@ -1893,6 +1911,62 @@ class ActaNavLoaderTests(TestCase):
         ev = Event.objects.get(file=rf, stage='load', control='acta_nav')
         self.assertEqual(ev.monitoring_class, Event.MonitoringClass.WARNING_ACTION)
         self.assertEqual(len(ev.detail['rejected']), 2)
+
+    # --- relecture du journal Acta (nav-imports) ----------------------------
+    def _load(self, client):
+        from .acta_nav import load_file
+        rf, _ = self._file()
+        with patch('api.parsing.get_s3_client', return_value=_fake_s3(self.CONTENT)):
+            load_file(rf.pk, client=client)
+        return rf, Event.objects.get(file=rf, stage='load', control='acta_nav')
+
+    def test_ingest_carries_file_ref_and_source_lines(self):
+        client = self._client()
+        rf, _ = self._load(client)
+        payload = next(c.args[2] for c in client.send_json.call_args_list
+                       if c.args[1] == '/api/v1/ingest/')
+        self.assertEqual(payload['file_ref'], f'alfaway:{rf.pk}:way/LU_PO_NAV_20261002.csv')
+        self.assertEqual([r['source_line_no'] for r in payload['records']], [1, 2])
+
+    def test_journal_is_read_back_into_the_event(self):
+        rf, ev = self._load(self._client())
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+        journal = ev.detail['journal']
+        self.assertEqual((journal['imports'], journal['rows'], journal['stored']), ([1], 2, 2))
+        self.assertFalse(journal['mismatch'])
+        self.assertEqual(ev.detail['file_ref'], f'alfaway:{rf.pk}:way/LU_PO_NAV_20261002.csv')
+
+    def test_previous_imports_of_the_same_file_are_ignored(self):
+        from .acta_nav import file_ref_of
+        client = self._client()
+        rf, _ = self._file()
+        client.journal.append({'id': 7, 'file_ref': file_ref_of(rf), 'rows': 99,
+                               'stored': 99, 'unchanged': 0, 'rejected': 0})
+        from .acta_nav import load_file
+        with patch('api.parsing.get_s3_client', return_value=_fake_s3(self.CONTENT)):
+            load_file(rf.pk, client=client)
+        ev = Event.objects.get(file=rf, stage='load', control='acta_nav')
+        self.assertEqual((ev.detail['journal']['imports'], ev.detail['journal']['rows']), ([8], 2))
+
+    def test_rejected_lines_come_with_origin_line_and_reason(self):
+        _, ev = self._load(self._client(ingest_status='rejected'))
+        lines = ev.detail['journal']['rejected_lines']
+        self.assertEqual([(l['source_line_no'], l['reason']) for l in lines],
+                         [(1, 'classe inconnue'), (2, 'classe inconnue')])
+
+    def test_journal_mismatch_is_warning_action(self):
+        _, ev = self._load(self._client(journal_gap=1))
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.WARNING_ACTION)
+        self.assertEqual(ev.detail['reason'], 'acta_journal_mismatch')
+        self.assertTrue(ev.detail['journal']['mismatch'])
+
+    def test_unreadable_journal_never_blocks_the_load(self):
+        from .acta import ActaError
+        client = self._client()
+        client.nav_imports.side_effect = ActaError('GET /api/v1/nav-imports/ → HTTP 404')
+        _, ev = self._load(client)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+        self.assertNotIn('journal', ev.detail)
 
     def test_external_code_refused_rolls_back_entity(self):
         from .acta_nav import load_file

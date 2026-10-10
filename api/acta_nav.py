@@ -13,6 +13,11 @@ classe, leurs codes externes ``SOURCE_CODE`` (source ``ACTA_SOURCE``) et le lien
      d'orphelin qu'un rejeu dupliquerait ;
   3. **VNI** : ``POST /api/v1/ingest/`` (``SHARE_CLASS_NAV``, lots ≤ 1000), rejet
      unitaire et idempotence côté Acta.
+     Le lot porte ``file_ref`` (``alfaway:<id>:<path>``) et chaque VNI sa ligne
+     d'origine (``source_line_no``) ; Acta les trace dans son journal
+     (``/api/v1/nav-imports/``), **relu** après l'ingest : imports créés, NAV
+     reçues / stockées / inchangées / refusées, lignes refusées et motif. Écart entre
+     NAV envoyées et journalisées → ``warning_action`` (``acta_journal_mismatch``).
 
 Taux de change : le fichier donne « devise de la part pour 1 unité de devise du
 fonds » ; Acta attend la **cotation de marché** (devise de base = plus haute
@@ -143,6 +148,7 @@ def build_plan(rf, feed, client, known_codes=None, currencies=None):
             'units_outstanding': _plain(units), 'nav_per_unit': _plain(nav),
             'total_nav_class_ccy': _plain(amt_class),
             'total_nav_fund_ccy': _plain(amt_fund), 'fx_rate': _plain(fx),
+            'source_line_no': n,
         })
     return plan
 
@@ -167,7 +173,38 @@ def _create_entity(client, payload, code, created, failures):
     return uid
 
 
-def apply_plan(client, plan):
+def file_ref_of(rf):
+    """Référence du fichier chez AlfaWay, tracée par Acta (``NavImport.file_ref``)."""
+    return f'alfaway:{rf.pk}:{rf.path}'[:512]
+
+
+def _last_import_id(client, file_ref):
+    """Plus grand id d'import déjà journalisé pour ce fichier (0 si aucun)."""
+    return max((i['id'] for i in client.nav_imports(file_ref)), default=0)
+
+
+def read_journal(client, file_ref, after_id, sent):
+    """Relit dans Acta le journal des imports créés par ce chargement (id > after_id).
+
+    Rapprochement **technique** (transport), pas métier : Acta a-t-il journalisé
+    autant de NAV qu'envoyées, et lesquelles a-t-il refusées (ligne d'origine, motif).
+    ``mismatch`` si le nombre de NAV journalisées diffère du nombre envoyé."""
+    imports = sorted((i for i in client.nav_imports(file_ref) if i['id'] > after_id),
+                     key=lambda i: i['id'])
+    totals = {k: sum(i[k] for i in imports) for k in ('rows', 'stored', 'unchanged', 'rejected')}
+    rejected_lines = []
+    for i in imports:
+        if i['rejected']:
+            rejected_lines += [
+                {'import': i['id'], 'line_no': l['line_no'],
+                 'source_line_no': l.get('source_line_no'),
+                 'source_record_id': l.get('source_record_id'), 'reason': l.get('reason')}
+                for l in client.nav_import_lines(i['id'], 'REJECTED')]
+    return {'imports': [i['id'] for i in imports], **totals,
+            'rejected_lines': rejected_lines, 'mismatch': totals['rows'] != sent}
+
+
+def apply_plan(client, plan, file_ref=None):
     created, links, failures = [], [], []
     for f in plan.funds.values():
         if f['uid'] is None:
@@ -201,17 +238,32 @@ def apply_plan(client, plan):
                                  'detail': body})
 
     counts, rejected = {}, []
+    after_id = None
+    if file_ref and plan.navs:
+        try:
+            after_id = _last_import_id(client, file_ref)
+        except ActaError as e:
+            logger.warning('Journal Acta illisible avant ingest (%s) : %s', file_ref, e)
+    envelope = {'schema_version': '1', 'source': settings.ACTA_SOURCE}
+    if file_ref:
+        envelope['file_ref'] = file_ref
     for i in range(0, len(plan.navs), INGEST_BATCH):
         status, body = client.send_json('POST', '/api/v1/ingest/', {
-            'schema_version': '1', 'source': settings.ACTA_SOURCE,
-            'records': plan.navs[i:i + INGEST_BATCH]})
+            **envelope, 'records': plan.navs[i:i + INGEST_BATCH]})
         if status != 200:
             raise ActaError(f'ingest refusé (HTTP {status}) : {str(body)[:500]}')
         for k, v in (body.get('counts') or {}).items():
             counts[k] = counts.get(k, 0) + v
         rejected += [r for r in body.get('results') or [] if r.get('status') == 'rejected']
+    # Relecture du journal Acta : jamais bloquante (Acta antérieur à 0020, réseau…).
+    journal = None
+    if after_id is not None:
+        try:
+            journal = read_journal(client, file_ref, after_id, len(plan.navs))
+        except ActaError as e:
+            journal = {'unavailable': str(e)[:300]}
     return {'created': created, 'links': links, 'failures': failures,
-            'nav_counts': counts, 'nav_rejected': rejected}
+            'nav_counts': counts, 'nav_rejected': rejected, 'journal': journal}
 
 
 def _emit(rf, control, result, mclass, detail):
@@ -269,7 +321,7 @@ def load_file(file_id, dry_run=False, client=None):
             refresh_control_class([rf.pk])
             return summary, None
         try:
-            res = apply_plan(client, plan)
+            res = apply_plan(client, plan, file_ref=file_ref_of(rf))
         except ActaError as e:
             _emit(rf, CTRL_NAV, Event.Result.FAILED, Event.MonitoringClass.RECYCLE,
                   {'reason': 'acta_unreachable', 'error': str(e)[:500]})
@@ -281,11 +333,18 @@ def load_file(file_id, dry_run=False, client=None):
               Event.MonitoringClass.PUSH if ok_ent else Event.MonitoringClass.WARNING_ACTION,
               {'created': len(res['created']), 'links': len(res['links']),
                'failures': res['failures'][:50], 'created_list': res['created']})
-        ok_nav = not res['nav_rejected']
+        journal = res['journal'] or {}
+        ok_nav = not res['nav_rejected'] and not journal.get('mismatch')
+        detail = {'counts': res['nav_counts'], 'rejected': res['nav_rejected'][:50],
+                  'file_ref': file_ref_of(rf)}
+        if res['journal'] is not None:
+            detail['journal'] = {**journal, 'rejected_lines': journal.get('rejected_lines', [])[:50]}
+        if journal.get('mismatch'):
+            detail['reason'] = 'acta_journal_mismatch'
         _emit(rf, CTRL_NAV,
               Event.Result.PASSED if ok_nav else Event.Result.FAILED,
               Event.MonitoringClass.PUSH if ok_nav else Event.MonitoringClass.WARNING_ACTION,
-              {'counts': res['nav_counts'], 'rejected': res['nav_rejected'][:50]})
+              detail)
         refresh_control_class([rf.pk])
     logger.info('Load Acta file=%s created=%s links=%s navs=%s rejected=%s',
                 rf.pk, len(res['created']), len(res['links']), res['nav_counts'],

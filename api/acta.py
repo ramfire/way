@@ -149,3 +149,15 @@ class ActaClient:
         data = self.get_json(f'/api/v1/entities/{fund_uid}/share-classes/')
         return {(r.get('entity') or {}).get('uid')
                 for r in data.get('share_classes') or []}
+
+    # --- journal des imports de NAV (Acta entities 0020) --------------------
+    def nav_imports(self, file_ref):
+        """Imports de NAV par l'API portant ce ``file_ref``, du plus récent au plus ancien."""
+        q = urllib.parse.urlencode({'file_ref': file_ref, 'channel': 'API'})
+        return self.iter_results(f'/api/v1/nav-imports/?{q}')
+
+    def nav_import_lines(self, import_id, outcome=None):
+        """Lignes reçues par un import (``outcome='REJECTED'`` pour les refus)."""
+        q = f'?{urllib.parse.urlencode({"outcome": outcome})}' if outcome else ''
+        return self.iter_results(f'/api/v1/nav-imports/{import_id}/lines/{q}')
+
