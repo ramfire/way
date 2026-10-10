@@ -208,7 +208,7 @@
         ctrl_channel_authorised: 'Channel authorised', ctrl_verdict: 'Verdict',
         ctrl_feed_recognised: 'Feed recognised', ctrl_filename_grammar: 'Filename grammar',
         stage_admission: 'admission', stage_qualification: 'qualification',
-        stage_load: 'load', ctrl_acta_nav: 'Acta NAV', ctrl_acta_entities: 'Acta entities', ctrl_acta_plan: 'Acta plan',
+        stage_load: 'load', ctrl_acta_nav: 'Acta NAV', ctrl_acta_entities: 'Acta entities', ctrl_acta_plan: 'Acta plan', ctrl_acta_count: 'Record count',
         aj_title: 'Acta journal — last load', aj_imports: 'Acta imports', aj_rows: 'received',
         aj_stored: 'stored', aj_unchanged: 'unchanged', aj_rejected: 'rejected',
         aj_mismatch: '⚠ Acta logged {r} NAVs, a different count from what was sent',
@@ -270,7 +270,7 @@
         ctrl_channel_authorised: 'Canal autorisé', ctrl_verdict: 'Verdict',
         ctrl_feed_recognised: 'Feed reconnu', ctrl_filename_grammar: 'Grammaire du nom',
         stage_admission: 'admission', stage_qualification: 'qualification',
-        stage_load: 'chargement', ctrl_acta_nav: 'VNI Acta', ctrl_acta_entities: 'Entités Acta', ctrl_acta_plan: 'Plan Acta',
+        stage_load: 'chargement', ctrl_acta_nav: 'VNI Acta', ctrl_acta_entities: 'Entités Acta', ctrl_acta_plan: 'Plan Acta', ctrl_acta_count: 'Compte des enregistrements',
         aj_title: 'Journal Acta — dernier chargement', aj_imports: 'Imports Acta', aj_rows: 'reçues',
         aj_stored: 'stockées', aj_unchanged: 'inchangées', aj_rejected: 'refusées',
         aj_mismatch: '⚠ Acta a journalisé {r} VNI, un nombre différent de celui envoyé',
@@ -331,7 +331,7 @@
         ctrl_channel_authorised: 'Canale autorizzato', ctrl_verdict: 'Verdetto',
         ctrl_feed_recognised: 'Feed riconosciuto', ctrl_filename_grammar: 'Grammatica del nome',
         stage_admission: 'ammissione', stage_qualification: 'qualificazione',
-        stage_load: 'caricamento', ctrl_acta_nav: 'NAV Acta', ctrl_acta_entities: 'Entità Acta', ctrl_acta_plan: 'Piano Acta',
+        stage_load: 'caricamento', ctrl_acta_nav: 'NAV Acta', ctrl_acta_entities: 'Entità Acta', ctrl_acta_plan: 'Piano Acta', ctrl_acta_count: 'Conteggio dei record',
         aj_title: 'Registro Acta — ultimo caricamento', aj_imports: 'Import Acta', aj_rows: 'ricevute',
         aj_stored: 'memorizzate', aj_unchanged: 'invariate', aj_rejected: 'rifiutate',
         aj_mismatch: '⚠ Acta ha registrato {r} NAV, un numero diverso da quello inviato',
@@ -834,6 +834,9 @@
       if (d.counts) bits.push(Object.entries(d.counts).filter(([, n]) => n).map(([k, n]) => k + '=' + n).join(' ') || 'counts=0');
       if (d.created !== undefined && d.links !== undefined) bits.push(`created=${d.created} links=${d.links}`);
       if (d.journal && d.journal.imports) bits.push('acta#' + d.journal.imports.join(','));
+      if (d.sent !== undefined) bits.push(`sent=${d.sent} returned=${d.returned}`
+        + (d.journal_rows != null ? ` journal=${d.journal_rows}` : '')
+        + (d.missing && d.missing.length ? ` missing=${d.missing.join(',')}` : ''));
       if (d.error) bits.push(d.error);
       return bits.length ? bits.join(' · ') : '—';
     }
