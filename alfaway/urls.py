@@ -17,18 +17,31 @@ Including another URLconf
 from django.contrib import admin
 from django.http import JsonResponse
 from django.urls import path
+from django.views.generic import RedirectView
 
 from api.views import (
     PresignedDownloadView,
     SFTPWebhookView,
+    admission_detail,
     archive_received_file,
+    business_expected_feed,
+    business_expected_page,
+    business_monitoring_feed,
+    business_monitoring_page,
     download_received_file,
+    enrol_feed,
+    monitoring_causes,
     monitoring_feed,
     monitoring_page,
+    recycle_file,
+    reject_file,
+    replay_admission,
+    replay_all_controls,
     restore_received_file,
 )
 
 urlpatterns = [
+    path('', RedirectView.as_view(url='/monitoring/', permanent=False), name='home'),
     path('admin/', admin.site.urls),
     path('api/internal/sftp-webhook/', SFTPWebhookView.as_view()),
     path('api/internal/files/<int:pk>/download-url/', PresignedDownloadView.as_view()),
@@ -37,5 +50,19 @@ urlpatterns = [
     path('files/<int:pk>/restore/', restore_received_file, name='restore-file'),
     path('monitoring/', monitoring_page, name='monitoring'),
     path('monitoring/feed/', monitoring_feed, name='monitoring-feed'),
+    path('monitoring/causes/', monitoring_causes, name='monitoring-causes'),
+    path('monitoring/business/', business_monitoring_page, name='monitoring-business'),
+    path('monitoring/business/feed/', business_monitoring_feed,
+         name='monitoring-business-feed'),
+    path('monitoring/expected/', business_expected_page, name='monitoring-expected'),
+    path('monitoring/expected/feed/', business_expected_feed,
+         name='monitoring-expected-feed'),
+    path('monitoring/admission/<int:pk>/', admission_detail, name='monitoring-admission'),
+    path('monitoring/admission/<int:pk>/replay/', replay_admission, name='monitoring-admission-replay'),
+    path('monitoring/feed/<int:pk>/enrol/', enrol_feed, name='monitoring-feed-enrol'),
+    path('monitoring/files/<int:pk>/recycle/', recycle_file, name='monitoring-file-recycle'),
+    path('monitoring/files/<int:pk>/reject/', reject_file, name='monitoring-file-reject'),
+    path('monitoring/files/<int:pk>/replay-all/', replay_all_controls,
+         name='monitoring-file-replay-all'),
     path('healthz/', lambda r: JsonResponse({'status': 'ok'})),
 ]

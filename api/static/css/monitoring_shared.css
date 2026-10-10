@@ -1,0 +1,107 @@
+/* AlfaWay — design system PARTAGÉ des boards de supervision.
+   Consommé par monitoring.html (fichier), business_monitoring.html (métier) et
+   business_expected.html (VNI attendues). Portée strictement PRÉSENTATION :
+   variables, chrome commun (body/header/table), ÉCHELLE DE SÉVÉRITÉ unifiée
+   (tous les badges de statut) et nav croisée. Aucune logique métier ici. */
+
+:root {
+  --bg:#0f172a; --card:#1e293b; --txt:#e2e8f0; --mut:#94a3b8; --line:#334155;
+
+  /* Échelle de sévérité UNIFIÉE (design §5), du plus grave au moins grave. Source
+     UNIQUE : tout badge de statut des trois boards réfère ces jetons — pas de
+     palette parallèle. blocking > warning_action > recycle > reject >
+     warning_noaction > push. */
+  --sev-blocking-bg:#991b1b;      --sev-blocking-fg:#fee2e2;      --sev-blocking-rail:#ef4444;
+  --sev-warn-action-bg:#9a3412;   --sev-warn-action-fg:#ffedd5;   --sev-warn-action-rail:#f97316;
+  --sev-recycle-bg:#854d0e;       --sev-recycle-fg:#fde68a;
+  --sev-reject-bg:#7f1d1d;        --sev-reject-fg:#fecaca;
+  --sev-warn-noaction-bg:#334155; --sev-warn-noaction-fg:#cbd5e1;
+  --sev-ok-bg:#14532d;            --sev-ok-fg:#bbf7d0;
+  --sev-info-bg:#3730a3;          --sev-info-fg:#e0e7ff;
+  --sev-recycled-bg:#1e3a8a;      --sev-recycled-fg:#dbeafe;
+}
+
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--txt);
+       font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
+header { padding:1rem 1.5rem; border-bottom:1px solid var(--line);
+         display:flex; align-items:center; gap:1.5rem; flex-wrap:wrap; }
+h1 { font-size:1.15rem; margin:0; }
+.spacer { flex:1; }
+.meta { color:var(--mut); font-size:.8rem; display:flex; align-items:center; gap:.8rem; }
+.muted { color:var(--mut); }
+
+.dot { width:9px; height:9px; border-radius:50%; background:#22c55e; display:inline-block;
+       animation:pulse 2s infinite; }
+.dot.paused { background:#eab308; animation:none; }
+.dot.error  { background:#ef4444; animation:none; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+button, select, input[type=date] { background:var(--card); color:var(--txt);
+         border:1px solid var(--line); border-radius:6px; padding:.35rem .7rem;
+         cursor:pointer; font-size:.8rem; }
+button:hover, select:hover, input[type=date]:hover { border-color:var(--mut); }
+
+table { width:100%; border-collapse:collapse; font-size:.86rem; }
+th, td { text-align:left; padding:.5rem .9rem; border-bottom:1px solid var(--line);
+         white-space:nowrap; }
+th { color:var(--mut); font-weight:600; position:sticky; top:0; background:var(--bg); }
+td.mono { font-family: ui-monospace, monospace; }
+.arrow { color:var(--mut); }
+
+/* Nav croisée entre boards (partials/monitoring_nav.html) : point d'entrée visuel
+   partagé. L'onglet actif est surligné comme les onglets Live/History du board
+   fichier (cohérence). */
+.mon-nav { display:flex; gap:.3rem; align-items:center; flex-wrap:wrap; }
+.mon-nav a { font-size:.82rem; text-decoration:none; color:var(--mut);
+             padding:.3rem .6rem; border:1px solid transparent; border-radius:6px; }
+.mon-nav a:hover { color:var(--txt); border-color:var(--line); }
+.mon-nav a.active { color:#fff; background:#334155; border-color:var(--mut); font-weight:600; }
+/* Lien vers l'admin Django : pas un board pair → séparé par un filet à gauche. */
+.mon-nav a.admin { margin-left:.4rem; padding-left:.7rem; border-left:1px solid var(--line);
+                   border-radius:0 6px 6px 0; }
+
+/* Chips de filtre (boards métier / VNI). Le board fichier a ses propres `.stat`. */
+.chips { display:flex; gap:.5rem; flex-wrap:wrap; padding:.8rem 1.5rem 0; }
+.chip { background:var(--card); border:1px solid var(--line); border-radius:999px;
+        padding:.3rem .8rem; font-size:.8rem; cursor:pointer; }
+.chip.active { outline:2px solid var(--mut); }
+.chip b { font-size:.95rem; }
+
+.empty { padding:2rem 1.5rem; color:var(--mut); }
+
+/* ── Badges de statut — ÉCHELLE DE SÉVÉRITÉ UNIFIÉE ─────────────────────────── */
+.badge { padding:.15rem .55rem; border-radius:999px; font-size:.75rem; font-weight:600; }
+
+/* Classes de monitoring (worst-wins), génériques tous stages/contrôles. */
+.mc-blocking         { background:var(--sev-blocking-bg); color:var(--sev-blocking-fg);
+                       box-shadow:inset 2px 0 0 var(--sev-blocking-rail); }
+.mc-warning_action   { background:var(--sev-warn-action-bg); color:var(--sev-warn-action-fg); }
+.mc-recycle          { background:var(--sev-recycle-bg); color:var(--sev-recycle-fg); }
+.mc-reject           { background:var(--sev-reject-bg); color:var(--sev-reject-fg); }
+.mc-warning_noaction { background:var(--sev-warn-noaction-bg); color:var(--sev-warn-noaction-fg); }
+.mc-push             { background:var(--sev-ok-bg); color:var(--sev-ok-fg); }
+.mc-none             { color:var(--mut); }
+
+/* États affichés (board fichier) : 4 valeurs sans ambiguïté verdict↔décision. */
+.ds-ok       { background:var(--sev-ok-bg); color:var(--sev-ok-fg); }
+.ds-failed   { background:var(--sev-warn-action-bg); color:var(--sev-warn-action-fg);
+               box-shadow:inset 2px 0 0 var(--sev-warn-action-rail); }
+.ds-recycled { background:var(--sev-recycled-bg); color:var(--sev-recycled-fg); }
+.ds-rejected { background:var(--sev-reject-bg); color:var(--sev-reject-fg); }
+.ds-all      { background:#1e293b; color:#cbd5e1; }
+
+/* Verdicts MÉTIER (board business) mappés sur l'échelle — pas de palette parallèle.
+   known = OK (push) ; candidate = action requise (warning_action). */
+.known     { background:var(--sev-ok-bg); color:var(--sev-ok-fg); }
+.candidate { background:var(--sev-warn-action-bg); color:var(--sev-warn-action-fg); }
+
+/* Verdicts d'attente VNI (board expected) mappés sur l'échelle unifiée. */
+.v-missing        { background:var(--sev-blocking-bg); color:var(--sev-blocking-fg);
+                    box-shadow:inset 2px 0 0 var(--sev-blocking-rail); }
+.v-late           { background:var(--sev-warn-action-bg); color:var(--sev-warn-action-fg); }
+.v-pending        { background:var(--sev-recycle-bg); color:var(--sev-recycle-fg); }
+.v-on_time        { background:var(--sev-ok-bg); color:var(--sev-ok-fg); }
+.v-not_due        { background:var(--sev-warn-noaction-bg); color:var(--sev-warn-noaction-fg); }
+.v-unanchored     { background:var(--sev-info-bg); color:var(--sev-info-fg); }
+.v-non_expansible { background:var(--sev-warn-noaction-bg); color:var(--mut); }

@@ -1,0 +1,14 @@
+{% comment %}
+  Nav croisée PARTAGÉE entre les boards de supervision (décision §1). Point d'entrée
+  visuel unique : liens vers les trois boards avec surlignage de l'actif.
+  Usage : {% include 'partials/monitoring_nav.html' with active='files' %}
+          (active ∈ 'files' | 'business' | 'expected').
+  Les libellés sont localisés côté JS via MShared.localizeNav (attribut data-i18n-nav) ;
+  le texte en dur ci-dessous est le repli anglais avant hydratation.
+{% endcomment %}
+<nav class="mon-nav" aria-label="Monitoring boards">
+  <a href="/monitoring/" data-i18n-nav="nav_files"{% if active == 'files' %} class="active" aria-current="page"{% endif %}>Files</a>
+  <a href="/monitoring/business/" data-i18n-nav="nav_business"{% if active == 'business' %} class="active" aria-current="page"{% endif %}>Business</a>
+  <a href="/monitoring/expected/" data-i18n-nav="nav_expected"{% if active == 'expected' %} class="active" aria-current="page"{% endif %}>NAV expected</a>
+  <a href="/admin/" class="admin" data-i18n-nav="nav_admin">⚙ Admin</a>
+</nav>

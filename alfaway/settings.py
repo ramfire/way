@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
+import json
 from pathlib import Path
 
 from decouple import config, Csv
@@ -163,6 +164,23 @@ SCW_BUCKET_PREFIX = config('SCW_BUCKET_PREFIX', default='alfaway')
 # Integration tokens
 SFTPGO_WEBHOOK_TOKEN = config('SFTPGO_WEBHOOK_TOKEN', default='')
 INTERNAL_TOKEN = config('INTERNAL_TOKEN', default='')
+
+# Acta (référentiel d'entités maître) — compte de service, session Django (cf. api/acta.py)
+ACTA_URL = config('ACTA_URL', default='')
+ACTA_HOST = config('ACTA_HOST', default='acta.algotech.lu')
+ACTA_USER = config('ACTA_USER', default='')
+ACTA_PASSWORD = config('ACTA_PASSWORD', default='')
+ACTA_TIMEOUT = config('ACTA_TIMEOUT', default=10, cast=int)
+# Source sous laquelle AlfaWay pose ses codes externes (SOURCE_CODE) dans Acta.
+ACTA_SOURCE = config('ACTA_SOURCE', default='ALFAWAY')
+
+# Admission — règles MINIMALES d'autorisation de canal/chemin par partenaire.
+# Mapping {username: [prefixes de chemin autorisés]}. **Absence de règle pour un
+# partenaire ⇒ tout autorisé** (l'admission est de l'observation, pas un blocage).
+# Ce n'est PAS du routage : simple préfixe. Édité ici (config) par les ops.
+ADMISSION_PATH_RULES = config(
+    'ADMISSION_PATH_RULES', default='{}',
+    cast=lambda v: json.loads(v) if isinstance(v, str) else (v or {}))
 
 
 # Logging -> /var/log/alfaway

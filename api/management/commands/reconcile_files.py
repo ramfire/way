@@ -18,7 +18,8 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
-from api.models import ReceivedFile
+from api.admission import file_admission
+from api.models import ReceivedFile, default_sub_tenant_id
 from api.s3 import get_s3_client
 
 
@@ -70,7 +71,7 @@ class Command(BaseCommand):
                 continue
             db_by_key[key] = rf  # garde le plus récent (ordre croissant)
 
-        backfilled = promoted = marked_missing = in_sync = 0
+        backfilled = promoted = marked_missing = sized = in_sync = 0
 
         # 3) S3 -> base : backfill / promote.
         for key, size in s3_objects.items():
@@ -84,6 +85,8 @@ class Command(BaseCommand):
                         s3_key=key, path=key, bucket=bucket,
                         file_size=size, status=1, action='reconcile',
                         reconciled=True, stored_at=timezone.now(),
+                        # Tenant d'ingest par défaut (l'admission le re-pointe).
+                        sub_tenant_id=default_sub_tenant_id(),
                         raw={'source': 'reconcile'},
                     )
             elif rf.state == ReceivedFile.State.RECEIVING:
@@ -106,6 +109,15 @@ class Command(BaseCommand):
                     rf.deleted_at = None
                     rf.reconciled = True
                     rf.save(update_fields=['state', 'deleted_at', 'reconciled'])
+            elif rf.file_size is None:
+                # Ligne `stored` déjà alignée mais sans taille : le hook `upload` de
+                # SFTPGo ne porte pas `file_size`. On la backfill depuis S3 — répare
+                # l'historique antérieur au remplissage à l'ingestion (cf. _on_upload).
+                sized += 1
+                self.stdout.write(f'  [size    ] {key} (file_size <- {size} o)')
+                if not dry:
+                    rf.file_size = size
+                    rf.save(update_fields=['file_size'])
             else:
                 in_sync += 1
 
@@ -119,10 +131,27 @@ class Command(BaseCommand):
                     rf.deleted_at = timezone.now()
                     rf.save(update_fields=['state', 'deleted_at'])
 
+        # 5) Filet admission : toute ligne `stored` SANS aucun événement
+        #    d'admission n'a jamais été classée (webhook perdu, gunicorn down au
+        #    moment de l'upload, backfill ci-dessus, etc.). On (re)lance
+        #    file_admission — même rôle que rattraper un hook perdu. Idempotent et
+        #    rejouable ; --dry-run n'écrit rien.
+        admitted = 0
+        need_admission = list(
+            ReceivedFile.objects
+            .filter(state=ReceivedFile.State.STORED)
+            .exclude(events__stage='admission'))
+        for rf in need_admission:
+            admitted += 1
+            self.stdout.write(f'  [admission] {object_key(rf)} (stored sans event admission)')
+            if not dry:
+                file_admission(rf.pk)
+
         tag = 'DRY-RUN — ' if dry else ''
         self.stdout.write(self.style.SUCCESS(
             f'{tag}backfill={backfilled} promote={promoted} '
-            f'missing={marked_missing} déjà-ok={in_sync}'))
+            f'missing={marked_missing} size={sized} admission={admitted} '
+            f'déjà-ok={in_sync}'))
 
     def _default_bucket(self):
         """Bucket réel : l'unique bucket des lignes, sinon SCW_BUCKET_PREFIX."""

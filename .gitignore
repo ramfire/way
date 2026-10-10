@@ -20,8 +20,9 @@ logs/
 media/
 .gunicorn/
 
-# collectstatic (assets admin + DRF), regénéré par `manage.py collectstatic`
-static/
+# collectstatic (assets admin + DRF), regénéré par `manage.py collectstatic`.
+# Ancré à la racine (/static/) pour NE PAS masquer les sources d'app (api/static/).
+/static/
 
 # --- Python ---
 __pycache__/

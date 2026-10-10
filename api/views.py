@@ -1,9 +1,17 @@
 import logging
 import posixpath
+import re
+from collections import Counter
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.contrib.admin.views.decorators import staff_member_required
-from django.db.models import Case, Count, IntegerField, Value, When
+from django.db.models import (
+    Case, CharField, Count, F, FloatField, Func, IntegerField, Value, When,
+)
+from django.db.models.fields.json import KeyTextTransform
+from django.db.models.functions import Cast, Coalesce, Lower
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
@@ -12,10 +20,39 @@ from django.views.decorators.http import require_POST
 from rest_framework.views import APIView
 from rest_framework.response import Response
 
-from .models import ReceivedFile
-from .s3 import PRESIGN_DEFAULT_EXPIRY, presigned_get_url
+from .calendar_engine import BusinessDays
+from .qualification import (
+    CAUSE_FEED_NOT_FOUND, latest_qualification_event,
+)
+from .models import (
+    MONITORING_SEVERITY, OPERATOR_REJECTED, Event, Handled, IdentificationPartition,
+    ReceivedFile, default_sub_tenant_id, operator_rejected_ids,
+    refresh_control_class, run_scope,
+)
+from .s3 import PRESIGN_DEFAULT_EXPIRY, object_size, presigned_get_url
 
 logger = logging.getLogger(__name__)
+
+# Classes de contrôle « en échec actionnable » sur lesquelles l'opérateur peut
+# remédier (Recycle/Reject). On exclut `push`/NULL (OK ou aucun contrôle) et
+# `warning_noaction` (avertissement explicitement sans action).
+TRIAGE_FAILURE_CLASSES = {
+    Event.MonitoringClass.BLOCKING, Event.MonitoringClass.WARNING_ACTION,
+    Event.MonitoringClass.RECYCLE, Event.MonitoringClass.REJECT,
+}
+
+
+def _triage_eligible(rf):
+    """Un fichier est remédiable (Recycle/Reject) ssi son contrôle est en échec
+    actionnable ET qu'il n'est pas déjà tranché : ni « traité » (``Handled``), ni
+    déjà rejeté par un opérateur (``operator_rejected``). Garde serveur des deux
+    actions — l'UI n'affiche les boutons que sur ce même critère (``can_remediate``).
+    """
+    if rf.control_class not in TRIAGE_FAILURE_CLASSES:
+        return False
+    if Handled.objects.filter(file=rf).exists():
+        return False
+    return rf.pk not in operator_rejected_ids([rf.pk])
 
 
 class FileNotReady(Exception):
@@ -111,6 +148,8 @@ class SFTPWebhookView(APIView):
                 bucket=p.get('bucket') or '',
                 action='pre-upload',
                 sftpgo_timestamp=p.get('timestamp'),
+                # Tenant d'ingest par défaut (l'admission le re-pointe ensuite).
+                sub_tenant_id=default_sub_tenant_id(),
                 raw=p,
             ),
         )
@@ -126,13 +165,25 @@ class SFTPWebhookView(APIView):
         success = sftp_status in (None, 1)
         state = ReceivedFile.State.STORED if success else ReceivedFile.State.FAILED
 
+        # Taille du fichier : le hook `upload` de SFTPGo ne transmet PAS `file_size`.
+        # Quand elle manque (upload réussi), on la lit une fois depuis S3 (clé
+        # physique = `path`, repli `virtual_path`) pour la stocker à la source — ainsi
+        # tous les consommateurs (complétude §1.7, board…) la trouvent en base, sans
+        # toucher S3 plus tard. Best-effort : `object_size` renvoie None si S3 KO,
+        # auquel cas la ligne reste sans taille (le filet `reconcile_files` rattrape).
+        file_size = p.get('file_size')
+        if file_size is None and success:
+            bucket = p.get('bucket') or settings.SCW_BUCKET_PREFIX
+            physical_key = p.get('path') or _key(p).lstrip('/')
+            file_size = object_size(bucket, physical_key)
+
         fields = dict(
             path=p.get('path') or '',
             username=username,
             protocol=p.get('protocol') or '',
             ip=p.get('ip') or None,
             session_id=session_id,
-            file_size=p.get('file_size'),
+            file_size=file_size,
             status=sftp_status,
             bucket=p.get('bucket') or '',
             action='upload',
@@ -152,14 +203,50 @@ class SFTPWebhookView(APIView):
             rf.stored_at = timezone.now() if success else None
             rf.save()
         else:
-            ReceivedFile.objects.create(
+            # Pas de ligne pre-upload corrélée : on crée directement (tenant d'ingest
+            # par défaut, re-pointé par l'admission). La branche update conserve le
+            # sub_tenant déjà posé au pre-upload.
+            rf = ReceivedFile.objects.create(
                 s3_key=s3_key,
                 stored_at=timezone.now() if success else None,
+                sub_tenant_id=default_sub_tenant_id(),
                 **fields,
             )
+        rf_id = rf.pk
         logger.info('SFTP upload %s: %s by %s',
                     'stored' if success else 'FAILED', s3_key, username)
         # TODO: déclencher DORA checks (futur worker via flag `processed`)
+
+        # Admission (post-stockage) : observation/classification, JAMAIS bloquante.
+        # Lancée seulement après que la ligne est `stored` et la 200 est acquise.
+        # Garde dédiée en plus du try/except de post() : l'admission ne peut EN
+        # AUCUN CAS affecter la réponse webhook ni l'upload (invariant 1).
+        if success and rf_id is not None:
+            self._run_admission(rf_id)
+
+    @staticmethod
+    def _run_admission(file_id):
+        """Admission + chaînage identification, garantis non bloquants (webhook 200).
+
+        Séparation des stages : le chaînage admission→identification (§1.6-b) vit
+        **ici, dans l'orchestrateur**, PAS dans ``file_admission``. L'identification
+        n'est lancée que si l'admission aboutit à un verdict **push**
+        (``control_class``) ; un recycle/reject n'identifie rien. Garde englobante :
+        ni l'admission ni l'identification ne peuvent affecter la réponse webhook.
+
+        Puis chargement (``acta_nav.maybe_load``) : seulement si la Route porte la
+        stratégie ``acta_nav`` et que l'amont est ``push`` ; ne lève jamais."""
+        try:
+            from .acta_nav import maybe_load
+            from .admission import file_admission, file_identification
+            file_admission(file_id)
+            rf = ReceivedFile.objects.get(pk=file_id)
+            if rf.control_class == Event.MonitoringClass.PUSH:
+                file_identification(file_id)
+                maybe_load(file_id)
+        except Exception:
+            logger.exception(
+                'Admission/identification: échec non bloquant pour file %s', file_id)
 
     def _on_delete(self, p):
         """Fichier supprimé via SFTP : marquer les lignes ``stored`` en ``deleted``.
@@ -244,7 +331,19 @@ def download_received_file(request, pk):
 
 # --- Monitoring temps réel (page auto-rafraîchie côté navigateur) -------------
 
-MONITORING_FEED_LIMIT = 50  # nb de lignes renvoyées par le feed
+MONITORING_FEED_LIMIT = 50   # taille de page par défaut renvoyée par le feed
+MONITORING_FEED_MAX = 500    # borne dure (?limit=) : protège le payload / la DB
+
+# Tri serveur : clés de colonnes acceptées (?sort=). Les champs *dérivés*
+# (filename, elapsed_ms, et stored_at en History) ne sont pas des colonnes brutes ;
+# ils sont calculés en base via annotations (voir `monitoring_feed`) pour que le
+# tri porte sur TOUTE la table et pas seulement sur la page renvoyée.
+SORT_KEYS = frozenset({
+    'id',        # PK (BigAutoField) : ordre d'ingest, exposé comme 1re colonne du board
+    'state', 'filename', 'username', 'protocol', 'ip',
+    'file_size', 'elapsed_ms', 'received_at', 'stored_at',
+    'control',   # colonne « Contrôles » : tri par SÉVÉRITÉ (pas alphabétique)
+})
 
 # Vue « Live » : flux opérationnel courant (à surveiller / à traiter). Les `failed`
 # y restent visibles tant qu'ils ne sont pas traités (futures actions de remédiation).
@@ -312,33 +411,195 @@ def restore_received_file(request, pk):
 
 @staff_member_required
 def monitoring_feed(request):
-    """JSON consommé par la page monitoring : N derniers fichiers + compteurs.
+    """JSON consommé par la page monitoring : une page de fichiers + compteurs.
 
     Deux vues via ``?view=`` : ``live`` (défaut — flux courant receiving/stored/
-    failed, échecs en tête) et ``history`` (archives deleted/missing). Lecture
-    seule, gardée par la session staff (cookie du fetch same-origin) ; pas de CSRF
-    (GET non mutant).
+    failed, échecs en tête) et ``history`` (archives deleted/missing). Le **tri**
+    (``?sort=&dir=``) et le **filtre par état** (``?state=``) sont appliqués côté
+    serveur sur TOUTE la table (et pas seulement sur la page) ; on renvoie ensuite
+    une **page** (``?limit=`` défaut 50 borné, ``?offset=`` pour paginer) plus
+    ``matched_total`` (nb total de lignes correspondant au filtre) pour que l'UI
+    pagine « a–b / total ». Lecture seule, gardée par la session staff (cookie du
+    fetch same-origin) ; pas de CSRF (GET non mutant).
     """
     view = 'history' if request.GET.get('view') == 'history' else 'live'
     states = HISTORY_STATES if view == 'history' else LIVE_STATES
     base = ReceivedFile.objects.filter(state__in=states)
 
-    if view == 'live':
-        # Erreurs (failed) remontées en tête, puis les plus récents.
+    # Filtre par état (chip cliquable). On ne retient que les états valides pour la
+    # vue courante ; toute autre valeur est ignorée (= pas de filtre).
+    valid_states = {s.value for s in states}
+    state_filter = request.GET.get('state')
+    if state_filter not in valid_states:
+        state_filter = None
+    if state_filter:
+        base = base.filter(state=state_filter)
+
+    # Triage : par défaut on MASQUE les fichiers TRANCHÉS → le board ne montre que ce
+    # qui reste à arbitrer. « Tranché » = soit « traité » (ligne ``Handled``, set-once,
+    # forcément un OK ``push``), soit **rejeté définitivement** par un opérateur
+    # (Event de triage ``operator_rejected``, forcément un ``reject`` via le
+    # court-circuit). `?show_handled=1` réaffiche les deux (toggle UI). Le masquage
+    # s'applique AUSSI aux compteurs ci-dessous (chip ↔ liste cohérents).
+    show_handled = request.GET.get('show_handled') == '1'
+    _rejected_q = {'events__stage': Event.Stage.TRIAGE,
+                   'events__cause_code': OPERATOR_REJECTED}
+
+    def _hide_resolved(qs):
+        if show_handled:
+            return qs
+        return qs.filter(handled__isnull=True).exclude(**_rejected_q)
+
+    def _undecided(qs):
+        # Aucune décision opérateur posée (ni « Recycled »/Handled, ni « Rejected »).
+        return qs.filter(handled__isnull=True).exclude(**_rejected_q)
+
+    # Compteurs des 4 ÉTATS affichés — vocabulaire sans ambiguïté verdict↔décision —
+    # plus `none` (aucun contrôle encore passé). Mutuellement exclusifs, indépendants
+    # du toggle :
+    #   ok       = verdict OK (push), aucune décision        → vert
+    #   failed   = verdict en ÉCHEC, aucune décision         → orange + boutons Recycle/Reject
+    #   recycled = l'opérateur a recyclé (ligne Handled)     → terminal, Download seul
+    #   rejected = l'opérateur a rejeté (operator_rejected)  → terminal, Download seul
+    # NB : un `reject` MOTEUR (quarantine, sans décision) tombe dans `failed` — plus
+    # jamais « Rejected » tant qu'aucune décision opérateur n'est prise.
+    _vis = ReceivedFile.objects.filter(state__in=states)
+    _und = _undecided(_vis)
+    per_display_state = {}
+    for key, n in (
+        ('ok', _und.filter(control_class=Event.MonitoringClass.PUSH).count()),
+        ('failed', _und.filter(control_class__in=TRIAGE_FAILURE_CLASSES).count()),
+        ('recycled', _vis.filter(handled__isnull=False).count()),
+        ('rejected', _vis.filter(**_rejected_q).distinct().count()),
+        ('none', _und.filter(control_class__isnull=True).count()),
+    ):
+        if n:
+            per_display_state[key] = n
+
+    # Filtre par état affiché (chip cliquable). `recycled`/`rejected` outrepassent le
+    # masquage par défaut (sinon rien à voir) ; `ok`/`failed`/`none` restent sur les
+    # fichiers SANS décision. Autre valeur → pas de filtre (vue par défaut masquée).
+    control_filter = request.GET.get('control')
+    if control_filter == 'recycled':
+        base = base.filter(handled__isnull=False)
+    elif control_filter == 'rejected':
+        base = base.filter(**_rejected_q).distinct()
+    elif control_filter == 'ok':
+        base = _undecided(base).filter(control_class=Event.MonitoringClass.PUSH)
+    elif control_filter == 'failed':
+        base = _undecided(base).filter(control_class__in=TRIAGE_FAILURE_CLASSES)
+    elif control_filter == 'none':
+        base = _undecided(base).filter(control_class__isnull=True)
+    else:
+        control_filter = None
+        base = _hide_resolved(base)
+
+    # Total des lignes correspondant au(x) filtre(s), AVANT pagination (top-N).
+    matched_total = base.count()
+
+    # Taille de page (?limit=), bornée pour protéger le payload et la DB.
+    try:
+        limit = int(request.GET.get('limit', MONITORING_FEED_LIMIT))
+    except (TypeError, ValueError):
+        limit = MONITORING_FEED_LIMIT
+    limit = max(1, min(limit, MONITORING_FEED_MAX))
+
+    # Décalage de pagination (?offset=). Borné à >= 0 ; si l'offset dépasse le
+    # total filtré (vue/tri/filtre changé, lignes passées en History entre deux
+    # polls…), on recale sur la dernière page non vide plutôt que de renvoyer une
+    # page vide. L'UI resynchronise son offset sur celui renvoyé.
+    try:
+        offset = int(request.GET.get('offset', 0))
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, offset)
+    if matched_total and offset >= matched_total:
+        offset = ((matched_total - 1) // limit) * limit
+
+    # Annotations pour le tri serveur des champs dérivés :
+    #  - _filename : basename de s3_key (tout après le dernier '/'), insensible à la casse ;
+    #  - _elapsed  : durée de transfert (ms) extraite du JSON `raw` et castée en nombre ;
+    #  - _stored_eff : horodatage « dernière colonne » en History (archive/suppression/stockage) ;
+    #  - _ctrl_sev : sévérité de la classe de monitoring matérialisée (control_class),
+    #    pour trier la colonne « Contrôles » par GRAVITÉ et non alphabétiquement
+    #    (NULL/inconnu → -1, le moins sévère). Worst-wins déjà matérialisé en amont.
+    ctrl_sev = Case(
+        *[When(control_class=cls, then=Value(sev))
+          for cls, sev in MONITORING_SEVERITY.items()],
+        default=Value(-1), output_field=IntegerField(),
+    )
+    base = base.annotate(
+        _filename=Lower(Func(
+            F('s3_key'), Value(r'^.*/'), Value(''),
+            function='regexp_replace', output_field=CharField())),
+        _elapsed=Cast(KeyTextTransform('elapsed', 'raw'), FloatField()),
+        _stored_eff=Coalesce('archived_at', 'deleted_at', 'stored_at'),
+        _ctrl_sev=ctrl_sev,
+    )
+
+    sort = request.GET.get('sort')
+    direction = 'desc' if request.GET.get('dir') == 'desc' else 'asc'
+    if sort in SORT_KEYS:
+        source = {
+            'id': F('id'),
+            'state': F('state'),
+            'filename': F('_filename'),
+            'username': Lower('username'),
+            'protocol': Lower('protocol'),
+            'ip': F('ip'),                # GenericIPAddressField → inet : tri numérique natif
+            'file_size': F('file_size'),
+            'elapsed_ms': F('_elapsed'),
+            'received_at': F('received_at'),
+            # stored_at : effectif (archive/suppr/stockage) en History, brut en Live.
+            'stored_at': F('_stored_eff') if view == 'history' else F('stored_at'),
+            # control : tri par sévérité de la classe (desc = le plus grave en tête).
+            'control': F('_ctrl_sev'),
+        }[sort]
+        primary = (source.desc(nulls_last=True) if direction == 'desc'
+                   else source.asc(nulls_last=True))
+        # Tri explicite : on l'honore tel quel (pas de « failed en tête »), avec un
+        # départage déterministe par récence puis id.
+        qs = list(base.order_by(primary, '-received_at', '-id')[offset:offset + limit])
+    elif view == 'live':
+        # Ordre par défaut Live : erreurs (failed) en tête, puis les plus récents.
+        sort = None
         err_first = Case(
             When(state=ReceivedFile.State.FAILED, then=Value(0)),
             default=Value(1),
             output_field=IntegerField(),
         )
         qs = list(base.annotate(_err_first=err_first)
-                  .order_by('_err_first', '-received_at')[:MONITORING_FEED_LIMIT])
+                  .order_by('_err_first', '-received_at', '-id')[offset:offset + limit])
     else:
-        qs = list(base.order_by('-received_at')[:MONITORING_FEED_LIMIT])
+        sort = None
+        qs = list(base.order_by('-received_at', '-id')[offset:offset + limit])
+
+    # Fichiers « traités » (sparse) + rejetés opérateur parmi les lignes de la page
+    # (batché pour éviter le N+1 ; pilotent `handled` et `can_remediate`).
+    page_ids = [rf.pk for rf in qs]
+    handled_ids = set(
+        Handled.objects.filter(file_id__in=page_ids).values_list('file_id', flat=True))
+    rejected_ids = operator_rejected_ids(page_ids)
+
+    def _display_state(rf):
+        # Les 4 états sans ambiguïté (cf. compteurs ci-dessus). La décision opérateur
+        # (Recycled/Rejected) prime sur le verdict ; un `reject` moteur sans décision
+        # reste « failed » (jamais « rejected »).
+        if rf.pk in handled_ids:
+            return 'recycled'
+        if rf.pk in rejected_ids:
+            return 'rejected'
+        if rf.control_class == Event.MonitoringClass.PUSH:
+            return 'ok'
+        if rf.control_class in TRIAGE_FAILURE_CLASSES:
+            return 'failed'
+        return 'none'
 
     def to_row(rf):
         name = posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)'
         # Durée de transfert : SFTPGo la fournit dans le payload (`elapsed`, ms).
         elapsed = rf.raw.get('elapsed') if isinstance(rf.raw, dict) else None
+        ds = _display_state(rf)
         return {
             'id': rf.pk,
             'state': rf.state,
@@ -354,14 +615,26 @@ def monitoring_feed(request):
             'deleted_at': rf.deleted_at.isoformat() if rf.deleted_at else None,
             'archived_at': rf.archived_at.isoformat() if rf.archived_at else None,
             'downloadable': rf.state == ReceivedFile.State.STORED,
+            # Axe contrôles : classe « worst-wins » matérialisée (read-model). Badge
+            # générique du board ; le détail par contrôle est dans la modale (dbl-clic).
+            'control_class': rf.control_class,
+            # Triage (étape 5) : booléen « traité » AU NIVEAU FICHIER. Couplage
+            # strict ⟹ vrai uniquement sur un OK (``push``) retraité ; le front
+            # n'affiche le badge que si `control_class === 'push' && handled`.
+            'handled': rf.pk in handled_ids,
             # Actions disponibles côté UI (gardées aussi côté serveur).
             'can_archive': rf.state == ReceivedFile.State.FAILED,
             'can_restore': rf.state == ReceivedFile.State.ARCHIVED,
+            # État affiché (4 états sans ambiguïté) — pilote badge + boutons. `failed`
+            # = échec SANS décision opérateur ⟹ seul état qui propose Recycle/Reject.
+            'display_state': ds,
+            'can_remediate': ds == 'failed',
         }
 
     # Compteurs globaux par état (indexés) : pilotent les chips + le badge History.
+    # Respectent le masquage des traités (cohérence avec les lignes/compteurs visibles).
     per_state = {s.value: 0 for s in ReceivedFile.State}
-    for row in ReceivedFile.objects.values('state').annotate(n=Count('id')):
+    for row in _hide_resolved(ReceivedFile.objects.all()).values('state').annotate(n=Count('id')):
         per_state[row['state']] = row['n']
     live_total = sum(per_state[s.value] for s in LIVE_STATES)
     history_total = sum(per_state[s.value] for s in HISTORY_STATES)
@@ -370,7 +643,635 @@ def monitoring_feed(request):
         'view': view,
         'rows': [to_row(rf) for rf in qs],
         'per_state': per_state,
+        'per_display_state': per_display_state,
         'live_total': live_total,
         'history_total': history_total,
+        # Écho de la requête de tri/filtre + cardinalités (pilote « affichés / total »).
+        'state_filter': state_filter,
+        'control_filter': control_filter,
+        'show_handled': show_handled,
+        'sort': sort,
+        'dir': direction if sort else None,
+        'limit': limit,
+        'offset': offset,
+        'matched_total': matched_total,
+        'returned': len(qs),
         'server_time': timezone.now().isoformat(),
     })
+
+
+@staff_member_required
+def business_monitoring_page(request):
+    """Board **métier** (§1.6-c) : verdict d'identification par partition (sous-fonds
+    × valuation_date × feed). Polling JS, voir ``business_monitoring.html``."""
+    return render(request, 'business_monitoring.html',
+                  {'feed_limit': MONITORING_FEED_LIMIT})
+
+
+@staff_member_required
+def business_monitoring_feed(request):
+    """JSON du board métier : une page de partitions (projection ``IdentificationPartition``)
+    + compteurs par ``control_class``.
+
+    Lit la **projection matérialisée** (pas les Events : pas de worst-wins à chaud).
+    ``?control=`` filtre par classe (ou ``fails`` = échecs actionnables) ; ``?limit=``
+    (défaut 50, borné 500) / ``?offset=`` paginent ; tri par défaut = dernier événement.
+    Lecture seule, gardée staff. Pas de filtre ``sub_tenant`` en lecture — fidèle au
+    board IT (isolation stampée à l'écriture, mono-tenant GIL)."""
+    # Compteurs par classe sur TOUTE la projection (chips), cohérents avec le filtre.
+    per_class = {c.value: 0 for c in Event.MonitoringClass}
+    for row in (IdentificationPartition.objects
+                .values('control_class').annotate(n=Count('id'))):
+        per_class[row['control_class']] = row['n']
+    fails_total = sum(per_class[c] for c in TRIAGE_FAILURE_CLASSES)
+    total = sum(per_class.values())
+
+    # ``select_related('received_file')`` : la colonne « Date réception » lit
+    # ``received_file.received_at`` → évite le N+1 sur la page de partitions.
+    qs = IdentificationPartition.objects.select_related(
+        'sub_fund', 'feed', 'received_file')
+    control = request.GET.get('control')
+    if control == 'fails':
+        qs = qs.filter(control_class__in=TRIAGE_FAILURE_CLASSES)
+    elif control in per_class:
+        qs = qs.filter(control_class=control)
+    else:
+        control = None
+    # Filtre AFFICHAGE pur sur le jour de réception observé (défaut = TOUS). Ne touche
+    # PAS aux compteurs/chips (per_class reste global, cf. décision §1.6-c).
+    reception_date = request.GET.get('reception_date') or None
+    if reception_date:
+        qs = qs.filter(received_file__received_at__date=reception_date)
+    matched_total = qs.count()
+
+    try:
+        limit = int(request.GET.get('limit', MONITORING_FEED_LIMIT))
+    except (TypeError, ValueError):
+        limit = MONITORING_FEED_LIMIT
+    limit = max(1, min(limit, MONITORING_FEED_MAX))
+    try:
+        offset = max(0, int(request.GET.get('offset', 0)))
+    except (TypeError, ValueError):
+        offset = 0
+
+    rows = [{
+        'id': p.id,
+        'sub_fund_value': p.sub_fund_value,
+        # Canonique si résolu, sinon null (badge « candidat »).
+        'sub_fund_key': p.sub_fund.key if p.sub_fund_id else None,
+        'valuation_date_value': p.valuation_date_value,
+        'feed': str(p.feed),
+        'control_class': p.control_class,
+        'is_known_subfund': p.is_known_subfund,
+        'received_file_id': p.received_file_id,
+        # Date de réception du fichier COURANT (dernier contributeur, = source du #NNN).
+        'received_at': (p.received_file.received_at.isoformat()
+                        if p.received_file_id and p.received_file.received_at else None),
+        'last_event_at': p.last_event_at.isoformat() if p.last_event_at else None,
+    } for p in qs[offset:offset + limit]]
+
+    return JsonResponse({
+        'rows': rows,
+        'per_class': per_class,
+        'fails_total': fails_total,
+        'total': total,
+        'control_filter': control,
+        'reception_date_filter': reception_date,
+        'limit': limit,
+        'offset': offset,
+        'matched_total': matched_total,
+        'returned': len(rows),
+        'server_time': timezone.now().isoformat(),
+    })
+
+
+# ── §3.8 — Moniteur d'attente VNI (lecture pure, calcul à la volée) ────────────
+# Confronte l'attente déclarative (§3.7 ``NavCalendarEntry``) aux arrivées réelles
+# (§1.6-c ``IdentificationPartition``). v1 : cadence ``daily`` seule (les autres sont
+# listées « non expansible »). AUCUNE écriture, AUCUNE projection matérialisée.
+EXPECTED_VERDICTS = ('missing', 'late', 'pending', 'on_time', 'not_due',
+                     'unanchored', 'non_expansible')
+LUX_TZ = ZoneInfo('Europe/Luxembourg')
+# Formats de repli si le feed ne déclare pas de ``format`` dans ``column_contracts``
+# (cf. admission._declared_date_format). Couvre l'ISO, le numérique et ``25-Mar-2026``.
+_FALLBACK_DATE_FORMATS = ('%Y-%m-%d', '%Y%m%d', '%d/%m/%Y', '%d-%m-%Y',
+                          '%Y/%m/%d', '%d-%b-%Y')
+
+
+def _declared_date_format(feed, field='valuation_date'):
+    """Format de date déclaré pour ``field`` dans le ``column_contracts`` du feed
+    (§1.5+), ou ``None`` — même source que le parsing/admission."""
+    layout = feed.layout if isinstance(getattr(feed, 'layout', None), dict) else {}
+    for c in (layout.get('column_contracts') or []):
+        if c.get('as') == field and c.get('type') == 'date':
+            return c.get('format')
+    return None
+
+
+def _parse_valuation_date(feed, raw):
+    """Parse la valeur brute de valo (chaîne format provider) en ``date`` réelle, via
+    le format déclaré puis repli. ``None`` si illisible (la partition ne matchera pas)."""
+    s = (raw or '').strip()
+    if not s:
+        return None
+    declared = _declared_date_format(feed)
+    for fmt in ([declared] if declared else []) + list(_FALLBACK_DATE_FORMATS):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+@staff_member_required
+def business_expected_page(request):
+    """Écran §3.8 : VNI attendues à une date donnée + verdict de timeliness.
+    Polling JS, voir ``business_expected.html``."""
+    return render(request, 'business_expected.html', {})
+
+
+@staff_member_required
+def business_expected_feed(request):
+    """JSON du moniteur d'attente : pour la date ``?date=`` (défaut aujourd'hui), une
+    ligne par ``NavCalendarEntry`` active avec sa valuation date attendue, son
+    expected_delivery (= valo + lag jours ouvrés) et son **verdict**.
+
+    Calcul **à la volée** (aucune table) ; lecture seule, gardée staff. v1 = cadence
+    ``daily`` ; ``weekly/monthly/quarterly`` → ``non_expansible`` (ancrage différé) ;
+    entrée sans calendrier → ``unanchored``. Confrontation aux arrivées réelles via
+    ``IdentificationPartition`` (parse de la valo brute avec le format déclaré)."""
+    from .models import NavCalendarEntry  # local : évite tout cycle d'import
+
+    raw_date = request.GET.get('date')
+    target = None
+    if raw_date:
+        try:
+            target = datetime.strptime(raw_date, '%Y-%m-%d').date()
+        except ValueError:
+            target = None
+    if target is None:
+        target = timezone.localdate()
+
+    now = timezone.now()
+    entries = list(NavCalendarEntry.objects
+                   .filter(status=NavCalendarEntry.Status.ACTIVE)
+                   .select_related('sub_fund', 'business_calendar')
+                   .order_by('sub_fund__key'))
+
+    # Un calculateur jours ouvrés par calendrier (mémoïsé : pas de N+1).
+    _bd_cache = {}
+
+    def days_for(cal):
+        if cal.id not in _bd_cache:
+            _bd_cache[cal.id] = BusinessDays(cal)
+        return _bd_cache[cal.id]
+
+    # Pré-charge les partitions des compartiments concernés → map des arrivées réelles
+    # (sub_fund_id, valo_iso) → (partition, received_at) la plus récemment reçue.
+    sf_ids = {e.sub_fund_id for e in entries}
+    actual = {}
+    for p in (IdentificationPartition.objects
+              .filter(sub_fund_id__in=sf_ids)
+              .select_related('feed', 'received_file')):
+        vd = _parse_valuation_date(p.feed, p.valuation_date_value)
+        if vd is None:
+            continue
+        ra = p.received_file.received_at if p.received_file_id else None
+        key = (p.sub_fund_id, vd)
+        cur = actual.get(key)
+        if cur is None or (ra and (cur[1] is None or ra > cur[1])):
+            actual[key] = (p, ra)
+
+    rows = []
+    for e in entries:
+        row = {
+            'id': e.id,
+            'sub_fund_key': e.sub_fund.key,
+            'cadence': e.cadence,
+            'lag': e.lag,
+            'deadline_time': e.deadline_time.strftime('%H:%M'),
+            'business_calendar': (e.business_calendar.code
+                                  if e.business_calendar_id else None),
+            'expected_valuation_date': None,
+            'expected_delivery': None,
+            'received_at': None,
+            'received_file_id': None,
+            'verdict': None,
+        }
+        if e.business_calendar_id is None:
+            row['verdict'] = 'unanchored'            # pas de calendrier → on ne devine pas
+        elif e.cadence != NavCalendarEntry.Cadence.DAILY:
+            row['verdict'] = 'non_expansible'        # ancrage non-daily différé (§3.8-b)
+        else:
+            bd = days_for(e.business_calendar)
+            if not bd.is_business_day(target):
+                row['verdict'] = 'not_due'           # D non ouvré → aucune livraison ce jour
+            else:
+                vd = bd.subtract(target, e.lag)      # valo attendue = D − lag ouvrés
+                # Échéance = expected_delivery (D) à l'heure limite, fuseau Luxembourg.
+                deadline = datetime.combine(target, e.deadline_time, tzinfo=LUX_TZ)
+                row['expected_valuation_date'] = vd.isoformat()
+                row['expected_delivery'] = target.isoformat()
+                hit = actual.get((e.sub_fund_id, vd))
+                if hit and hit[1] is not None:
+                    p, ra = hit
+                    row['received_at'] = ra.isoformat()
+                    row['received_file_id'] = p.received_file_id
+                    row['verdict'] = 'on_time' if ra <= deadline else 'late'
+                else:
+                    row['verdict'] = 'pending' if now <= deadline else 'missing'
+        rows.append(row)
+
+    per_verdict = {v: 0 for v in EXPECTED_VERDICTS}
+    for r in rows:
+        per_verdict[r['verdict']] = per_verdict.get(r['verdict'], 0) + 1
+
+    vfilter = request.GET.get('verdict')
+    if vfilter in per_verdict:
+        shown = [r for r in rows if r['verdict'] == vfilter]
+    else:
+        vfilter = None
+        shown = rows
+
+    return JsonResponse({
+        'date': target.isoformat(),
+        'rows': shown,
+        'per_verdict': per_verdict,
+        'total': len(rows),
+        'returned': len(shown),
+        'verdict_filter': vfilter,
+        'server_time': now.isoformat(),
+    })
+
+
+@staff_member_required
+def monitoring_causes(request):
+    """Agrégation « par cause » des contrôles en échec courants (complément).
+
+    Vue de **second niveau** (unité de travail = le fichier, cf. design §7) : regroupe
+    l'état **courant** des contrôles en échec (dernier ``Event`` par
+    ``(file, stage, control)``, ``result=failed``) par **cause** =
+    ``(stage, control, monitoring_class, reason)``. Pour chaque cause : nombre de
+    fichiers, partenaires dominants, quelques exemples. Sert à voir que « N lignes
+    partagent une cause » et à **surfacer les signaux** (un même ``warning_action``
+    sur 2092 fichiers = une action). Lecture seule, gardée staff ; ne modifie rien.
+    """
+    view = 'history' if request.GET.get('view') == 'history' else 'live'
+    states = HISTORY_STATES if view == 'history' else LIVE_STATES
+    file_ids = list(ReceivedFile.objects.filter(state__in=states)
+                    .values_list('id', flat=True))
+
+    # État courant de chaque contrôle (dernier event par (file, stage, control)).
+    events = (Event.objects.filter(file_id__in=file_ids)
+              .order_by('file_id', 'stage', 'control', '-created_at', '-id')
+              .values('file_id', 'stage', 'control', 'monitoring_class', 'result', 'detail'))
+    current = {}
+    for e in events:
+        key = (e['file_id'], e['stage'], e['control'])
+        if key not in current:
+            current[key] = e
+
+    # Regrouper les contrôles COURANTS en échec par cause.
+    causes = {}
+    affected = set()
+    for e in current.values():
+        if e['result'] != Event.Result.FAILED:
+            continue
+        affected.add(e['file_id'])
+        detail = e['detail'] if isinstance(e['detail'], dict) else {}
+        reason = detail.get('reason') or '—'
+        key = (e['stage'], e['control'], e['monitoring_class'], reason)
+        agg = causes.get(key)
+        if agg is None:
+            agg = causes[key] = {
+                'stage': e['stage'], 'control': e['control'],
+                'monitoring_class': e['monitoring_class'], 'reason': reason,
+                'count': 0, '_users': Counter(), '_examples': [], '_files': [],
+            }
+        agg['count'] += 1
+        agg['_files'].append(e['file_id'])
+        # On compte aussi l'username vide ('' = partenaire « vide » bien réel ici) ;
+        # l'UI l'affiche « ∅ ». most_common surface le(s) partenaire(s) dominant(s).
+        agg['_users'][detail.get('username') or ''] += 1
+        if len(agg['_examples']) < 5:
+            agg['_examples'].append(e['file_id'])
+
+    # Résoudre les noms d'exemples (une seule requête).
+    ex_ids = {fid for c in causes.values() for fid in c['_examples']}
+    names = {}
+    if ex_ids:
+        for rf in (ReceivedFile.objects.filter(id__in=ex_ids)
+                   .values('id', 's3_key', 'path')):
+            names[rf['id']] = posixpath.basename(
+                rf['s3_key'] or rf['path'] or '') or '(sans nom)'
+
+    # Triage (étape 5) — réconciliation AU NIVEAU FICHIER uniquement : le triage par
+    # cause (``TriageAck``) a été retiré. Un fichier « traité » = ligne Handled (sparse).
+    handled_files = set(
+        Handled.objects.filter(file_id__in=affected)
+        .values_list('file_id', flat=True))
+
+    open_files = set()   # fichiers « à traiter » (non traités), distincts
+    rows = []
+    for key, c in causes.items():
+        files = c['_files']
+        n_file_resolved = sum(1 for fid in files if fid in handled_files)
+        # « À traiter » dans cette cause = les fichiers non traités (sans Handled).
+        n_open = c['count'] - n_file_resolved
+        open_files.update(fid for fid in files if fid not in handled_files)
+        rows.append({
+            'stage': c['stage'], 'control': c['control'],
+            'monitoring_class': c['monitoring_class'], 'reason': c['reason'],
+            'count': c['count'],
+            'open_count': n_open,
+            'file_resolved_count': n_file_resolved,
+            'top_users': [{'username': u, 'count': n} for u, n in c['_users'].most_common(3)],
+            'examples': [names.get(fid, str(fid)) for fid in c['_examples']],
+        })
+    # Tri : le plus sévère d'abord, puis le plus gros volume.
+    rows.sort(key=lambda r: (-MONITORING_SEVERITY.get(r['monitoring_class'], -1), -r['count']))
+
+    return JsonResponse({
+        'view': view,
+        'causes': rows,
+        'cause_total': len(rows),
+        'files_affected': len(affected),
+        'files_open': len(open_files),   # après réconciliation triage (cause × fichier)
+        'server_time': timezone.now().isoformat(),
+    })
+
+
+def _admission_payload(rf):
+    """Trace de contrôle d'un fichier : tous les événements de l'axe contrôles
+    (stages ``admission``, ``qualification``, ``routing``, ``parsing`` **et**
+    ``identification`` — chaque contrôle + le verdict de chaque stage), du plus
+    ancien au plus récent. Forme partagée par ``admission_detail`` (lecture),
+    ``replay_admission`` et ``enrol_feed`` (rejeu). Le stage ``triage`` (décision
+    opérateur) est volontairement exclu de la trace de contrôle.
+
+    Inclut ``load`` (chargement Acta) pour la même raison qu'``identification`` ci-dessous,
+    et ``acta_journal`` : le journal Acta du dernier chargement (cf. ``_acta_journal``).
+
+    Inclut ``identification`` (§1.6) : son contrôle alimente le ``control_class``
+    (worst-wins, badge du board) — l'exclure rendait le badge « inexpliqué » quand
+    seul l'identification était non-verte (modale toute verte, badge orange).
+
+    Expose aussi de quoi proposer l'enrôlement d'une feed côté UI :
+    ``subfolder`` (le dossier du fichier) et ``needs_feed`` (vrai si le
+    fichier est admis mais que sa qualification est en ``recycle`` faute de
+    feed — miroir de l'enrôlement partenaire pour l'admission)."""
+    from .acta_nav import CTRL_NAV, STAGE as STAGE_LOAD
+    from .admission import STAGE_IDENTIFICATION
+    events = list(Event.objects
+                  .filter(file=rf, stage__in=(
+                      Event.Stage.ADMISSION, Event.Stage.QUALIFICATION,
+                      Event.Stage.ROUTING, Event.Stage.PARSING, STAGE_IDENTIFICATION,
+                      STAGE_LOAD))
+                  .order_by('created_at', 'id'))
+    last_qual = latest_qualification_event(rf)
+    needs_feed = bool(
+        rf.channel_id and last_qual is not None
+        and last_qual.cause_code == CAUSE_FEED_NOT_FOUND)
+    return {
+        'id': rf.pk,
+        'filename': posixpath.basename(rf.s3_key or rf.path or '') or '(sans nom)',
+        'username': rf.username,
+        'state': rf.state,
+        'subfolder': posixpath.dirname(rf.s3_key or rf.path or '').strip('/'),
+        'needs_feed': needs_feed,
+        'events': [{
+            'stage': e.stage,
+            'control': e.control,
+            'result': e.result,
+            'monitoring_class': e.monitoring_class,
+            'cause_code': e.cause_code,
+            'detail': e.detail if isinstance(e.detail, dict) else {},
+            'created_at': e.created_at.isoformat() if e.created_at else None,
+        } for e in events],
+        'acta_journal': _acta_journal(events, STAGE_LOAD, CTRL_NAV),
+    }
+
+
+def _acta_journal(events, stage, control):
+    """Journal Acta du **dernier** chargement des VNI (``load/acta_nav``), tel que relu
+    par le loader (``Event.detail.journal``) : pas d'appel à Acta à l'ouverture de la
+    modale. ``None`` si le fichier n'a jamais été chargé ou si le journal n'a pas été
+    relu (chargement antérieur au 2026-10-10, Acta injoignable)."""
+    last = next((e for e in reversed(events)
+                 if e.stage == stage and e.control == control), None)
+    journal = (last.detail or {}).get('journal') if last else None
+    if not journal:
+        return None
+    base = f'https://{settings.ACTA_HOST}/admin/entities/navimport'
+    return {**journal, 'file_ref': last.detail.get('file_ref'),
+            'loaded_at': last.created_at.isoformat() if last.created_at else None,
+            'links': {str(i): f'{base}/{i}/change/' for i in journal.get('imports') or []}}
+
+
+@staff_member_required
+def admission_detail(request, pk):
+    """Détail des contrôles d'admission d'un fichier (pour le support).
+
+    Lecture seule, gardée par la session staff. Renvoie TOUS les événements de
+    stage ``admission`` du fichier (chaque contrôle + le verdict), du plus ancien
+    au plus récent — c'est exactement la trace que le support déroule au
+    double-clic sur une ligne du board. N'altère rien (events append-only).
+    """
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    return JsonResponse(_admission_payload(rf))
+
+
+@require_POST
+@staff_member_required
+def replay_admission(request, pk):
+    """Action UI : **rejouer** l'admission d'un fichier (le mécanisme « recycle »).
+
+    Après enrôlement d'un partenaire / autorisation d'un canal au référentiel,
+    l'opérateur rejoue l'admission depuis la modale ; ``file_admission`` réémet un
+    verdict (append-only) et rematérialise le rollup du board. Idempotent et sans
+    effet sur ``ReceivedFile.state`` (cf. api/admission.py). Renvoie le détail
+    d'admission rafraîchi (forme de ``admission_detail``) + le verdict obtenu, pour
+    ré-afficher la modale et laisser le board repoller.
+    """
+    from .admission import file_admission
+
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    verdict = file_admission(rf.pk)
+    if verdict is None:
+        # file_admission avale ses exceptions et renvoie None ; voir django.log.
+        return JsonResponse({'detail': 'rejeu impossible (voir les logs)'}, status=502)
+    logger.info('Replay admission ReceivedFile %s (%s) -> %s par %s',
+                pk, rf.s3_key, verdict, request.user)
+    rf.refresh_from_db()
+    payload = _admission_payload(rf)
+    payload['ok'] = True
+    payload['verdict'] = verdict
+    return JsonResponse(payload)
+
+
+@require_POST
+@staff_member_required
+def enrol_feed(request, pk):
+    """Action UI : **enrôler la feed** d'un sous-dossier (le « recycle » de la
+    qualification, miroir de l'enrôlement partenaire côté admission).
+
+    Déclenchée depuis la modale sur un fichier **admis** dont la qualification est en
+    ``recycle`` (``feed_not_found``). Crée (ou réactive/aligne) la
+    ``Feed`` du couple ``(canal, sous-dossier)`` du fichier — avec une
+    grammaire de nom **optionnelle** (regex ; vide = aucune contrainte) — puis
+    **rejoue l'admission**, qui ré-enchaîne la qualification et rematérialise le
+    rollup du board. Renvoie la trace rafraîchie (forme de ``admission_detail``).
+    """
+    from .models import Feed
+    from .admission import file_admission
+
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    if rf.channel_id is None:
+        # Pas de canal résolu ⇒ rien à qualifier ; on enrôle d'abord le partenaire.
+        return JsonResponse(
+            {'detail': 'fichier non admis (canal non résolu) — enrôler le partenaire d’abord'},
+            status=409)
+
+    subfolder = posixpath.dirname(rf.s3_key or rf.path or '').strip('/')
+    filename_regex = (request.POST.get('filename_regex') or '').strip()
+    if filename_regex:
+        try:
+            re.compile(filename_regex)
+        except re.error as exc:
+            return JsonResponse({'detail': f'regex invalide : {exc}'}, status=400)
+    grammar = {'filename': filename_regex} if filename_regex else {}
+
+    # N Feeds par (canal, sous-dossier) depuis §1.4 : la grammaire fait partie
+    # de la clé d'idempotence (une ligne par motif). La Route s'assigne séparément
+    # (admin) ; un enrôlement sans route → qualifié puis recycle (route_not_configured).
+    nom, created = Feed.objects.get_or_create(
+        channel_id=rf.channel_id, subfolder=subfolder, grammar=grammar,
+        defaults={'sub_tenant_id': rf.sub_tenant_id, 'active': True})
+    if not created and not nom.active:
+        nom.active = True
+        nom.save(update_fields=['active'])
+    logger.info('Enrôlement feed #%s (canal=%s subfolder=%r created=%s) par %s',
+                nom.pk, rf.channel_id, subfolder, created, request.user)
+
+    verdict = file_admission(rf.pk)   # ré-enchaîne admission + qualification
+    if verdict is None:
+        return JsonResponse({'detail': 'rejeu impossible (voir les logs)'}, status=502)
+    rf.refresh_from_db()
+    payload = _admission_payload(rf)
+    payload['ok'] = True
+    payload['verdict'] = verdict
+    payload['feed_created'] = created
+    return JsonResponse(payload)
+
+
+@require_POST
+@staff_member_required
+def recycle_file(request, pk):
+    """Action UI : **Recycle** — **mécanisme unique** de retraitement d'un échec.
+
+    Rejoue ``file_admission`` (ré-émet admission + qualification, append-only,
+    re-dérive ``control_class``) **et** — couplage strict, hérité de l'ancien
+    « Handle » qu'il remplace — pose le flag set-once ``Handled`` **ssi** le
+    re-contrôle aboutit à un OK (``push``). Sinon le fichier reste en échec, sans
+    flag. Garde serveur partagée avec Reject (``_triage_eligible``) : 409 sur un
+    fichier OK ou déjà tranché. Le flag n'existe QUE pour un OK obtenu ici (un OK
+    natif via reconcile/modale n'a pas de badge).
+    """
+    from .admission import file_admission
+
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    if not _triage_eligible(rf):
+        return JsonResponse(
+            {'detail': 'fichier non remédiable (OK ou déjà tranché)'}, status=409)
+    verdict = file_admission(rf.pk)
+    if verdict is None:
+        return JsonResponse({'detail': 'rejeu impossible (voir les logs)'}, status=502)
+    rf.refresh_from_db()
+    handled = (rf.control_class == Event.MonitoringClass.PUSH)
+    if handled:
+        # Set-once : on ne réécrit pas un tampon existant (pas de owner volatile).
+        Handled.objects.get_or_create(
+            file=rf, defaults={'owner': request.user.get_username(),
+                               'sub_tenant_id': rf.sub_tenant_id})
+    logger.info('Recycle ReceivedFile %s (%s) -> %s handled=%s par %s',
+                pk, rf.s3_key, verdict, handled, request.user)
+    return JsonResponse({'ok': True, 'id': rf.pk, 'control_class': rf.control_class,
+                         'verdict': verdict, 'handled': handled})
+
+
+@require_POST
+@staff_member_required
+def reject_file(request, pk):
+    """Action UI : **Reject** — décision opérateur TERMINALE sur un fichier en échec.
+
+    Appende un Event de triage ``operator_rejected`` (append-only, audit) puis
+    rematérialise la classe : le court-circuit de ``refresh_control_class`` force
+    ``reject`` (le terminal humain prime sur l'actionnable ``recycle``). Garde
+    serveur partagée avec Recycle (``_triage_eligible``) : refus 409 sur un fichier
+    OK ou déjà tranché. Définitif (mutuellement exclusif avec Recycle ensuite).
+    """
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    if not _triage_eligible(rf):
+        return JsonResponse(
+            {'detail': 'fichier non remédiable (OK ou déjà tranché)'}, status=409)
+    with run_scope():
+        Event.objects.create(
+            file=rf, sub_tenant_id=rf.sub_tenant_id, stage=Event.Stage.TRIAGE,
+            control='operator_decision', result=Event.Result.FAILED,
+            monitoring_class=Event.MonitoringClass.REJECT, cause_code=OPERATOR_REJECTED,
+            detail={'by': request.user.get_username()})
+        refresh_control_class([rf.pk])
+    rf.refresh_from_db()
+    logger.info('Reject (triage) ReceivedFile %s (%s) par %s', pk, rf.s3_key, request.user)
+    return JsonResponse({'ok': True, 'id': rf.pk, 'control_class': rf.control_class})
+
+
+@require_POST
+@staff_member_required
+def replay_all_controls(request, pk):
+    """Action UI : **relancer TOUTE la chaîne de contrôles** d'un fichier.
+
+    Déclenchée au double-clic sur le badge de contrôle du board. Rejoue la chaîne
+    complète — ``file_admission`` (admission→qualification→routing→parsing) **puis**
+    ``file_identification`` (§1.6) — à l'image de l'orchestrateur webhook
+    (``SFTPWebhookView._run_admission``). Contrairement à ``replay_admission``
+    (admission seule), couvre l'identification : c'est le geste self-service qui
+    remplace ``manage.py run_identification`` après un correctif de config amont
+    (profil d'identification, référentiel, alias). Non bloquant, append-only,
+    idempotent ; les deux moteurs rematérialisent ``control_class`` en ``finally``.
+    Sans effet sur ``ReceivedFile.state``. Renvoie la classe de contrôle rafraîchie.
+
+    ⚠️ Le ré-jeu de l'identification est gardé par la **qualification**, PAS par
+    ``control_class`` : après ``file_admission``, la passe d'identification la plus
+    récente reste la PRÉCÉDENTE (stale) tant qu'on ne l'a pas rejouée, donc le
+    worst-wins ``control_class`` refléterait encore son ``warning_action`` et — si on
+    gardait le ``== PUSH`` de l'orchestrateur — empêcherait justement le re-jeu qui
+    la corrige. On identifie donc dès que le fichier est (re)qualifié (feed
+    résoluble), miroir du gardien interne de ``file_identification``.
+    """
+    from .admission import VERDICT_ADMIS, file_admission, file_identification
+    from .qualification import VERDICT_QUALIFIED
+
+    rf = get_object_or_404(ReceivedFile, pk=pk)
+    verdict = file_admission(rf.pk)
+    if verdict is None:
+        # file_admission avale ses exceptions et renvoie None ; voir django.log.
+        return JsonResponse({'detail': 'rejeu impossible (voir les logs)'}, status=502)
+    # Identification re-jouée ssi CETTE passe d'admission aboutit à ``admis`` ET que
+    # le fichier est (re)qualifié. Le double garde-fou est nécessaire : ``file_admission``
+    # ne ré-émet la qualification QUE si son verdict est ``admis`` (cf. admission.py) ;
+    # sans le test ``verdict == VERDICT_ADMIS``, un fichier basculé en recycle/quarantine
+    # par le re-jeu (partenaire révoqué, canal supprimé) garderait son ANCIEN Event
+    # ``QUALIFIED`` (append-only, latest-wins) → on identifierait un fichier qui n'est
+    # PLUS admis, divergeant de l'orchestrateur webhook (gardé sur ``control_class==PUSH``).
+    ql = latest_qualification_event(rf)
+    if (verdict == VERDICT_ADMIS and ql is not None
+            and ql.detail.get('verdict') == VERDICT_QUALIFIED):
+        file_identification(rf.pk)   # ne lève jamais ; rematérialise control_class
+        from .acta_nav import maybe_load
+        maybe_load(rf.pk)            # chargement (stratégie de la Route), non bloquant
+    rf.refresh_from_db()
+    logger.info('Replay ALL controls ReceivedFile %s (%s) -> %s par %s',
+                pk, rf.s3_key, verdict, request.user)
+    return JsonResponse({'ok': True, 'id': rf.pk,
+                         'control_class': rf.control_class, 'verdict': verdict})
