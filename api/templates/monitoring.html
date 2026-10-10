@@ -208,6 +208,12 @@
         ctrl_channel_authorised: 'Channel authorised', ctrl_verdict: 'Verdict',
         ctrl_feed_recognised: 'Feed recognised', ctrl_filename_grammar: 'Filename grammar',
         stage_admission: 'admission', stage_qualification: 'qualification',
+        stage_load: 'load', ctrl_acta_nav: 'Acta NAV', ctrl_acta_entities: 'Acta entities', ctrl_acta_plan: 'Acta plan',
+        aj_title: 'Acta journal — last load', aj_imports: 'Acta imports', aj_rows: 'received',
+        aj_stored: 'stored', aj_unchanged: 'unchanged', aj_rejected: 'rejected',
+        aj_mismatch: '⚠ Acta logged {r} NAVs, a different count from what was sent',
+        aj_rej_title: 'Lines rejected by Acta', aj_c_line: 'File line', aj_c_record: 'Record', aj_c_reason: 'Reason',
+        aj_none: 'No line rejected.', aj_more: 'first {n} shown',
         nom_title: 'No feed for this folder', nom_folder: 'Folder',
         nom_regex_label: 'Filename regex (optional)',
         nom_regex_ph: 'e.g. .+\\.csv — empty = no name constraint',
@@ -264,6 +270,12 @@
         ctrl_channel_authorised: 'Canal autorisé', ctrl_verdict: 'Verdict',
         ctrl_feed_recognised: 'Feed reconnu', ctrl_filename_grammar: 'Grammaire du nom',
         stage_admission: 'admission', stage_qualification: 'qualification',
+        stage_load: 'chargement', ctrl_acta_nav: 'VNI Acta', ctrl_acta_entities: 'Entités Acta', ctrl_acta_plan: 'Plan Acta',
+        aj_title: 'Journal Acta — dernier chargement', aj_imports: 'Imports Acta', aj_rows: 'reçues',
+        aj_stored: 'stockées', aj_unchanged: 'inchangées', aj_rejected: 'refusées',
+        aj_mismatch: '⚠ Acta a journalisé {r} VNI, un nombre différent de celui envoyé',
+        aj_rej_title: 'Lignes refusées par Acta', aj_c_line: 'Ligne fichier', aj_c_record: 'Enregistrement', aj_c_reason: 'Motif',
+        aj_none: 'Aucune ligne refusée.', aj_more: '{n} premières affichées',
         nom_title: 'Aucun feed pour ce dossier', nom_folder: 'Dossier',
         nom_regex_label: 'Regex du nom de fichier (optionnel)',
         nom_regex_ph: 'ex. .+\\.csv — vide = aucune contrainte de nom',
@@ -319,6 +331,12 @@
         ctrl_channel_authorised: 'Canale autorizzato', ctrl_verdict: 'Verdetto',
         ctrl_feed_recognised: 'Feed riconosciuto', ctrl_filename_grammar: 'Grammatica del nome',
         stage_admission: 'ammissione', stage_qualification: 'qualificazione',
+        stage_load: 'caricamento', ctrl_acta_nav: 'NAV Acta', ctrl_acta_entities: 'Entità Acta', ctrl_acta_plan: 'Piano Acta',
+        aj_title: 'Registro Acta — ultimo caricamento', aj_imports: 'Import Acta', aj_rows: 'ricevute',
+        aj_stored: 'memorizzate', aj_unchanged: 'invariate', aj_rejected: 'rifiutate',
+        aj_mismatch: '⚠ Acta ha registrato {r} NAV, un numero diverso da quello inviato',
+        aj_rej_title: 'Righe rifiutate da Acta', aj_c_line: 'Riga file', aj_c_record: 'Record', aj_c_reason: 'Motivo',
+        aj_none: 'Nessuna riga rifiutata.', aj_more: 'prime {n} mostrate',
         nom_title: 'Nessun feed per questa cartella', nom_folder: 'Cartella',
         nom_regex_label: 'Regex del nome file (opzionale)',
         nom_regex_ph: 'es. .+\\.csv — vuoto = nessun vincolo sul nome',
@@ -812,7 +830,40 @@
       if (d.pattern) bits.push('pattern=' + d.pattern);
       if (d.filename) bits.push('file=' + d.filename);
       if (d.first) bits.push('first');
+      // chargement Acta (stage load)
+      if (d.counts) bits.push(Object.entries(d.counts).filter(([, n]) => n).map(([k, n]) => k + '=' + n).join(' ') || 'counts=0');
+      if (d.created !== undefined && d.links !== undefined) bits.push(`created=${d.created} links=${d.links}`);
+      if (d.journal && d.journal.imports) bits.push('acta#' + d.journal.imports.join(','));
+      if (d.error) bits.push(d.error);
       return bits.length ? bits.join(' · ') : '—';
+    }
+    // Journal Acta du dernier chargement (`acta_journal` du payload) : compteurs,
+    // liens vers les imports dans l'admin Acta, lignes refusées avec leur motif.
+    function renderActaJournal(j) {
+      if (!j) return '';
+      const links = (j.imports || []).map(id =>
+        `<a href="${esc(j.links[String(id)] || '#')}" target="_blank" rel="noopener">#${esc(String(id))}</a>`).join(' ');
+      const counts = ['rows', 'stored', 'unchanged', 'rejected']
+        .map(k => `${esc(t('aj_' + k))} <strong>${esc(String(j[k] ?? 0))}</strong>`).join(' · ');
+      const mismatch = j.mismatch
+        ? `<div class="empty" style="color:#f87171">${esc(t('aj_mismatch').replace('{r}', j.rows))}</div>` : '';
+      const rej = j.rejected_lines || [];
+      const rejRows = rej.map(l => `<tr>
+          <td>${esc(String(l.source_line_no ?? l.line_no))}</td>
+          <td class="det">${esc(l.source_record_id || '—')}</td>
+          <td class="det">${esc(l.reason || '—')}</td></tr>`).join('');
+      const more = j.rejected > rej.length
+        ? ` <span style="opacity:.6">(${esc(t('aj_more').replace('{n}', rej.length))})</span>` : '';
+      const rejTable = j.rejected
+        ? `<div style="margin:.6rem 0 .3rem"><strong>${esc(t('aj_rej_title'))}</strong>${more}</div>
+           <table><thead><tr><th>${esc(t('aj_c_line'))}</th><th>${esc(t('aj_c_record'))}</th>
+           <th>${esc(t('aj_c_reason'))}</th></tr></thead><tbody>${rejRows}</tbody></table>`
+        : `<div style="opacity:.7;margin-top:.3rem">${esc(t('aj_none'))}</div>`;
+      return `<div style="margin-top:1rem;padding:.6rem;border:1px solid var(--line);border-radius:6px">
+          <div style="margin-bottom:.4rem"><strong>${esc(t('aj_title'))}</strong>
+            <span style="opacity:.6;font-size:.85em"> ${esc(fmtTime(j.loaded_at))}</span></div>
+          <div style="opacity:.8;font-size:.85em;margin-bottom:.3rem"><code>${esc(j.file_ref || '')}</code></div>
+          <div>${esc(t('aj_imports'))} ${links} — ${counts}</div>${mismatch}${rejTable}</div>`;
     }
     function renderAdmission(data) {
       $('modal-title').textContent = t('adm_title');
@@ -852,7 +903,7 @@
       $('modal-body').innerHTML = head + `<table><thead><tr>
           <th>${esc(t('adm_c_control'))}</th><th>${esc(t('adm_c_result'))}</th>
           <th>${esc(t('adm_c_detail'))}</th><th>${esc(t('adm_c_time'))}</th>
-        </tr></thead><tbody>${rows}</tbody></table>`;
+        </tr></thead><tbody>${rows}</tbody></table>` + renderActaJournal(data.acta_journal);
     }
     // Rejeu de l'admission depuis la modale (POST). Réémet un verdict (append-only,
     // idempotent, n'altère pas `state`), ré-affiche les contrôles à jour et fait

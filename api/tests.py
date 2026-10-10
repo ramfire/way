@@ -1968,6 +1968,35 @@ class ActaNavLoaderTests(TestCase):
         self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
         self.assertNotIn('journal', ev.detail)
 
+    def _detail(self, rf):
+        self.client.force_login(get_user_model().objects.create_user('staff', is_staff=True))
+        return self.client.get(f'/monitoring/admission/{rf.pk}/').json()
+
+    def test_file_trace_shows_load_and_acta_journal(self):
+        rf, _ = self._load(self._client(ingest_status='rejected'))
+        body = self._detail(rf)
+        self.assertIn(('load', 'acta_nav'), [(e['stage'], e['control']) for e in body['events']])
+        journal = body['acta_journal']
+        self.assertEqual((journal['imports'], journal['rows'], journal['rejected']), ([1], 2, 2))
+        self.assertEqual(journal['file_ref'], f'alfaway:{rf.pk}:way/LU_PO_NAV_20261002.csv')
+        self.assertTrue(journal['links']['1'].endswith('/admin/entities/navimport/1/change/'))
+        self.assertEqual(journal['rejected_lines'][0]['reason'], 'classe inconnue')
+
+    def test_acta_journal_is_from_the_last_load(self):
+        client = self._client()
+        rf, _ = self._load(client)
+        from .acta_nav import load_file
+        with patch('api.parsing.get_s3_client', return_value=_fake_s3(self.CONTENT)):
+            load_file(rf.pk, client=client)
+        self.assertEqual(self._detail(rf)['acta_journal']['imports'], [2])
+
+    def test_no_acta_journal_without_read_back(self):
+        from .acta import ActaError
+        client = self._client()
+        client.nav_imports.side_effect = ActaError('HTTP 404')
+        rf, _ = self._load(client)
+        self.assertIsNone(self._detail(rf)['acta_journal'])
+
     def test_external_code_refused_rolls_back_entity(self):
         from .acta_nav import load_file
         rf, _ = self._file()

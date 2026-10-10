@@ -1009,6 +1009,9 @@ def _admission_payload(rf):
     ``replay_admission`` et ``enrol_feed`` (rejeu). Le stage ``triage`` (décision
     opérateur) est volontairement exclu de la trace de contrôle.
 
+    Inclut ``load`` (chargement Acta) pour la même raison qu'``identification`` ci-dessous,
+    et ``acta_journal`` : le journal Acta du dernier chargement (cf. ``_acta_journal``).
+
     Inclut ``identification`` (§1.6) : son contrôle alimente le ``control_class``
     (worst-wins, badge du board) — l'exclure rendait le badge « inexpliqué » quand
     seul l'identification était non-verte (modale toute verte, badge orange).
@@ -1017,12 +1020,14 @@ def _admission_payload(rf):
     ``subfolder`` (le dossier du fichier) et ``needs_feed`` (vrai si le
     fichier est admis mais que sa qualification est en ``recycle`` faute de
     feed — miroir de l'enrôlement partenaire pour l'admission)."""
+    from .acta_nav import CTRL_NAV, STAGE as STAGE_LOAD
     from .admission import STAGE_IDENTIFICATION
-    events = (Event.objects
-              .filter(file=rf, stage__in=(
-                  Event.Stage.ADMISSION, Event.Stage.QUALIFICATION,
-                  Event.Stage.ROUTING, Event.Stage.PARSING, STAGE_IDENTIFICATION))
-              .order_by('created_at', 'id'))
+    events = list(Event.objects
+                  .filter(file=rf, stage__in=(
+                      Event.Stage.ADMISSION, Event.Stage.QUALIFICATION,
+                      Event.Stage.ROUTING, Event.Stage.PARSING, STAGE_IDENTIFICATION,
+                      STAGE_LOAD))
+                  .order_by('created_at', 'id'))
     last_qual = latest_qualification_event(rf)
     needs_feed = bool(
         rf.channel_id and last_qual is not None
@@ -1043,7 +1048,24 @@ def _admission_payload(rf):
             'detail': e.detail if isinstance(e.detail, dict) else {},
             'created_at': e.created_at.isoformat() if e.created_at else None,
         } for e in events],
+        'acta_journal': _acta_journal(events, STAGE_LOAD, CTRL_NAV),
     }
+
+
+def _acta_journal(events, stage, control):
+    """Journal Acta du **dernier** chargement des VNI (``load/acta_nav``), tel que relu
+    par le loader (``Event.detail.journal``) : pas d'appel à Acta à l'ouverture de la
+    modale. ``None`` si le fichier n'a jamais été chargé ou si le journal n'a pas été
+    relu (chargement antérieur au 2026-10-10, Acta injoignable)."""
+    last = next((e for e in reversed(events)
+                 if e.stage == stage and e.control == control), None)
+    journal = (last.detail or {}).get('journal') if last else None
+    if not journal:
+        return None
+    base = f'https://{settings.ACTA_HOST}/admin/entities/navimport'
+    return {**journal, 'file_ref': last.detail.get('file_ref'),
+            'loaded_at': last.created_at.isoformat() if last.created_at else None,
+            'links': {str(i): f'{base}/{i}/change/' for i in journal.get('imports') or []}}
 
 
 @staff_member_required
