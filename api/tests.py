@@ -1930,6 +1930,18 @@ class ActaNavLoaderTests(TestCase):
                        if c.args[1] == '/api/v1/ingest/')
         self.assertEqual(payload['file_ref'], f'alfaway:{rf.pk}:way/LU_PO_NAV_20261002.csv')
         self.assertEqual([r['source_line_no'] for r in payload['records']], [1, 2])
+        raw = payload['records'][0]['source_raw']
+        self.assertEqual(list(raw), self.NAMES)            # toutes les colonnes, dans l'ordre
+        self.assertEqual(raw['FX_Rate'], '.887705')        # valeur brute, non inversée
+
+    def test_columns_beyond_the_layout_are_kept(self):
+        from .acta_nav import _rows
+        rf, feed = self._file()
+        line = self.CONTENT.splitlines()[0] + b';extra-1;extra-2\n'
+        with patch('api.parsing.get_s3_client', return_value=_fake_s3(line)):
+            _, row = next(_rows(rf, feed))
+        n = len(self.NAMES)
+        self.assertEqual((row[f'col_{n + 1}'], row[f'col_{n + 2}']), ('extra-1', 'extra-2'))
 
     def test_journal_is_read_back_into_the_event(self):
         rf, ev = self._load(self._client())

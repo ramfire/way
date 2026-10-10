@@ -11,10 +11,11 @@ classe, leurs codes externes ``SOURCE_CODE`` (source ``ACTA_SOURCE``) et le lien
      de chacun, lien ``SHARE_CLASS_OF``. Un code externe refusé → l'entité tout
      juste créée est clôturée (``DELETE`` = ``end_validity``) pour ne pas laisser
      d'orphelin qu'un rejeu dupliquerait ;
-  3. **VNI** : ``POST /api/v1/ingest/`` (``SHARE_CLASS_NAV``, lots ≤ 1000), rejet
+  3. **VNI** : ``POST /api/v1/ingest/`` (``SHARE_CLASS_NAV``, lots ≤ 500), rejet
      unitaire et idempotence côté Acta.
      Le lot porte ``file_ref`` (``alfaway:<id>:<path>``) et chaque VNI sa ligne
-     d'origine (``source_line_no``) ; Acta les trace dans son journal
+     d'origine : numéro (``source_line_no``) et contenu complet, toutes colonnes
+     (``source_raw``, lots ≤ 500 vu la taille) ; Acta les trace dans son journal
      (``/api/v1/nav-imports/``), **relu** après l'ingest : imports créés, NAV
      reçues / stockées / inchangées / refusées, lignes refusées et motif ;
   4. **compte** (dernier contrôle, ``acta_count``) : chaque VNI envoyée doit revenir
@@ -52,7 +53,9 @@ CTRL_PLAN = 'acta_plan'
 CTRL_COUNT = 'acta_count'
 
 NAV_TYPES = {'O': 'OFFICIAL', 'E': 'ESTIMATED', 'T': 'TECHNICAL'}
-INGEST_BATCH = 1000
+# Lots de 500 : avec la ligne d'origine (``source_raw``, ~1,5 Ko pour LU_PO_NAV), un
+# enregistrement pèse ~2 Ko ; 1000 frôlerait la limite Django de 2,5 Mo par requête.
+INGEST_BATCH = 500
 
 
 def _dec(value):
@@ -93,7 +96,10 @@ def _rows(rf, feed):
     text = _fetch_bytes(rf).decode(layout.get('encoding') or 'utf-8')
     delim = layout.get('delimiter') or ','
     for i, line in enumerate(l for l in text.splitlines() if l.strip()):
-        yield i + 1, dict(zip(names, line.split(delim)))
+        values = line.split(delim)
+        # Colonnes au-delà du layout déclaré : gardées (col_<n>), la ligne reste complète.
+        yield i + 1, {**dict(zip(names, values)),
+                      **{f'col_{n}': v for n, v in enumerate(values[len(names):], len(names) + 1)}}
 
 
 def build_plan(rf, feed, client, known_codes=None, currencies=None):
@@ -152,6 +158,7 @@ def build_plan(rf, feed, client, known_codes=None, currencies=None):
             'total_nav_class_ccy': _plain(amt_class),
             'total_nav_fund_ccy': _plain(amt_fund), 'fx_rate': _plain(fx),
             'source_line_no': n,
+            'source_raw': r,     # ligne d'origine complète, stockée telle quelle par Acta
         })
     return plan
 
