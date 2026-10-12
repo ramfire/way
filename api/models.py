@@ -1,5 +1,6 @@
 import contextvars
 import logging
+import re
 import uuid
 from contextlib import contextmanager
 
@@ -277,6 +278,27 @@ class Channel(models.Model):
         return f'{self.kind}:{self.identifier}'
 
 
+def validate_grammar(value):
+    """Validateur de la ``grammar`` d'une Feed, au save (admin compris).
+
+    ``{"filename": "<regex>"}`` doit **compiler** : une regex invalide (ex. glob
+    ``*PO_NAV_.*`` au lieu de ``.*PO_NAV_.*``) ne se verrait qu'à la qualification,
+    en recycle ``grammar_invalid`` pour **chaque** fichier du sous-dossier.
+    ``{}`` / clé absente = aucune contrainte (valide).
+    """
+    if not isinstance(value, dict):
+        raise ValidationError('grammar must be a dict (JSON object).')
+    pattern = value.get('filename')
+    if not pattern:
+        return
+    if not isinstance(pattern, str):
+        raise ValidationError('grammar.filename must be a string (regex).')
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise ValidationError(f'grammar.filename: invalid regex ({exc}).')
+
+
 def validate_layout(value):
     """Validateur **de forme** du descripteur ``layout`` (§1.5), au save.
 
@@ -334,7 +356,7 @@ class Feed(models.Model):
         SubTenant, on_delete=models.PROTECT, related_name='feeds',
     )
     subfolder = models.CharField(max_length=255, blank=True, default='')
-    grammar = models.JSONField(default=dict, blank=True)
+    grammar = models.JSONField(default=dict, blank=True, validators=[validate_grammar])
     mandatory = models.JSONField(default=list, blank=True)
     active = models.BooleanField(default=True)
     # Départage si plusieurs grammaires matchent le même nom (DESC ; le + haut gagne).

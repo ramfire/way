@@ -546,6 +546,16 @@ class QualificationTests(TestCase):
         self.assertEqual(ev.detail['verdict'], qual.VERDICT_RECYCLE)
         self.assertEqual(ev.cause_code, qual.CAUSE_GRAMMAR_INVALID)
 
+    def test_invalid_regex_rejected_at_save(self):
+        # Garde-fou admin : une grammaire qui ne compile pas échoue à full_clean.
+        from django.core.exceptions import ValidationError
+        from .models import validate_grammar
+        validate_grammar({})
+        validate_grammar({'filename': r'.*PO_NAV_.*\.csv'})
+        for bad in ({'filename': r'*PO_NAV_.*\.csv'}, {'filename': 3}, []):
+            with self.assertRaises(ValidationError):
+                validate_grammar(bad)
+
     def test_not_run_when_admission_not_admis(self):
         # Compte non mappé → admission recycle → AUCUN événement de qualification.
         rf = make_file(username='ghost', s3_key='in/ghost/x.csv')
