@@ -1919,6 +1919,28 @@ class ActaNavLoaderTests(TestCase):
         self.assertEqual(plan.funds['FX0001']['valid_from'], '2026-09-30')
         self.assertEqual(len(plan.classes), 2)
 
+    def test_valid_from_capped_at_today_for_future_nav(self):
+        # Acta résout « à maintenant » : une entité datée d'une VNI future y serait
+        # invisible (FA0702, 2026-10-12) → valid_from plafonné à aujourd'hui.
+        with patch('api.acta_nav.timezone.localdate', return_value=date(2026, 9, 15)):
+            plan = self._plan()
+        self.assertEqual(plan.funds['FX0001']['valid_from'], '2026-09-15')
+        self.assertEqual(plan.classes['900001']['valid_from'], '2026-09-15')
+        self.assertEqual(plan.navs[0]['nav_date'], '2026-10-01')
+
+    def test_failed_rollback_is_traced(self):
+        from unittest.mock import MagicMock
+        from .acta_nav import _create_entity
+        c = MagicMock()
+        c.send_json.side_effect = [(201, {'uid': 'u1'}), (400, {'__all__': ['dup']}),
+                                   (404, {'detail': 'not found'})]
+        created, failures = [], []
+        self.assertIsNone(_create_entity(
+            c, {'valid_from': '2026-10-01T00:00:00Z', 'entity_type': 'SUB_FUND'},
+            'FA0702', created, failures))
+        self.assertEqual(failures[0]['rolled_back'], 'u1')
+        self.assertEqual(failures[0]['rollback_failed'], 404)
+
     def test_known_codes_are_not_recreated(self):
         plan = self._plan(known={'FX0001': 'f-uid', '900001': 'c-uid'})
         self.assertEqual(plan.funds['FX0001']['uid'], 'f-uid')

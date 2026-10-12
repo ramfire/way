@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
+from django.utils import timezone
 
 from .acta import ActaClient, ActaError, ActaTimeout, SOURCE_CODE
 from .models import (
@@ -109,6 +110,10 @@ def build_plan(rf, feed, client, known_codes=None, currencies=None):
         settings.ACTA_SOURCE)
     ccys = currencies if currencies is not None else client.currencies()
     plan = Plan()
+    # Acta résout codes et entités « à maintenant » (``.current()``) : une entité
+    # datée d'une VNI future y serait invisible jusqu'à cette date (codes non
+    # retrouvés, VNI « référence non résolue », re-création refusée).
+    today = timezone.localdate().isoformat()
     for n, r in _rows(rf, feed):
         fund, share = r.get('Fund_code', '').strip(), r.get('Share_code', '').strip()
         nav_date = _iso(r.get('NAV_date'))
@@ -139,13 +144,13 @@ def build_plan(rf, feed, client, known_codes=None, currencies=None):
 
         f = plan.funds.setdefault(fund, {
             'code': fund, 'name': r.get('Fund_name', '').strip(), 'currency': fund_ccy,
-            'uid': known.get(fund), 'valid_from': nav_date})
+            'uid': known.get(fund), 'valid_from': min(nav_date, today)})
         f['valid_from'] = min(f['valid_from'], nav_date)
         c = plan.classes.setdefault(share, {
             'code': share, 'fund': fund, 'currency': class_ccy,
             'isin': r.get('ISIN_code', '').strip() or None,
             'name': f"{f['name']} — {r.get('Share_type', '').strip() or share}",
-            'uid': known.get(share), 'valid_from': nav_date})
+            'uid': known.get(share), 'valid_from': min(nav_date, today)})
         c['valid_from'] = min(c['valid_from'], nav_date)
         f['valid_from'] = min(f['valid_from'], c['valid_from'])
 
@@ -176,9 +181,13 @@ def _create_entity(client, payload, code, created, failures):
         'entity': uid, 'source': settings.ACTA_SOURCE, 'code_type': SOURCE_CODE,
         'code': code, 'valid_from': payload['valid_from']})
     if status != 201:
-        client.send_json('DELETE', f'/api/v1/entities/{uid}/', None)
-        failures.append({'code': code, 'step': 'external_code', 'status': status,
-                         'detail': ext, 'rolled_back': uid})
+        del_status, _ = client.send_json('DELETE', f'/api/v1/entities/{uid}/', None)
+        failure = {'code': code, 'step': 'external_code', 'status': status,
+                   'detail': ext, 'rolled_back': uid}
+        if del_status not in (200, 204):
+            # Clôture refusée : l'entité reste orpheline dans Acta (à nettoyer).
+            failure['rollback_failed'] = del_status
+        failures.append(failure)
         return None
     created.append({'code': code, 'uid': uid, 'type': payload['entity_type']})
     return uid
