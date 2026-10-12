@@ -1959,6 +1959,20 @@ class ActaNavLoaderTests(TestCase):
                  if c.args[1] == '/api/v1/entity-relationships/']
         self.assertEqual(len(links), 2)
 
+    def test_plan_read_failure_emits_unreachable_event(self):
+        # Acta injoignable dès la lecture du référentiel (build_plan) : Event
+        # acta_unreachable visible, rien n'est envoyé.
+        from .acta import ActaError
+        client = self._client()
+        client.source_codes.side_effect = ActaError('Acta injoignable : timed out')
+        rf, ev = self._load(client)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.RECYCLE)
+        self.assertEqual(ev.detail['reason'], 'acta_unreachable')
+        self.assertEqual(ev.detail['step'], 'plan')
+        client.send_json.assert_not_called()
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
+
     # --- timeout d'ingest : délai dédié + reprise par le journal --------------
     def test_ingest_uses_dedicated_timeout(self):
         client = self._client()
@@ -2398,6 +2412,24 @@ class ActaClientTimeoutTests(TestCase):
     def test_urlerror_timeout_is_acta_timeout(self):
         import urllib.error
         self.assertTrue(self._raise(urllib.error.URLError(TimeoutError('timed out'))))
+
+    def test_get_json_retries_once_on_timeout(self):
+        from .acta import ActaClient, ActaTimeout
+        c = ActaClient()
+        c._cookies['sessionid'] = 's'
+        with patch.object(c, '_request', side_effect=[
+                ActaTimeout('timed out'), (200, b'{"ok": 1}')]) as req:
+            self.assertEqual(c.get_json('/x'), {'ok': 1})
+        self.assertEqual(req.call_count, 2)
+
+    def test_get_json_gives_up_after_second_timeout(self):
+        from .acta import ActaClient, ActaTimeout
+        c = ActaClient()
+        c._cookies['sessionid'] = 's'
+        with patch.object(c, '_request', side_effect=ActaTimeout('timed out')) as req:
+            with self.assertRaises(ActaTimeout):
+                c.get_json('/x')
+        self.assertEqual(req.call_count, 2)
 
     def test_connection_refused_is_not_timeout(self):
         self.assertFalse(self._raise(ConnectionRefusedError('refused')))

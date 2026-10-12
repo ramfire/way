@@ -397,8 +397,20 @@ def load_file(file_id, dry_run=False, client=None):
     from .admission import _resolve_feed
     rf = ReceivedFile.objects.get(pk=file_id)
     feed = _resolve_feed(rf)
-    client = client or ActaClient()
-    plan = build_plan(rf, feed, client)
+    try:
+        client = client or ActaClient()
+        plan = build_plan(rf, feed, client)
+    except ActaError as e:
+        if dry_run:
+            raise
+        # Lecture du référentiel Acta impossible avant tout envoi : même verdict que
+        # pendant l'ingest. Sans cet Event, l'échec restait invisible (log seul) et
+        # le board affichait encore la passe précédente.
+        with run_scope():
+            _emit(rf, CTRL_NAV, Event.Result.FAILED, Event.MonitoringClass.RECYCLE,
+                  {'reason': 'acta_unreachable', 'step': 'plan', 'error': str(e)[:500]})
+        refresh_control_class([rf.pk])
+        return {'error': str(e)[:500]}, None
     summary = {
         'funds_total': len(plan.funds),
         'funds_to_create': sum(1 for f in plan.funds.values() if f['uid'] is None),

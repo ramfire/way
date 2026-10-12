@@ -102,7 +102,13 @@ class ActaClient:
     def get_json(self, path):
         if 'sessionid' not in self._cookies:
             self.login()
-        status, body = self._request('GET', path)
+        try:
+            status, body = self._request('GET', path)
+        except ActaTimeout as e:
+            # Lecture sans effet de bord : un 2e essai absorbe un ralentissement
+            # passager d'Acta (page de 15 s sous charge, fichier 595).
+            logger.warning('GET %s : timeout, nouvel essai (%s)', path, e)
+            status, body = self._request('GET', path)
         if status != 200:
             raise ActaError(f'GET {path} → HTTP {status}')
         try:
