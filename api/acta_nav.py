@@ -253,6 +253,15 @@ def apply_plan(client, plan, file_ref=None):
                 'name': f['name'] or f['code'], 'entity_type': 'SUB_FUND',
                 'currency': f['currency'], 'valid_from': f'{f["valid_from"]}T00:00:00Z',
             }, f['code'], created, failures)
+    # Classes liées par fonds, lues UNE fois par fonds (``share_classes_of`` = 1 appel
+    # HTTP) : sinon 1 appel par classe — 220 appels pour 67 fonds (~23 s, fichier 595).
+    linked = {}
+
+    def _linked(fund_uid):
+        if fund_uid not in linked:
+            linked[fund_uid] = set(client.share_classes_of(fund_uid))
+        return linked[fund_uid]
+
     for c in plan.classes.values():
         fund = plan.funds[c['fund']]
         if fund['uid'] is None:
@@ -267,13 +276,15 @@ def apply_plan(client, plan, file_ref=None):
             c['uid'] = _create_entity(client, payload, c['code'], created, failures)
             if c['uid'] is None:
                 continue
-        if new_class or c['uid'] not in client.share_classes_of(fund['uid']):
+        if new_class or c['uid'] not in _linked(fund['uid']):
             status, body = client.send_json('POST', '/api/v1/entity-relationships/', {
                 'parent': fund['uid'], 'child': c['uid'],
                 'relationship_type': 'SHARE_CLASS_OF',
                 'valid_from': f'{fund["valid_from"]}T00:00:00Z'})
             if status == 201:
                 links.append({'fund': fund['code'], 'class': c['code']})
+                if fund['uid'] in linked:
+                    linked[fund['uid']].add(c['uid'])
             else:
                 failures.append({'code': c['code'], 'step': 'link', 'status': status,
                                  'detail': body})

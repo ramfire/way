@@ -1939,6 +1939,26 @@ class ActaNavLoaderTests(TestCase):
         self.assertEqual(ev.monitoring_class, Event.MonitoringClass.WARNING_ACTION)
         self.assertEqual(len(ev.detail['rejected']), 2)
 
+    def test_share_classes_read_once_per_fund(self):
+        # 2 classes connues du même fonds, déjà liées : 1 seul appel share-classes,
+        # aucun lien recréé.
+        client = self._client(known={'FX0001': 'f-uid', '900001': 'c1', '900002': 'c2'})
+        client.share_classes_of.return_value = {'c1', 'c2'}
+        _, ev = self._load(client)
+        client.share_classes_of.assert_called_once_with('f-uid')
+        paths = [c.args[1] for c in client.send_json.call_args_list]
+        self.assertNotIn('/api/v1/entity-relationships/', paths)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+
+    def test_unlinked_known_classes_still_linked(self):
+        # Classes connues mais non liées : lecture unique, puis un lien par classe.
+        client = self._client(known={'FX0001': 'f-uid', '900001': 'c1', '900002': 'c2'})
+        self._load(client)
+        client.share_classes_of.assert_called_once_with('f-uid')
+        links = [c for c in client.send_json.call_args_list
+                 if c.args[1] == '/api/v1/entity-relationships/']
+        self.assertEqual(len(links), 2)
+
     # --- timeout d'ingest : délai dédié + reprise par le journal --------------
     def test_ingest_uses_dedicated_timeout(self):
         client = self._client()
