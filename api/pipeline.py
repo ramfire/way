@@ -16,7 +16,7 @@ import logging
 from django.db import transaction
 from django.utils import timezone
 
-from .models import Event, Handled, ReceivedFile
+from .models import Event, Handled, ReceivedFile, current_control_rollup
 
 logger = logging.getLogger(__name__)
 
@@ -42,17 +42,24 @@ def run_pipeline(file_id):
 
     Séparation des stages : le chaînage admission→identification (§1.6-b) vit
     **ici, dans l'orchestrateur**, PAS dans ``file_admission``. L'identification
-    n'est lancée que si l'admission aboutit à un verdict **push**
-    (``control_class``) ; un recycle/reject n'identifie rien.
+    n'est lancée que si l'**amont** (admission → qualification → routing → parsing)
+    est **push** ; un recycle/reject amont n'identifie rien.
+
+    ⚠️ Garde sur l'amont, PAS sur ``control_class`` : ce worst-wins inclut encore la
+    passe PRÉCÉDENTE d'identification/chargement tant qu'on ne l'a pas rejouée. Sur
+    un Recycle après un échec aval (Acta injoignable), ``control_class`` resterait
+    ``recycle`` et bloquerait justement le rejeu qui le corrige (fichier 595).
+    Pour un premier passage (aucun Event aval), les deux gardes coïncident.
 
     Puis chargement (``acta_nav.maybe_load``) : seulement si la Route porte la
     stratégie ``acta_nav`` et que l'amont est ``push`` ; ne lève jamais."""
     try:
-        from .acta_nav import maybe_load
-        from .admission import file_admission, file_identification
+        from .acta_nav import STAGE as STAGE_LOAD, maybe_load
+        from .admission import STAGE_IDENTIFICATION, file_admission, file_identification
         file_admission(file_id)
-        rf = ReceivedFile.objects.get(pk=file_id)
-        if rf.control_class == Event.MonitoringClass.PUSH:
+        upstream = current_control_rollup(
+            [file_id], exclude_stages=(STAGE_IDENTIFICATION, STAGE_LOAD)).get(file_id)
+        if upstream and upstream['monitoring_class'] == Event.MonitoringClass.PUSH:
             file_identification(file_id)
             maybe_load(file_id)
         return True

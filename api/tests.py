@@ -2313,14 +2313,11 @@ class RecycleViaPipelineTests(TestCase):
     def test_worker_runs_identification_and_load_then_flags(self):
         from django.core.management import call_command
 
-        def admis(file_id):
-            ReceivedFile.objects.filter(pk=file_id).update(
-                control_class=Event.MonitoringClass.PUSH)
-            return 'admis'
-
+        # Cause corrigée (enrôlement + feed routée) : l'admission rejouée passe push.
+        enrol('stranger')
+        add_feed('stranger', 'in/acme', r'.+', route=add_route('stranger'))
         self._recycle()
-        with patch('api.admission.file_admission', side_effect=admis), \
-                patch('api.admission.file_identification') as fi, \
+        with patch('api.admission.file_identification') as fi, \
                 patch('api.acta_nav.maybe_load') as ml:
             call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
         fi.assert_called_once_with(self.rf.pk)
@@ -2329,6 +2326,44 @@ class RecycleViaPipelineTests(TestCase):
         self.assertEqual(self.rf.pipeline_state, ReceivedFile.PipelineState.DONE)
         self.assertEqual(self.rf.pipeline_requested_by, '')
         self.assertEqual(Handled.objects.get(file=self.rf).owner, 'staff')
+
+    def test_recycle_after_downstream_failure_replays_identification(self):
+        """Cas du fichier 595 : amont OK, mais dernier chargement en échec (Acta
+        injoignable) → control_class=recycle. Le worker doit quand même rejouer
+        identification + chargement (garde sur l'amont, pas sur control_class)."""
+        from django.core.management import call_command
+        from .models import run_scope, refresh_control_class
+        enrol('acme')
+        add_feed('acme', 'in/acme', r'.+', route=add_route('acme'))
+        rf = make_file(username='acme', s3_key='in/acme/nav.csv')
+        file_admission(rf.pk)
+        with run_scope():
+            Event.objects.create(file=rf, stage='load', control='acta_nav',
+                                 result=Event.Result.FAILED,
+                                 monitoring_class=Event.MonitoringClass.RECYCLE,
+                                 sub_tenant_id=rf.sub_tenant_id,
+                                 detail={'reason': 'acta_unreachable'})
+        refresh_control_class([rf.pk])
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
+
+        self.assertEqual(
+            self.client.post(f'/monitoring/files/{rf.pk}/recycle/').status_code, 202)
+        with patch('api.admission.file_identification') as fi, \
+                patch('api.acta_nav.maybe_load') as ml:
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        fi.assert_called_once_with(rf.pk)
+        ml.assert_called_once_with(rf.pk)
+
+    def test_upstream_failure_still_blocks_identification(self):
+        from django.core.management import call_command
+        from api.pipeline import enqueue
+        enqueue(self.rf.pk)      # partenaire jamais enrôlé → amont recycle
+        with patch('api.admission.file_identification') as fi, \
+                patch('api.acta_nav.maybe_load') as ml:
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        fi.assert_not_called()
+        ml.assert_not_called()
 
     def test_webhook_run_never_flags_handled(self):
         """Une mise en file par le webhook (sans opérateur) ne pose jamais Handled."""
