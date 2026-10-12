@@ -33,13 +33,14 @@ plan ne vérifie que la forme (champs présents, nombres et dates lisibles, devi
 connues d'Acta).
 """
 import logging
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
 
-from .acta import ActaClient, ActaError, SOURCE_CODE
+from .acta import ActaClient, ActaError, ActaTimeout, SOURCE_CODE
 from .models import (
     Event, ReceivedFile, current_control_rollup, refresh_control_class, run_scope,
 )
@@ -214,6 +215,36 @@ def read_journal(client, file_ref, after_id, sent):
             'rejected_lines': rejected_lines, 'mismatch': totals['rows'] != sent}
 
 
+RECOVERY_POLL = 5   # s entre deux relectures du journal après un timeout d'ingest
+
+
+def _recover_batch(client, file_ref, after_id, expected_rows, error):
+    """Lot d'ingest sans réponse (timeout) : Acta a pu l'ingérer quand même — il
+    poursuit le traitement côté serveur. On relit son journal (imports ``> after_id``
+    pour ce ``file_ref``) jusqu'à ``ACTA_INGEST_RECOVERY_WAIT`` s : si les VNI
+    journalisées atteignent ``expected_rows`` (cumul envoyé, lot compris), le lot est
+    acquis → renvoie le dernier import. Sinon relève ``error`` (→ ``acta_unreachable``,
+    rejouable). Sans ``file_ref`` / journal illisible avant ingest : pas de preuve
+    possible, on relève directement."""
+    if not file_ref or after_id is None:
+        raise error
+    deadline = time.monotonic() + settings.ACTA_INGEST_RECOVERY_WAIT
+    while True:
+        try:
+            imports = [i for i in client.nav_imports(file_ref) if i['id'] > after_id]
+            if imports and sum(i['rows'] for i in imports) >= expected_rows:
+                imp = max(imports, key=lambda i: i['id'])
+                logger.warning('Ingest Acta sans réponse mais journalisé (%s, import %s)',
+                               file_ref, imp['id'])
+                return imp
+        except ActaError as e:
+            logger.warning('Journal Acta illisible après timeout (%s) : %s', file_ref, e)
+        if time.monotonic() >= deadline:
+            raise ActaError(f'{error} ; lot absent du journal Acta après '
+                            f'{settings.ACTA_INGEST_RECOVERY_WAIT} s') from error
+        time.sleep(RECOVERY_POLL)
+
+
 def apply_plan(client, plan, file_ref=None):
     created, links, failures = [], [], []
     for f in plan.funds.values():
@@ -257,11 +288,25 @@ def apply_plan(client, plan, file_ref=None):
     envelope = {'schema_version': '1', 'source': settings.ACTA_SOURCE}
     if file_ref:
         envelope['file_ref'] = file_ref
-    returned, missing = 0, []
+    returned, missing, recovered = 0, [], []
     for i in range(0, len(plan.navs), INGEST_BATCH):
         records = plan.navs[i:i + INGEST_BATCH]
-        status, body = client.send_json('POST', '/api/v1/ingest/', {
-            **envelope, 'records': records})
+        try:
+            status, body = client.send_json('POST', '/api/v1/ingest/', {
+                **envelope, 'records': records}, timeout=settings.ACTA_INGEST_TIMEOUT)
+        except ActaTimeout as e:
+            # Pas de réponse API : on prend le journal Acta comme preuve d'ingestion.
+            imp = _recover_batch(client, file_ref, after_id, i + len(records), e)
+            recovered.append({'import': imp['id'], 'rows': len(records)})
+            for k in ('stored', 'unchanged', 'rejected'):
+                counts[k] = counts.get(k, 0) + imp.get(k, 0)
+            if imp.get('rejected'):
+                rejected += [
+                    {'status': 'rejected', 'import': imp['id'],
+                     'source_record_id': l.get('source_record_id'),
+                     'reason': l.get('reason')}
+                    for l in client.nav_import_lines(imp['id'], 'REJECTED')]
+            continue
         if status != 200:
             raise ActaError(f'ingest refusé (HTTP {status}) : {str(body)[:500]}')
         for k, v in (body.get('counts') or {}).items():
@@ -281,7 +326,8 @@ def apply_plan(client, plan, file_ref=None):
             journal = {'unavailable': str(e)[:300]}
     return {'created': created, 'links': links, 'failures': failures,
             'nav_counts': counts, 'nav_rejected': rejected, 'journal': journal,
-            'sent': len(plan.navs), 'returned': returned, 'missing': missing}
+            'sent': len(plan.navs), 'returned': returned, 'missing': missing,
+            'recovered': recovered}
 
 
 def count_check(res):
@@ -290,9 +336,14 @@ def count_check(res):
     l'ingest, même ``source_record_id``) ; et, si le journal Acta a pu être relu, il
     doit avoir journalisé autant de VNI qu'envoyées. → ``(ok, detail)``."""
     journal = res['journal'] or {}
+    # Lots repris via le journal après timeout : pas de retour API à compter, c'est
+    # la relecture du journal (``acta_journal_mismatch``) qui les contrôle.
+    recovered_rows = sum(r['rows'] for r in res.get('recovered', []))
     detail = {'sent': res['sent'], 'returned': res['returned'],
               'missing': res['missing'][:50], 'journal_rows': journal.get('rows')}
-    if res['returned'] != res['sent'] or res['missing']:
+    if recovered_rows:
+        detail['recovered_rows'] = recovered_rows
+    if res['returned'] + recovered_rows != res['sent'] or res['missing']:
         detail['reason'] = 'api_count_mismatch'
     elif journal.get('mismatch'):
         detail['reason'] = 'acta_journal_mismatch'
@@ -372,6 +423,8 @@ def load_file(file_id, dry_run=False, client=None):
                   'file_ref': file_ref_of(rf)}
         if res['journal'] is not None:
             detail['journal'] = {**journal, 'rejected_lines': journal.get('rejected_lines', [])[:50]}
+        if res['recovered']:
+            detail['recovered_after_timeout'] = res['recovered']
         _emit(rf, CTRL_NAV,
               Event.Result.PASSED if ok_nav else Event.Result.FAILED,
               Event.MonitoringClass.PUSH if ok_nav else Event.MonitoringClass.WARNING_ACTION,

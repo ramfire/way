@@ -204,6 +204,10 @@ sudo systemctl restart alfaway alfaway-worker
 > 202) et rejoue la chaîne **complète**, identification + chargement compris ; le worker
 > pose `Handled` si le run aboutit à `push`. Refusé (409) tant que le fichier est
 > `pending`/`running`.
+> **Ingest Acta** : timeout dédié `ACTA_INGEST_TIMEOUT` (120 s, vs `ACTA_TIMEOUT` 10 s pour
+> les lectures). Sur timeout, le loader relit le journal Acta (`nav-imports?file_ref=`)
+> jusqu'à `ACTA_INGEST_RECOVERY_WAIT` (60 s) : lot journalisé ⇒ succès
+> (`recovered_after_timeout`), sinon `acta_unreachable` (incident fichier 595, 2026-10-12).
 Aussi : `path("healthz/", ...)` pour les health checks.
 
 ---

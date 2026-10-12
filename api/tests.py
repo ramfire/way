@@ -1844,7 +1844,7 @@ class ActaNavLoaderTests(TestCase):
         return rf, feed
 
     def _client(self, known=None, ingest_status='created', journal=None, journal_gap=0,
-                api_gap=0):
+                api_gap=0, ingest_timeout=None):
         from unittest.mock import MagicMock
         c = MagicMock()
         c.source_codes.return_value = known or {}
@@ -1855,7 +1855,7 @@ class ActaNavLoaderTests(TestCase):
         # Journal Acta simulé : un import par lot ingéré (cf. Acta /api/v1/nav-imports/).
         c.journal, c.journal_lines = list(journal or []), {}
 
-        def send(method, path, payload):
+        def send(method, path, payload, timeout=None):
             if path == '/api/v1/entities/':
                 return 201, {'uid': next(uids)}
             if path == '/api/v1/ingest/':
@@ -1871,6 +1871,13 @@ class ActaNavLoaderTests(TestCase):
                     {'line_no': i + 1, 'source_line_no': r.get('source_line_no'),
                      'source_record_id': r['source_record_id'], 'outcome': 'REJECTED',
                      'reason': 'classe inconnue'} for i, r in enumerate(records)] if refused else []
+                if ingest_timeout:
+                    # 'ingested' : Acta a traité le lot mais la réponse n'est pas arrivée ;
+                    # 'lost' : rien dans le journal (on retire l'import simulé).
+                    if ingest_timeout == 'lost':
+                        c.journal.pop()
+                    from .acta import ActaTimeout
+                    raise ActaTimeout('Acta injoignable (http://acta) : timed out')
                 echoed = records[:len(records) - api_gap]
                 return 200, {'counts': {ingest_status: len(echoed)},
                              'results': [{'status': ingest_status, 'index': i,
@@ -1929,6 +1936,37 @@ class ActaNavLoaderTests(TestCase):
         with patch('api.parsing.get_s3_client', return_value=_fake_s3(self.CONTENT)):
             load_file(rf.pk, client=self._client(ingest_status='rejected'))
         ev = Event.objects.get(file=rf, stage='load', control='acta_nav')
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.WARNING_ACTION)
+        self.assertEqual(len(ev.detail['rejected']), 2)
+
+    # --- timeout d'ingest : délai dédié + reprise par le journal --------------
+    def test_ingest_uses_dedicated_timeout(self):
+        client = self._client()
+        with override_settings(ACTA_INGEST_TIMEOUT=77):
+            self._load(client)
+        call = next(c for c in client.send_json.call_args_list
+                    if c.args[1] == '/api/v1/ingest/')
+        self.assertEqual(call.kwargs['timeout'], 77)
+
+    def test_timeout_but_journalised_is_success(self):
+        # Cas du fichier 595 : Acta a ingéré (import ACCEPTED) après le timeout client.
+        rf, ev = self._load(self._client(ingest_timeout='ingested'))
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+        self.assertEqual(ev.detail['recovered_after_timeout'], [{'import': 1, 'rows': 2}])
+        self.assertEqual(ev.detail['counts']['stored'], 2)
+        cnt = Event.objects.get(file=rf, stage='load', control='acta_count')
+        self.assertEqual(cnt.result, Event.Result.PASSED)
+        self.assertEqual(cnt.detail['recovered_rows'], 2)
+
+    def test_timeout_and_absent_from_journal_is_unreachable(self):
+        with override_settings(ACTA_INGEST_RECOVERY_WAIT=0), patch('api.acta_nav.time.sleep'):
+            rf, ev = self._load(self._client(ingest_timeout='lost'))
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.RECYCLE)
+        self.assertEqual(ev.detail['reason'], 'acta_unreachable')
+        self.assertIn('absent du journal', ev.detail['error'])
+
+    def test_timeout_recovered_rejections_are_warning_action(self):
+        _, ev = self._load(self._client(ingest_timeout='ingested', ingest_status='rejected'))
         self.assertEqual(ev.monitoring_class, Event.MonitoringClass.WARNING_ACTION)
         self.assertEqual(len(ev.detail['rejected']), 2)
 
@@ -2068,7 +2106,7 @@ class ActaNavLoaderTests(TestCase):
         client = self._client()
         base = client.send_json.side_effect
 
-        def send(method, path, payload):
+        def send(method, path, payload, timeout=None):
             if path == '/api/v1/entity-external-codes/':
                 return 400, {'code': ['déjà utilisé']}
             return base(method, path, payload)
@@ -2284,3 +2322,27 @@ class RecycleViaPipelineTests(TestCase):
                 patch('api.acta_nav.maybe_load'):
             call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
         self.assertFalse(Handled.objects.filter(file=self.rf).exists())
+
+
+@override_settings(ACTA_URL='http://acta', ACTA_USER='u', ACTA_PASSWORD='p')
+class ActaClientTimeoutTests(TestCase):
+    """Un timeout réseau devient ``ActaTimeout`` (la requête a pu aboutir côté Acta),
+    distinct des autres erreurs de transport (``ActaError``)."""
+
+    def _raise(self, exc):
+        from .acta import ActaClient, ActaError, ActaTimeout
+        c = ActaClient()
+        c._opener = type('O', (), {'open': staticmethod(lambda *a, **k: (_ for _ in ()).throw(exc))})()
+        with self.assertRaises(ActaError) as cm:
+            c._request('GET', '/x')
+        return isinstance(cm.exception, ActaTimeout)
+
+    def test_socket_timeout_is_acta_timeout(self):
+        self.assertTrue(self._raise(TimeoutError('timed out')))
+
+    def test_urlerror_timeout_is_acta_timeout(self):
+        import urllib.error
+        self.assertTrue(self._raise(urllib.error.URLError(TimeoutError('timed out'))))
+
+    def test_connection_refused_is_not_timeout(self):
+        self.assertFalse(self._raise(ConnectionRefusedError('refused')))

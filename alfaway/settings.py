@@ -171,6 +171,12 @@ ACTA_HOST = config('ACTA_HOST', default='acta.algotech.lu')
 ACTA_USER = config('ACTA_USER', default='')
 ACTA_PASSWORD = config('ACTA_PASSWORD', default='')
 ACTA_TIMEOUT = config('ACTA_TIMEOUT', default=10, cast=int)
+# Ingest des VNI : plus long que les lectures (≈27 s pour 220 VNI). La chaîne tourne
+# hors requête (worker), donc plus soumise au timeout du hook SFTPGo (20 s).
+ACTA_INGEST_TIMEOUT = config('ACTA_INGEST_TIMEOUT', default=120, cast=int)
+# Après un timeout d'ingest : durée max de relecture du journal Acta (nav-imports) pour
+# constater si le lot a quand même été ingéré (Acta poursuit le traitement côté serveur).
+ACTA_INGEST_RECOVERY_WAIT = config('ACTA_INGEST_RECOVERY_WAIT', default=60, cast=int)
 # Source sous laquelle AlfaWay pose ses codes externes (SOURCE_CODE) dans Acta.
 ACTA_SOURCE = config('ACTA_SOURCE', default='ALFAWAY')
 
