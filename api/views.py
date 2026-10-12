@@ -30,6 +30,7 @@ from .models import (
     refresh_control_class, run_scope,
 )
 from .s3 import PRESIGN_DEFAULT_EXPIRY, object_size, presigned_get_url
+from .pipeline import ACTIVE_STATES, enqueue
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,9 @@ def _triage_eligible(rf):
     actions — l'UI n'affiche les boutons que sur ce même critère (``can_remediate``).
     """
     if rf.control_class not in TRIAGE_FAILURE_CLASSES:
+        return False
+    # Retraitement déjà en file/en cours : pas de 2e Recycle ni de Reject concurrent.
+    if rf.pipeline_state in ACTIVE_STATES:
         return False
     if Handled.objects.filter(file=rf).exists():
         return False
@@ -165,6 +169,18 @@ class SFTPWebhookView(APIView):
         success = sftp_status in (None, 1)
         state = ReceivedFile.State.STORED if success else ReceivedFile.State.FAILED
 
+        # Idempotence : SFTPGo REJOUE le hook (retry_max) s'il n'obtient pas de réponse
+        # à temps, avec un payload identique. (session_id, timestamp ns) identifie
+        # l'événement : déjà vu ⇒ rejeu, on ignore (sinon nouvelle ligne + rechargement,
+        # incident 2026-10-12). On teste ``raw`` (jamais réécrit par delete/rename).
+        timestamp = p.get('timestamp')
+        if session_id and timestamp is not None and ReceivedFile.objects.filter(
+                session_id=session_id, sftpgo_timestamp=timestamp,
+                raw__action='upload').exists():
+            logger.info('SFTP upload rejoué ignoré: %s by %s (session %s)',
+                        s3_key, username, session_id)
+            return
+
         # Taille du fichier : le hook `upload` de SFTPGo ne transmet PAS `file_size`.
         # Quand elle manque (upload réussi), on la lit une fois depuis S3 (clé
         # physique = `path`, repli `virtual_path`) pour la stocker à la source — ainsi
@@ -215,38 +231,13 @@ class SFTPWebhookView(APIView):
         rf_id = rf.pk
         logger.info('SFTP upload %s: %s by %s',
                     'stored' if success else 'FAILED', s3_key, username)
-        # TODO: déclencher DORA checks (futur worker via flag `processed`)
 
         # Admission (post-stockage) : observation/classification, JAMAIS bloquante.
-        # Lancée seulement après que la ligne est `stored` et la 200 est acquise.
-        # Garde dédiée en plus du try/except de post() : l'admission ne peut EN
-        # AUCUN CAS affecter la réponse webhook ni l'upload (invariant 1).
+        # Exécutée HORS requête par le worker ``run_pipeline_worker`` : on ne fait que
+        # mettre en file. Une chaîne synchrone (Acta lent) dépassait le timeout du hook
+        # SFTPGo, qui rejouait alors la notification → chargements multiples.
         if success and rf_id is not None:
-            self._run_admission(rf_id)
-
-    @staticmethod
-    def _run_admission(file_id):
-        """Admission + chaînage identification, garantis non bloquants (webhook 200).
-
-        Séparation des stages : le chaînage admission→identification (§1.6-b) vit
-        **ici, dans l'orchestrateur**, PAS dans ``file_admission``. L'identification
-        n'est lancée que si l'admission aboutit à un verdict **push**
-        (``control_class``) ; un recycle/reject n'identifie rien. Garde englobante :
-        ni l'admission ni l'identification ne peuvent affecter la réponse webhook.
-
-        Puis chargement (``acta_nav.maybe_load``) : seulement si la Route porte la
-        stratégie ``acta_nav`` et que l'amont est ``push`` ; ne lève jamais."""
-        try:
-            from .acta_nav import maybe_load
-            from .admission import file_admission, file_identification
-            file_admission(file_id)
-            rf = ReceivedFile.objects.get(pk=file_id)
-            if rf.control_class == Event.MonitoringClass.PUSH:
-                file_identification(file_id)
-                maybe_load(file_id)
-        except Exception:
-            logger.exception(
-                'Admission/identification: échec non bloquant pour file %s', file_id)
+            enqueue(rf_id)
 
     def _on_delete(self, p):
         """Fichier supprimé via SFTP : marquer les lignes ``stored`` en ``deleted``.
@@ -628,7 +619,9 @@ def monitoring_feed(request):
             # État affiché (4 états sans ambiguïté) — pilote badge + boutons. `failed`
             # = échec SANS décision opérateur ⟹ seul état qui propose Recycle/Reject.
             'display_state': ds,
-            'can_remediate': ds == 'failed',
+            'can_remediate': ds == 'failed' and rf.pipeline_state not in ACTIVE_STATES,
+            # Retraitement en file/en cours (Recycle ou upload) : le front l'affiche.
+            'pipeline_state': rf.pipeline_state,
         }
 
     # Compteurs globaux par état (indexés) : pilotent les chips + le badge History.
@@ -1169,34 +1162,26 @@ def enrol_feed(request, pk):
 def recycle_file(request, pk):
     """Action UI : **Recycle** — **mécanisme unique** de retraitement d'un échec.
 
-    Rejoue ``file_admission`` (ré-émet admission + qualification, append-only,
-    re-dérive ``control_class``) **et** — couplage strict, hérité de l'ancien
-    « Handle » qu'il remplace — pose le flag set-once ``Handled`` **ssi** le
-    re-contrôle aboutit à un OK (``push``). Sinon le fichier reste en échec, sans
-    flag. Garde serveur partagée avec Reject (``_triage_eligible``) : 409 sur un
-    fichier OK ou déjà tranché. Le flag n'existe QUE pour un OK obtenu ici (un OK
-    natif via reconcile/modale n'a pas de badge).
-    """
-    from .admission import file_admission
+    Met le fichier en file du worker (``pipeline.enqueue``) : la chaîne COMPLÈTE est
+    rejouée hors requête — admission → qualification → routing → parsing **puis**,
+    si ``push``, identification et chargement Acta. (Avant : ``file_admission``
+    seule, donc un échec d'identification — Acta injoignable — ne pouvait jamais
+    repasser OK et le bouton restait proposé indéfiniment.)
 
+    Couplage strict hérité de l'ancien « Handle » : le worker pose le flag set-once
+    ``Handled`` au nom de l'opérateur **ssi** le run aboutit à ``push``. Garde serveur
+    partagée avec Reject (``_triage_eligible``) : 409 sur un fichier OK, déjà tranché
+    ou déjà en file. Réponse 202 : le résultat arrive via le polling du board.
+    """
     rf = get_object_or_404(ReceivedFile, pk=pk)
     if not _triage_eligible(rf):
         return JsonResponse(
-            {'detail': 'fichier non remédiable (OK ou déjà tranché)'}, status=409)
-    verdict = file_admission(rf.pk)
-    if verdict is None:
-        return JsonResponse({'detail': 'rejeu impossible (voir les logs)'}, status=502)
-    rf.refresh_from_db()
-    handled = (rf.control_class == Event.MonitoringClass.PUSH)
-    if handled:
-        # Set-once : on ne réécrit pas un tampon existant (pas de owner volatile).
-        Handled.objects.get_or_create(
-            file=rf, defaults={'owner': request.user.get_username(),
-                               'sub_tenant_id': rf.sub_tenant_id})
-    logger.info('Recycle ReceivedFile %s (%s) -> %s handled=%s par %s',
-                pk, rf.s3_key, verdict, handled, request.user)
-    return JsonResponse({'ok': True, 'id': rf.pk, 'control_class': rf.control_class,
-                         'verdict': verdict, 'handled': handled})
+            {'detail': 'fichier non remédiable (OK, déjà tranché ou en cours)'},
+            status=409)
+    enqueue(rf.pk, requested_by=request.user.get_username())
+    logger.info('Recycle ReceivedFile %s (%s) mis en file par %s',
+                pk, rf.s3_key, request.user)
+    return JsonResponse({'ok': True, 'id': rf.pk, 'queued': True}, status=202)
 
 
 @require_POST
@@ -1234,7 +1219,7 @@ def replay_all_controls(request, pk):
     Déclenchée au double-clic sur le badge de contrôle du board. Rejoue la chaîne
     complète — ``file_admission`` (admission→qualification→routing→parsing) **puis**
     ``file_identification`` (§1.6) — à l'image de l'orchestrateur webhook
-    (``SFTPWebhookView._run_admission``). Contrairement à ``replay_admission``
+    (``api.pipeline.run_pipeline``). Contrairement à ``replay_admission``
     (admission seule), couvre l'identification : c'est le geste self-service qui
     remplace ``manage.py run_identification`` après un correctif de config amont
     (profil d'identification, référentiel, alias). Non bloquant, append-only,

@@ -162,6 +162,28 @@ class ReceivedFile(models.Model):
     # True quand la ligne provient d'un backfill `reconcile_files` (et non d'un hook).
     reconciled = models.BooleanField(default=False, db_index=True)
 
+    # File d'attente de la chaîne post-stockage (admission → … → chargement), exécutée
+    # HORS requête par le worker ``run_pipeline_worker`` : le webhook ne fait que poser
+    # ``pending`` et répond aussitôt. Sinon un amont lent (Acta) fait dépasser le
+    # timeout du hook SFTPGo (20 s), qui REJOUE la notification → fichier chargé N fois
+    # (incident 2026-10-12, LU_PO_NAV_20261003.csv ×4). Vide = jamais mis en file
+    # (lignes antérieures, backfill reconcile, upload en échec).
+    class PipelineState(models.TextChoices):
+        PENDING = 'pending', 'En attente'
+        RUNNING = 'running', 'En cours'
+        DONE = 'done', 'Terminé'
+        ERROR = 'error', 'Erreur'
+
+    pipeline_state = models.CharField(
+        max_length=12, choices=PipelineState.choices, blank=True, default='',
+        db_index=True,
+    )
+    pipeline_started_at = models.DateTimeField(null=True, blank=True)
+    pipeline_finished_at = models.DateTimeField(null=True, blank=True)
+    # Opérateur ayant demandé un « Recycle » (vide = mise en file par le webhook) :
+    # le worker pose ``Handled`` à son nom si le run aboutit à ``push``, puis l'efface.
+    pipeline_requested_by = models.CharField(max_length=150, blank=True, default='')
+
     # Read-model matérialisé de l'axe contrôles : classe de monitoring « worst-wins »
     # (la plus sévère parmi l'état COURANT des contrôles du fichier, tous stages
     # confondus). Dérivé des `Event` ; rafraîchi par `refresh_control_class()` après

@@ -294,6 +294,15 @@ class MonitoringCausesTests(TestCase):
                          Event.MonitoringClass.WARNING_ACTION)
 
 
+def drain_pipeline():
+    """Vide la file du worker (``--once``) en neutralisant identification et
+    chargement Acta : scénarios centrés sur l'admission (sans profil d'identification
+    configuré, l'identification poserait ``warning_action``)."""
+    from django.core.management import call_command
+    with patch('api.admission.file_identification'), patch('api.acta_nav.maybe_load'):
+        call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+
+
 class HandledTests(TestCase):
     """Tampon « traité » set-once au niveau fichier + réconciliation (étape 5).
 
@@ -317,8 +326,15 @@ class HandledTests(TestCase):
         return {c['control']: c for c in self.client.get('/monitoring/causes/').json()['causes']}
 
     def _handle(self, rf):
-        # « Recycle » est le mécanisme unique : rejoue ET pose le flag si OK.
-        return self.client.post(f'/monitoring/files/{rf.pk}/recycle/').json()
+        # « Recycle » est le mécanisme unique : met en file (202) ; le worker rejoue
+        # la chaîne ET pose le flag si OK. On draine la file pour observer le verdict.
+        resp = self.client.post(f'/monitoring/files/{rf.pk}/recycle/')
+        if resp.status_code != 202:
+            return resp.json()
+        drain_pipeline()
+        rf.refresh_from_db()
+        return {'control_class': rf.control_class,
+                'handled': Handled.objects.filter(file=rf).exists()}
 
     def test_file_override_reconciliation(self):
         # On enrôle le partenaire (cause corrigée) pour que le « Handle » aboutisse.
@@ -691,8 +707,8 @@ class RemediationEndpointTests(TestCase):
         enrol('newcomer')
         add_feed('newcomer', 'in/acme', r'.+', route=add_route('newcomer'))  # corrige la cause + route
         r = self.client.post(f'/monitoring/files/{rf.pk}/recycle/')
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()['verdict'], VERDICT_ADMIS)
+        self.assertEqual(r.status_code, 202)               # mis en file du worker
+        drain_pipeline()
         rf.refresh_from_db()
         self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
 
@@ -767,7 +783,8 @@ class RemediationEndpointTests(TestCase):
         file_admission(rf.pk)
         enrol('newcomer')
         add_feed('newcomer', 'in/acme', r'.+', route=add_route('newcomer'))  # route → push
-        self.client.post(f'/monitoring/files/{rf.pk}/recycle/')   # → push + Handled
+        self.client.post(f'/monitoring/files/{rf.pk}/recycle/')   # mis en file
+        drain_pipeline()                                          # → push + Handled
         row = next(x for x in self.client.get('/monitoring/feed/?control=recycled')
                    .json()['rows'] if x['id'] == rf.pk)
         self.assertEqual(row['display_state'], 'recycled')
@@ -2112,3 +2129,158 @@ class ActaNavLoaderTests(TestCase):
         rf = self._routed_file()
         with patch('api.acta_nav.load_file', side_effect=RuntimeError('boom')):
             self.assertIsNone(maybe_load(rf.pk))
+
+
+@override_settings(SFTPGO_WEBHOOK_TOKEN='tok')
+class AsyncPipelineTests(TestCase):
+    """Le webhook `upload` met en file sans exécuter la chaîne ; le worker la
+    déroule hors requête (évite les rejeux SFTPGo sur timeout, incident 2026-10-12)."""
+
+    def _upload(self, **extra):
+        payload = {'action': 'upload', 'username': 'acme', 'status': 1,
+                   'virtual_path': '/NAV.csv', 'path': 'acme/NAV.csv',
+                   'bucket': 'alfaway-dev', 'session_id': 's1', 'file_size': 10,
+                   **extra}
+        return self.client.post('/api/internal/sftp-webhook/?token=tok',
+                                payload, content_type='application/json')
+
+    def test_webhook_enqueues_without_running_pipeline(self):
+        with patch('api.admission.file_admission') as fa:
+            resp = self._upload()
+        self.assertEqual(resp.status_code, 200)
+        fa.assert_not_called()
+        rf = ReceivedFile.objects.get(s3_key='/NAV.csv')
+        self.assertEqual(rf.pipeline_state, ReceivedFile.PipelineState.PENDING)
+
+    def test_replayed_upload_hook_is_ignored(self):
+        """SFTPGo rejoue le hook (même session + même timestamp) : une seule ligne."""
+        self._upload(timestamp=123)
+        rf = ReceivedFile.objects.get(s3_key='/NAV.csv')
+        ReceivedFile.objects.filter(pk=rf.pk).update(
+            pipeline_state=ReceivedFile.PipelineState.DONE)
+        resp = self._upload(timestamp=123)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(ReceivedFile.objects.filter(s3_key='/NAV.csv').count(), 1)
+        rf.refresh_from_db()
+        self.assertEqual(rf.pipeline_state, ReceivedFile.PipelineState.DONE)
+
+    def test_new_upload_same_file_is_kept(self):
+        """Ré-dépôt réel du même fichier (nouvel événement) : nouvelle ligne."""
+        self._upload(timestamp=123)
+        self._upload(timestamp=456)
+        self.assertEqual(ReceivedFile.objects.filter(s3_key='/NAV.csv').count(), 2)
+
+    def test_replay_after_delete_still_ignored(self):
+        self._upload(timestamp=123)
+        self.client.post('/api/internal/sftp-webhook/?token=tok',
+                         {'action': 'delete', 'virtual_path': '/NAV.csv'},
+                         content_type='application/json')
+        self._upload(timestamp=123)
+        self.assertEqual(ReceivedFile.objects.filter(s3_key='/NAV.csv').count(), 1)
+
+    def test_failed_upload_not_enqueued(self):
+        self._upload(status=2)
+        rf = ReceivedFile.objects.get(s3_key='/NAV.csv')
+        self.assertEqual(rf.pipeline_state, '')
+
+    def test_worker_once_processes_pending(self):
+        from django.core.management import call_command
+        self._upload()
+        rf = ReceivedFile.objects.get(s3_key='/NAV.csv')
+        with patch('api.admission.file_admission') as fa:
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        fa.assert_called_once_with(rf.pk)
+        rf.refresh_from_db()
+        self.assertEqual(rf.pipeline_state, ReceivedFile.PipelineState.DONE)
+        self.assertIsNotNone(rf.pipeline_finished_at)
+
+    def test_worker_marks_error_and_continues(self):
+        from django.core.management import call_command
+        a = make_file(s3_key='a.csv', pipeline_state='pending')
+        b = make_file(s3_key='b.csv', pipeline_state='pending')
+        with patch('api.admission.file_admission',
+                   side_effect=[RuntimeError('boom'), 'admis']):
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        a.refresh_from_db(); b.refresh_from_db()
+        self.assertEqual({a.pipeline_state, b.pipeline_state}, {'error', 'done'})
+
+    def test_worker_requeues_orphan_running(self):
+        from django.core.management import call_command
+        rf = make_file(pipeline_state='running')
+        with patch('api.admission.file_admission') as fa:
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        fa.assert_called_once_with(rf.pk)
+        rf.refresh_from_db()
+        self.assertEqual(rf.pipeline_state, 'done')
+
+    def test_legacy_rows_not_picked_up(self):
+        from django.core.management import call_command
+        make_file()   # pipeline_state vide (ligne antérieure / backfill)
+        with patch('api.admission.file_admission') as fa:
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        fa.assert_not_called()
+
+
+class RecycleViaPipelineTests(TestCase):
+    """« Recycle » passe par la file du worker et rejoue la chaîne COMPLÈTE
+    (identification + chargement inclus) — cas du fichier 593 : identification en
+    échec (Acta injoignable) que l'ancien Recycle (admission seule) ne pouvait lever."""
+
+    def setUp(self):
+        self.rf = make_file(username='stranger')    # jamais enrôlé → recycle
+        file_admission(self.rf.pk)
+        self.rf.refresh_from_db()
+        self.assertEqual(self.rf.control_class, Event.MonitoringClass.RECYCLE)
+        self.staff = get_user_model().objects.create_user('staff', is_staff=True)
+        self.client.force_login(self.staff)
+
+    def _recycle(self):
+        return self.client.post(f'/monitoring/files/{self.rf.pk}/recycle/')
+
+    def test_recycle_enqueues_without_running_inline(self):
+        with patch('api.admission.file_admission') as fa:
+            resp = self._recycle()
+        self.assertEqual(resp.status_code, 202)
+        fa.assert_not_called()
+        self.rf.refresh_from_db()
+        self.assertEqual(self.rf.pipeline_state, ReceivedFile.PipelineState.PENDING)
+        self.assertEqual(self.rf.pipeline_requested_by, 'staff')
+
+    def test_second_recycle_while_queued_is_refused(self):
+        self.assertEqual(self._recycle().status_code, 202)
+        self.assertEqual(self._recycle().status_code, 409)
+        resp = self.client.post(f'/monitoring/files/{self.rf.pk}/reject/')
+        self.assertEqual(resp.status_code, 409)
+
+    def test_worker_runs_identification_and_load_then_flags(self):
+        from django.core.management import call_command
+
+        def admis(file_id):
+            ReceivedFile.objects.filter(pk=file_id).update(
+                control_class=Event.MonitoringClass.PUSH)
+            return 'admis'
+
+        self._recycle()
+        with patch('api.admission.file_admission', side_effect=admis), \
+                patch('api.admission.file_identification') as fi, \
+                patch('api.acta_nav.maybe_load') as ml:
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        fi.assert_called_once_with(self.rf.pk)
+        ml.assert_called_once_with(self.rf.pk)
+        self.rf.refresh_from_db()
+        self.assertEqual(self.rf.pipeline_state, ReceivedFile.PipelineState.DONE)
+        self.assertEqual(self.rf.pipeline_requested_by, '')
+        self.assertEqual(Handled.objects.get(file=self.rf).owner, 'staff')
+
+    def test_webhook_run_never_flags_handled(self):
+        """Une mise en file par le webhook (sans opérateur) ne pose jamais Handled."""
+        from django.core.management import call_command
+        from api.pipeline import enqueue
+        enqueue(self.rf.pk)
+        with patch('api.admission.file_admission', side_effect=lambda pk: (
+                ReceivedFile.objects.filter(pk=pk).update(
+                    control_class=Event.MonitoringClass.PUSH), 'admis')[1]), \
+                patch('api.admission.file_identification'), \
+                patch('api.acta_nav.maybe_load'):
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        self.assertFalse(Handled.objects.filter(file=self.rf).exists())

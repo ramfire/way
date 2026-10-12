@@ -182,7 +182,7 @@ gunicorn. C'est un **filet**, pas une excuse pour sauter le restart post-migrati
 **Après toute migration ou changement de code Python, redémarrer Gunicorn :**
 ```bash
 sudo -u www-data /opt/alfaway/venv/bin/python manage.py migrate   # si migrations
-sudo systemctl restart alfaway
+sudo systemctl restart alfaway alfaway-worker
 ```
 > **Pourquoi (incident 2026-06-13)** : une migration ajoutant `reconciled NOT NULL` (0003) a
 > été *appliquée à la base* sans redémarrer Gunicorn. Les workers tournaient encore avec
@@ -191,13 +191,26 @@ sudo systemctl restart alfaway
 > bloquer les uploads SFTP), l'échec était **silencieux** : uploads S3 OK mais **rien dans le
 > monitoring**. Diagnostic : `IntegrityError` visible dans `/var/log/alfaway/django.log`.
 > Résolu par `systemctl restart alfaway` + backfill via `reconcile_files`.
+>
+> **Worker pipeline (`alfaway-worker.service`, depuis 2026-10-12)** : le webhook `upload` ne
+> fait plus que poser `ReceivedFile.pipeline_state='pending'` et répond aussitôt ; la chaîne
+> admission → … → identification → chargement Acta tourne dans
+> `manage.py run_pipeline_worker` (`api/pipeline.py`). Avant, la chaîne synchrone (Acta lent)
+> dépassait le timeout du hook SFTPGo (20 s, `retry_max: 3`) → SFTPGo rejouait la
+> notification → fichier chargé jusqu'à 4 fois. États : `pending/running/done/error`
+> (vide = ligne antérieure ou backfill, jamais reprise). Rattrapage manuel :
+> `sudo -u www-data venv/bin/python manage.py run_pipeline_worker --once`.
+> **Recycle (board)** passe aussi par cette file (`pipeline.enqueue(requested_by=…)`, réponse
+> 202) et rejoue la chaîne **complète**, identification + chargement compris ; le worker
+> pose `Handled` si le run aboutit à `push`. Refusé (409) tant que le fichier est
+> `pending`/`running`.
 Aussi : `path("healthz/", ...)` pour les health checks.
 
 ---
 
 ## Validation
 ```bash
-for s in alfaway sftpgo nginx ssh.socket alfaway-reconcile.timer; do systemctl is-active $s; done
+for s in alfaway alfaway-worker sftpgo nginx ssh.socket alfaway-reconcile.timer; do systemctl is-active $s; done
 curl http://127.0.0.1:8010/healthz/         # {"status":"ok"}
 journalctl -fu alfaway ; journalctl -fu sftpgo
 ```

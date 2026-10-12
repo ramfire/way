@@ -45,6 +45,7 @@
     .chk { font-size:.8rem; color:var(--mut); display:flex; align-items:center;
            gap:.3rem; cursor:pointer; user-select:none; }
     button.act, button.rem-act { padding:.2rem .55rem; font-size:.76rem; }
+    .rem-queued { font-size:.76rem; color:var(--mut); white-space:nowrap; }
     a.dl { color:#7dd3fc; text-decoration:none; }
     a.dl:hover { text-decoration:underline; }
     a.ev { color:#a5b4fc; text-decoration:none; cursor:pointer; }
@@ -194,7 +195,7 @@
         tr_open: 'Open', tr_in_progress: 'In progress', tr_resolved: 'Resolved',
         tr_claim: 'Claim', tr_resolve: 'Resolve', tr_reopen: 'Reopen',
         tr_handled: '✓ handled', tr_rejected: '⊘ rejected',
-        tr_recycle: '↻ Recycle', tr_reject: '⊘ Reject',
+        tr_recycle: '↻ Recycle', tr_reject: '⊘ Reject', tr_queued: '⏳ Processing…',
         hide_handled: 'Hide resolved',
         // libellés de la modale détail (support)
         adm_title: 'Admission checks', adm_no_events: 'No admission event for this file yet.',
@@ -257,7 +258,7 @@
         tr_open: 'Ouvert', tr_in_progress: 'En cours', tr_resolved: 'Résolu',
         tr_claim: 'Prendre', tr_resolve: 'Résoudre', tr_reopen: 'Rouvrir',
         tr_handled: '✓ traité', tr_rejected: '⊘ rejeté',
-        tr_recycle: '↻ Recycler', tr_reject: '⊘ Rejeter',
+        tr_recycle: '↻ Recycler', tr_reject: '⊘ Rejeter', tr_queued: '⏳ En cours…',
         hide_handled: 'Masquer tranchés',
         adm_title: 'Contrôles d’admission', adm_no_events: 'Aucun événement d’admission pour ce fichier.',
         adm_c_control: 'Contrôle', adm_c_result: 'Résultat', adm_c_class: 'Classe',
@@ -318,7 +319,7 @@
         tr_open: 'Aperto', tr_in_progress: 'In corso', tr_resolved: 'Risolto',
         tr_claim: 'Prendi', tr_resolve: 'Risolvi', tr_reopen: 'Riapri',
         tr_handled: '✓ gestito', tr_rejected: '⊘ rifiutato',
-        tr_recycle: '↻ Ricicla', tr_reject: '⊘ Rifiuta',
+        tr_recycle: '↻ Ricicla', tr_reject: '⊘ Rifiuta', tr_queued: '⏳ In corso…',
         hide_handled: 'Nascondi risolti',
         adm_title: 'Controlli di ammissione', adm_no_events: 'Nessun evento di ammissione per questo file.',
         adm_c_control: 'Controllo', adm_c_result: 'Esito', adm_c_class: 'Classe',
@@ -571,6 +572,10 @@
         if (r.can_remediate) {
           acts.push(`<button class="rem-act" data-rem="recycle" data-id="${r.id}">${t('tr_recycle')}</button>`);
           acts.push(`<button class="rem-act" data-rem="reject" data-id="${r.id}">${t('tr_reject')}</button>`);
+        } else if (r.display_state === 'failed'
+                   && (r.pipeline_state === 'pending' || r.pipeline_state === 'running')) {
+          // Recycle en file du worker : boutons masqués (garde serveur) jusqu'au verdict.
+          acts.push(`<span class="rem-queued">${t('tr_queued')}</span>`);
         }
         const dl = acts.join(' ');
         // Dernière colonne « horodatage » : stockage (Live) ou archivage/suppression (History).
@@ -783,6 +788,10 @@
     // Remédiation contrôle (Recycle/Reject) : POST dédié, append-only côté serveur ;
     // on repolle pour refléter la nouvelle classe (recyclé re-dérivé, rejeté terminal).
     async function doRemediate(act, id) {
+      // Anti double-clic : on désactive les deux actions de la ligne dès le clic
+      // (le re-render du poll les remplace ensuite).
+      document.querySelectorAll(`button.rem-act[data-id="${id}"]`)
+        .forEach(b => { b.disabled = true; });
       try {
         const res = await fetch(`/monitoring/files/${id}/${act}/`, {
           method: 'POST',
