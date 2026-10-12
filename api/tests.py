@@ -1211,6 +1211,92 @@ class RunScopeTests(TestCase):
         self.assertEqual(ev.run_id, rid)
 
 
+def _xlsx(rows, sheet='Sheet1'):
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet
+    for r in rows:
+        ws.append(r)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+class ParsingXlsxTests(ParsingTests):
+    """Parsing ``format: xlsx`` : même contrôles que le CSV, cellules typées."""
+
+    COLS = ['COMPANY', 'VALUATION_INS_CURR', 'REPORT_DATE']
+    LAYOUT = {'format': 'xlsx', 'header': {'present': True, 'columns': COLS},
+              'column_contracts': [
+                  {'name': 'COMPANY', 'type': 'string', 'required': True, 'nullable': False},
+                  {'name': 'VALUATION_INS_CURR', 'type': 'number', 'required': True},
+                  {'name': 'REPORT_DATE', 'type': 'date', 'format': '%d/%m/%Y',
+                   'required': True}]}
+
+    def test_typed_cells_parse(self):
+        # Date Excel native et nombre : conformes sans passer par le format texte.
+        rf, _ = self._qualified_file(layout=self.LAYOUT)
+        verdict = self._parse(rf, _xlsx([self.COLS, ['Acme', 1250.5, date(2025, 5, 13)],
+                                         ['Beta', 10, '13/05/2025'], [None, None]]))
+        self.assertEqual(verdict, parsing.VERDICT_PARSED)
+        ev = parsing.latest_parsing_event(rf)
+        self.assertEqual((ev.detail['format'], ev.detail['record_count'],
+                          ev.detail['column_count']), ('xlsx', 2, 3))
+
+    def test_header_only_workbook_parses_zero_records(self):
+        # Cas du fichier AD_DEMO_FUND_CREDIT_DIRECT_NAV (#690) : en-tête seul.
+        rf, _ = self._qualified_file(layout=self.LAYOUT)
+        self.assertEqual(self._parse(rf, _xlsx([self.COLS])), parsing.VERDICT_PARSED)
+        self.assertEqual(parsing.latest_parsing_event(rf).detail['record_count'], 0)
+
+    def test_short_row_is_trailing_blanks_but_long_row_is_malformed(self):
+        layout = {**self.LAYOUT, 'column_contracts': []}
+        rf, _ = self._qualified_file(layout=layout)
+        self.assertEqual(self._parse(rf, _xlsx([self.COLS, ['Acme']])),
+                         parsing.VERDICT_PARSED)
+        verdict = self._parse(rf, _xlsx([self.COLS, ['Acme', 1, 2, 'extra']]))
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
+                         parsing.CAUSE_MALFORMED_RECORD)
+
+    def test_contract_type_failure_on_text_cell(self):
+        rf, _ = self._qualified_file(layout=self.LAYOUT)
+        verdict = self._parse(rf, _xlsx([self.COLS, ['Acme', 'n/a', date(2025, 5, 13)]]))
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        ev = parsing.latest_parsing_event(rf)
+        self.assertEqual(ev.cause_code, parsing.CAUSE_COLUMN_TYPE)
+        self.assertEqual(ev.detail['columns'][0]['column'], 'VALUATION_INS_CURR')
+
+    def test_header_mismatch_recycles(self):
+        rf, _ = self._qualified_file(layout=self.LAYOUT)
+        verdict = self._parse(rf, _xlsx([['COMPANY', 'OTHER', 'REPORT_DATE']]))
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
+                         parsing.CAUSE_HEADER_MISMATCH)
+
+    def test_unknown_sheet_or_not_a_workbook_is_decode_error(self):
+        rf, _ = self._qualified_file(layout={**self.LAYOUT, 'sheet': 'Data'})
+        self.assertEqual(self._parse(rf, _xlsx([self.COLS])), parsing.VERDICT_RECYCLE)
+        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
+                         parsing.CAUSE_DECODE_ERROR)
+        self.assertEqual(self._parse(rf, b'A;B;C\n'), parsing.VERDICT_RECYCLE)
+        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
+                         parsing.CAUSE_DECODE_ERROR)
+
+    def test_named_sheet_is_read(self):
+        rf, _ = self._qualified_file(layout={**self.LAYOUT, 'sheet': 'Data'})
+        self.assertEqual(self._parse(rf, _xlsx([self.COLS], sheet='Data')),
+                         parsing.VERDICT_PARSED)
+
+    def test_layout_sheet_must_be_name_or_index(self):
+        from django.core.exceptions import ValidationError
+        from .models import validate_layout
+        validate_layout({'format': 'xlsx', 'sheet': 0})
+        with self.assertRaises(ValidationError):
+            validate_layout({'format': 'xlsx', 'sheet': ['Data']})
+
+
 class RunIdRollupTests(ParsingTests):
     """Rollup scopé à la dernière passe (fix du « contrôle fantôme »).
 

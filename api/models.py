@@ -321,6 +321,10 @@ def validate_layout(value):
         if key in value and not isinstance(value[key], str):
             raise ValidationError(f'layout.{key} must be a string.')
 
+    if 'sheet' in value and (isinstance(value['sheet'], bool)
+                             or not isinstance(value['sheet'], (str, int))):
+        raise ValidationError('layout.sheet must be a sheet name or a 0-based index.')
+
     if 'record_types' in value and not isinstance(value['record_types'], list):
         raise ValidationError('layout.record_types must be a list.')
 

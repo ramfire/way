@@ -19,8 +19,9 @@ uniquement, jamais les valeurs métier :
 Le moteur ne *reject* jamais : tout problème (config, lecture, décodage, forme) →
 ``recycle`` (retraitable — on corrige le ``layout`` puis on rejoue).
 """
+import io
 import logging
-from datetime import datetime
+from datetime import date, datetime
 
 from django.conf import settings
 
@@ -60,8 +61,8 @@ CAUSE_COLUMN_TYPE = 'column_type'              # valeur non conforme au type/for
 # Types validables par un contrat de colonne (``format`` requis si ``date``).
 CONTRACT_TYPES = ('string', 'date', 'number')
 
-# Formats délimités supportés par ce premier moteur.
-SUPPORTED_FORMATS = ('csv',)
+# Formats supportés : délimité (``csv``) et classeur Excel (``xlsx``, une feuille).
+SUPPORTED_FORMATS = ('csv', 'xlsx')
 
 # Plafond de taille au-delà duquel on ne charge pas le fichier en mémoire.
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024
@@ -137,8 +138,13 @@ def _value_matches_type(value, type_, fmt):
 
     ``date`` → ``datetime.strptime(value, fmt)`` (``fmt`` requis). ``number`` → cast
     ``float``. ``string`` (et tout type non reconnu) → toujours conforme (pas de
-    contrainte de forme). On ne valide JAMAIS le sens métier (existence référentiel =
+    contrainte de forme). Une cellule xlsx déjà typée (date Excel, nombre) est conforme
+    à son type sans format. On ne valide JAMAIS le sens métier (existence référentiel =
     identification §1.6)."""
+    if type_ == 'date' and isinstance(value, date):
+        return True
+    if type_ == 'number' and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return True
     if type_ == 'date':
         if not fmt:
             return False        # contrat mal déclaré : date sans format → non conforme
@@ -156,7 +162,7 @@ def _value_matches_type(value, type_, fmt):
     return True
 
 
-def _check_column_contracts(rf, contracts, header_fields, data_lines, delimiter):
+def _check_column_contracts(rf, contracts, header_fields, rows):
     """§1.5+ : contrôle de contrat par colonne (présence / non-nullité / type).
 
     Granularité **FICHIER** : ≥1 ligne fautive compromet le fichier (verdict global,
@@ -183,8 +189,7 @@ def _check_column_contracts(rf, contracts, header_fields, data_lines, delimiter)
 
     empty_counts = {}   # nom de colonne → nb de lignes à valeur vide
     bad_type = {}       # nom de colonne → {column, type, format, bad_rows, sample}
-    for line in data_lines:
-        fields = line.split(delimiter)
+    for fields in rows:
         for c in not_null:
             idx = index_of[c['name']]
             val = fields[idx] if idx < len(fields) else ''
@@ -196,7 +201,8 @@ def _check_column_contracts(rf, contracts, header_fields, data_lines, delimiter)
             s = '' if raw is None else str(raw).strip()
             if s == '':
                 continue    # vide = ressort de column_not_null, pas de column_type
-            if not _value_matches_type(s, c.get('type'), c.get('format')):
+            value = s if isinstance(raw, str) else raw     # cellule xlsx typée
+            if not _value_matches_type(value, c.get('type'), c.get('format')):
                 b = bad_type.setdefault(c['name'], {
                     'column': c['name'], 'type': c.get('type'),
                     'format': c.get('format'), 'bad_rows': 0, 'sample': []})
@@ -214,6 +220,31 @@ def _check_column_contracts(rf, contracts, header_fields, data_lines, delimiter)
         return _recycle(rf, CAUSE_COLUMN_TYPE, {'columns': list(bad_type.values())},
                         control=CTRL_COLUMN_TYPE)
     return None
+
+
+def _blank(value):
+    return value is None or (isinstance(value, str) and value.strip() == '')
+
+
+def _xlsx_rows(raw, sheet):
+    """Lignes non vides d'une feuille xlsx, valeurs typées (openpyxl ``data_only`` :
+    résultat des formules). Les cellules vides de fin de ligne sont retirées : une
+    ligne plus courte que l'en-tête n'est pas malformée. ``sheet`` : nom, index
+    (0 = première) ou absent (première feuille). Peut lever (→ ``decode_error``)."""
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    try:
+        ws = wb[sheet] if isinstance(sheet, str) else wb.worksheets[sheet or 0]
+        rows = []
+        for values in ws.iter_rows(values_only=True):
+            cells = list(values)
+            while cells and _blank(cells[-1]):
+                cells.pop()
+            if cells:
+                rows.append(cells)
+        return rows
+    finally:
+        wb.close()
 
 
 def _parse(rf, feed):
@@ -249,37 +280,44 @@ def _parse(rf, feed):
         # Transitoire (S3 down / objet absent) → recycle (rejouer plus tard).
         return _recycle(rf, CAUSE_UNREADABLE, {'error': str(e)})
 
-    try:
-        text = raw.decode(encoding)
-    except (UnicodeDecodeError, LookupError) as e:
-        return _recycle(rf, CAUSE_DECODE_ERROR, {'encoding': encoding, 'error': str(e)})
-
-    # Lignes non vides (les lignes vides — fin de fichier incluse — sont ignorées).
-    lines = [ln for ln in text.splitlines() if ln.strip() != '']
+    if fmt == 'xlsx':
+        try:
+            rows = _xlsx_rows(raw, layout.get('sheet'))
+        except Exception as e:
+            return _recycle(rf, CAUSE_DECODE_ERROR, {'sheet': layout.get('sheet'),
+                                                     'error': str(e)[:300]})
+    else:
+        try:
+            text = raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError) as e:
+            return _recycle(rf, CAUSE_DECODE_ERROR, {'encoding': encoding, 'error': str(e)})
+        # Lignes non vides (les lignes vides — fin de fichier incluse — sont ignorées).
+        rows = [ln.split(delimiter) for ln in text.splitlines() if ln.strip() != '']
 
     if header_present:
-        if not lines:
+        if not rows:
             return _recycle(rf, CAUSE_HEADER_MISMATCH, {'reason': 'no_header'})
-        header_fields = lines[0].split(delimiter)
+        header_fields = [('' if v is None else str(v).strip()) if fmt == 'xlsx' else v
+                         for v in rows[0]]
         if expected_columns is not None and header_fields != list(expected_columns):
             return _recycle(rf, CAUSE_HEADER_MISMATCH, {
                 'expected_columns': len(expected_columns),
                 'found_columns': len(header_fields)})
         column_count = len(header_fields)
-        data_lines = lines[1:]
+        data_rows = rows[1:]
     else:
         header_fields = None    # pas de header → pas de mapping nom→colonne (cf. §1.5+)
         if expected_columns:
             column_count = len(expected_columns)
-        elif lines:
-            column_count = len(lines[0].split(delimiter))
+        elif rows:
+            column_count = len(rows[0])
         else:
             column_count = 0
-        data_lines = lines
+        data_rows = rows
 
-    for i, line in enumerate(data_lines):
-        fields = line.split(delimiter)
-        if len(fields) != column_count:
+    for i, fields in enumerate(data_rows):
+        # xlsx : fin de ligne vide retirée → seule une ligne trop LONGUE est malformée.
+        if len(fields) > column_count or (len(fields) < column_count and fmt != 'xlsx'):
             return _recycle(rf, CAUSE_MALFORMED_RECORD, {
                 'record_index': i + 1,  # 1-based parmi les lignes de données
                 'expected_fields': column_count,
@@ -290,14 +328,13 @@ def _parse(rf, feed):
     # sans header (header_fields None), on ne peut pas l'appliquer → on laisse passer.
     contracts = layout.get('column_contracts')
     if isinstance(contracts, list) and contracts and header_fields is not None:
-        verdict = _check_column_contracts(
-            rf, contracts, header_fields, data_lines, delimiter)
+        verdict = _check_column_contracts(rf, contracts, header_fields, data_rows)
         if verdict is not None:
             return verdict      # un contrôle de contrat a échoué (recycle, fichier global)
 
     return _parsed(rf, {
         'format': fmt, 'column_count': column_count,
-        'record_count': len(data_lines), 'feed_id': feed.pk,
+        'record_count': len(data_rows), 'feed_id': feed.pk,
     })
 
 
