@@ -1,11 +1,11 @@
 {% comment %}
   Applique le layout persisté (thème visuel) AVANT le rendu, pour éviter un flash
-  du thème noir par défaut. À inclure dans le <head>, après le CSS partagé.
+  du thème noir (défaut CSS sans attribut). Défaut = generali, black seulement si choisi. À inclure dans le <head>, après le CSS partagé.
   Même clé localStorage que MShared.applyLayout (monitoring_shared.js).
 {% endcomment %}
 <script>
   try {
     var l = localStorage.getItem('alfaway_layout');
-    if (l === 'generali') document.documentElement.setAttribute('data-layout', l);
-  } catch (e) {}
+    document.documentElement.setAttribute('data-layout', l === 'black' ? 'black' : 'generali');
+  } catch (e) { document.documentElement.setAttribute('data-layout', 'generali'); }
 </script>

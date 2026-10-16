@@ -70,19 +70,19 @@
   }
 
   // Layouts visuels disponibles (thèmes CSS, cf. bloc `data-layout` du CSS partagé).
-  // Choix persisté côté navigateur, commun aux trois boards. `black` = défaut.
+  // Choix persisté côté navigateur, commun aux trois boards. `generali` = défaut (nouveau navigateur).
   var LAYOUTS = ['black', 'generali'];
   var LAYOUT_KEY = 'alfaway_layout';
 
   function currentLayout() {
     var v;
     try { v = localStorage.getItem(LAYOUT_KEY); } catch (e) { v = null; }
-    return LAYOUTS.indexOf(v) >= 0 ? v : 'black';
+    return LAYOUTS.indexOf(v) >= 0 ? v : 'generali';
   }
 
   // Pose <html data-layout> + synchronise le menu ; `persist` enregistre le choix.
   function applyLayout(name, persist) {
-    if (LAYOUTS.indexOf(name) < 0) name = 'black';
+    if (LAYOUTS.indexOf(name) < 0) name = 'generali';
     document.documentElement.setAttribute('data-layout', name);
     if (persist) { try { localStorage.setItem(LAYOUT_KEY, name); } catch (e) { /* privé */ } }
     document.querySelectorAll('[data-layout-pick]').forEach(function (el) { el.value = name; });
