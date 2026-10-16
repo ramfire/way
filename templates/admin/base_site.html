@@ -1,0 +1,26 @@
+{% extends "admin/base.html" %}
+{% load static %}
+{% comment %}
+  Layout client (core/layouts.py) appliqué à tout l'admin : CSS de variables +
+  classe layout-<nom> sur <body>. Le layout est choisi côté serveur (ALFAWAY_LAYOUT).
+{% endcomment %}
+
+{% block title %}{% if subtitle %}{{ subtitle }} | {% endif %}{{ title }} | {{ site_title|default:_('Django site admin') }}{% endblock %}
+
+{% block extrastyle %}{{ block.super }}{% if alfaway_layout %}<link rel="stylesheet" href="{% static alfaway_layout.admin_css %}">{% endif %}{% endblock %}
+
+{% block bodyclass %}{{ block.super }}{% if alfaway_layout %} layout-{{ alfaway_layout.name }}{% endif %}{% endblock %}
+
+{% block branding %}
+<div id="site-name" class="layout-brand">
+  <a href="{% url 'admin:index' %}">
+    {% if alfaway_layout.logo %}<img class="layout-logo" src="{% static alfaway_layout.logo %}" alt="{{ alfaway_layout.label }}">{% endif %}
+    <span class="layout-wordmark">{{ site_header|default:_('Django administration') }}</span>
+  </a>
+</div>
+{% if user.is_anonymous %}
+  {% include "admin/color_theme_toggle.html" %}
+{% endif %}
+{% endblock %}
+
+{% block nav-global %}{% endblock %}

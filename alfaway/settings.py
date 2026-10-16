@@ -68,13 +68,15 @@ ROOT_URLCONF = 'alfaway.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        # Gabarits projet : priment sur ceux des apps (dont django.contrib.admin).
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
                 'django.template.context_processors.request',
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
+                'core.context_processors.layout',
             ],
         },
     },
@@ -143,6 +145,9 @@ STORAGES = {
         'django.contrib.staticfiles.storage.StaticFilesStorage' if TESTING
         else 'django.contrib.staticfiles.storage.ManifestStaticFilesStorage')},
 }
+
+# Layout visuel de l'admin (thème client, cf. core/layouts.py). Nom inconnu → 'generali'.
+ALFAWAY_LAYOUT = config('ALFAWAY_LAYOUT', default='generali')
 
 MEDIA_URL = 'media/'
 MEDIA_ROOT = '/opt/alfaway/media'
