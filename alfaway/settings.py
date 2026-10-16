@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 import json
+import sys
 from pathlib import Path
 
 from decouple import config, Csv
@@ -129,6 +130,19 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 STATIC_ROOT = '/opt/alfaway/static'
+
+# Noms de fichiers statiques empreintés (css/x.<hash>.css) : une nouvelle version =
+# une nouvelle URL, donc pas de CSS/JS périmé en cache navigateur après déploiement.
+# ⚠️ Exige `collectstatic` à chaque déploiement (sinon 500 : entrée absente du
+# manifeste). Les tests (`manage.py test`) gardent le stockage simple : ils ne
+# dépendent pas d'un collectstatic préalable.
+TESTING = len(sys.argv) > 1 and sys.argv[1] == 'test'
+STORAGES = {
+    'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
+    'staticfiles': {'BACKEND': (
+        'django.contrib.staticfiles.storage.StaticFilesStorage' if TESTING
+        else 'django.contrib.staticfiles.storage.ManifestStaticFilesStorage')},
+}
 
 MEDIA_URL = 'media/'
 MEDIA_ROOT = '/opt/alfaway/media'

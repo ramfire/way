@@ -184,6 +184,11 @@ gunicorn. C'est un **filet**, pas une excuse pour sauter le restart post-migrati
 sudo -u www-data /opt/alfaway/venv/bin/python manage.py migrate   # si migrations
 sudo systemctl restart alfaway alfaway-worker
 ```
+> **Statiques empreintés (`ManifestStaticFilesStorage`, depuis 2026-10-16)** : tout
+> changement de CSS/JS/template exige `sudo -u www-data venv/bin/python manage.py
+> collectstatic --noinput` **puis** le restart (le manifeste est lu au démarrage). Sans
+> collectstatic, un `{% static %}` absent du manifeste → **500**. Raison : nginx sert
+> `/static/` sans `Cache-Control`, les navigateurs gardaient l'ancienne CSS.
 > **Pourquoi (incident 2026-06-13)** : une migration ajoutant `reconciled NOT NULL` (0003) a
 > été *appliquée à la base* sans redémarrer Gunicorn. Les workers tournaient encore avec
 > l'ancien modèle (sans le champ) → chaque insert envoyait `NULL` → `IntegrityError`, ligne
