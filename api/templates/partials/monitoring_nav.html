@@ -3,6 +3,8 @@
   visuel unique : liens vers les trois boards avec surlignage de l'actif.
   Usage : {% include 'partials/monitoring_nav.html' with active='files' %}
           (active ∈ 'files' | 'business' | 'expected').
+  Le menu « Layout » (thème visuel) est câblé par MShared (monitoring_shared.js) ;
+  le layout est posé tôt par partials/layout_head.html (pas de flash du thème noir).
   Les libellés sont localisés côté JS via MShared.localizeNav (attribut data-i18n-nav) ;
   le texte en dur ci-dessous est le repli anglais avant hydratation.
 {% endcomment %}
@@ -11,4 +13,8 @@
   <a href="/monitoring/business/" data-i18n-nav="nav_business"{% if active == 'business' %} class="active" aria-current="page"{% endif %}>Business</a>
   <a href="/monitoring/expected/" data-i18n-nav="nav_expected"{% if active == 'expected' %} class="active" aria-current="page"{% endif %}>NAV expected</a>
   <a href="/admin/" class="admin" data-i18n-nav="nav_admin">⚙ Admin</a>
+  <select class="layout-pick" data-layout-pick aria-label="Layout" title="Layout">
+    <option value="black">◐ Black</option>
+    <option value="generali">◐ Generali</option>
+  </select>
 </nav>
