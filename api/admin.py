@@ -31,6 +31,9 @@ def _ordered_get_app_list(request, app_label=None):
 
 
 admin.site.get_app_list = _ordered_get_app_list
+admin.site.site_header = 'AlfaWay'
+admin.site.site_title = 'AlfaWay'
+admin.site.index_title = 'Data Transfer Platform'
 
 
 @admin.register(ReceivedFile)

@@ -1,5 +1,6 @@
 import contextvars
 import logging
+import re
 import uuid
 from contextlib import contextmanager
 
@@ -162,6 +163,28 @@ class ReceivedFile(models.Model):
     # True quand la ligne provient d'un backfill `reconcile_files` (et non d'un hook).
     reconciled = models.BooleanField(default=False, db_index=True)
 
+    # File d'attente de la chaîne post-stockage (admission → … → chargement), exécutée
+    # HORS requête par le worker ``run_pipeline_worker`` : le webhook ne fait que poser
+    # ``pending`` et répond aussitôt. Sinon un amont lent (Acta) fait dépasser le
+    # timeout du hook SFTPGo (20 s), qui REJOUE la notification → fichier chargé N fois
+    # (incident 2026-10-12, LU_PO_NAV_20261003.csv ×4). Vide = jamais mis en file
+    # (lignes antérieures, backfill reconcile, upload en échec).
+    class PipelineState(models.TextChoices):
+        PENDING = 'pending', 'En attente'
+        RUNNING = 'running', 'En cours'
+        DONE = 'done', 'Terminé'
+        ERROR = 'error', 'Erreur'
+
+    pipeline_state = models.CharField(
+        max_length=12, choices=PipelineState.choices, blank=True, default='',
+        db_index=True,
+    )
+    pipeline_started_at = models.DateTimeField(null=True, blank=True)
+    pipeline_finished_at = models.DateTimeField(null=True, blank=True)
+    # Opérateur ayant demandé un « Recycle » (vide = mise en file par le webhook) :
+    # le worker pose ``Handled`` à son nom si le run aboutit à ``push``, puis l'efface.
+    pipeline_requested_by = models.CharField(max_length=150, blank=True, default='')
+
     # Read-model matérialisé de l'axe contrôles : classe de monitoring « worst-wins »
     # (la plus sévère parmi l'état COURANT des contrôles du fichier, tous stages
     # confondus). Dérivé des `Event` ; rafraîchi par `refresh_control_class()` après
@@ -255,6 +278,27 @@ class Channel(models.Model):
         return f'{self.kind}:{self.identifier}'
 
 
+def validate_grammar(value):
+    """Validateur de la ``grammar`` d'une Feed, au save (admin compris).
+
+    ``{"filename": "<regex>"}`` doit **compiler** : une regex invalide (ex. glob
+    ``*PO_NAV_.*`` au lieu de ``.*PO_NAV_.*``) ne se verrait qu'à la qualification,
+    en recycle ``grammar_invalid`` pour **chaque** fichier du sous-dossier.
+    ``{}`` / clé absente = aucune contrainte (valide).
+    """
+    if not isinstance(value, dict):
+        raise ValidationError('grammar must be a dict (JSON object).')
+    pattern = value.get('filename')
+    if not pattern:
+        return
+    if not isinstance(pattern, str):
+        raise ValidationError('grammar.filename must be a string (regex).')
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise ValidationError(f'grammar.filename: invalid regex ({exc}).')
+
+
 def validate_layout(value):
     """Validateur **de forme** du descripteur ``layout`` (§1.5), au save.
 
@@ -276,6 +320,10 @@ def validate_layout(value):
     for key in str_keys:
         if key in value and not isinstance(value[key], str):
             raise ValidationError(f'layout.{key} must be a string.')
+
+    if 'sheet' in value and (isinstance(value['sheet'], bool)
+                             or not isinstance(value['sheet'], (str, int))):
+        raise ValidationError('layout.sheet must be a sheet name or a 0-based index.')
 
     if 'record_types' in value and not isinstance(value['record_types'], list):
         raise ValidationError('layout.record_types must be a list.')
@@ -312,7 +360,7 @@ class Feed(models.Model):
         SubTenant, on_delete=models.PROTECT, related_name='feeds',
     )
     subfolder = models.CharField(max_length=255, blank=True, default='')
-    grammar = models.JSONField(default=dict, blank=True)
+    grammar = models.JSONField(default=dict, blank=True, validators=[validate_grammar])
     mandatory = models.JSONField(default=list, blank=True)
     active = models.BooleanField(default=True)
     # Départage si plusieurs grammaires matchent le même nom (DESC ; le + haut gagne).

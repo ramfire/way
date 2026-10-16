@@ -2,6 +2,7 @@
 .env
 .env.*
 *.env
+!.env.example
 secrets*
 *.pem
 *.key
@@ -23,6 +24,9 @@ media/
 # collectstatic (assets admin + DRF), regénéré par `manage.py collectstatic`.
 # Ancré à la racine (/static/) pour NE PAS masquer les sources d'app (api/static/).
 /static/
+
+# Paquets d'intégration déposés à la main (sources copiées dans le projet).
+_incoming/
 
 # --- Python ---
 __pycache__/

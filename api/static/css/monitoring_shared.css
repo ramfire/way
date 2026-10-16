@@ -7,6 +7,26 @@
 :root {
   --bg:#0f172a; --card:#1e293b; --txt:#e2e8f0; --mut:#94a3b8; --line:#334155;
 
+  /* Chrome secondaire (onglet/chip actif, liens, surbrillance, modale). Jetons
+     redéfinis par chaque layout (cf. bloc `data-layout` en fin de fichier). */
+  --hdr-bg:transparent;  --hdr-fg:var(--txt);    --hdr-rule:var(--line);
+  --active-bg:#334155;   --active-fg:#fff;
+  --sel-bg:#0c4a6e;      --sel-line:#7dd3fc;
+  --neutral-bg:#475569;  --neutral-fg:#e2e8f0;
+  --link:#7dd3fc;        --link-alt:#a5b4fc;
+  --ok-txt:#4ade80;      --ko-txt:#f87171;
+  --flash:#3730a3;       --row-failed:rgba(239,68,68,.14); --row-failed-rail:#ef4444;
+  --shadow:rgba(0,0,0,.45); --overlay:rgba(0,0,0,.62);
+  --font:system-ui, -apple-system, Segoe UI, sans-serif;
+
+  /* Axe STOCKAGE (board fichier) + triage : distincts de l'échelle de sévérité. */
+  --st-receiving-bg:#1e3a8a; --st-receiving-fg:#bfdbfe;
+  --st-stored-bg:#14532d;    --st-stored-fg:#bbf7d0;
+  --st-failed-bg:#7f1d1d;    --st-failed-fg:#fecaca;
+  --st-deleted-bg:#374151;   --st-deleted-fg:#d1d5db;
+  --st-missing-bg:#78350f;   --st-missing-fg:#fed7aa;
+  --st-archived-bg:#312e81;  --st-archived-fg:#c7d2fe;
+
   /* Échelle de sévérité UNIFIÉE (design §5), du plus grave au moins grave. Source
      UNIQUE : tout badge de statut des trois boards réfère ces jetons — pas de
      palette parallèle. blocking > warning_action > recycle > reject >
@@ -22,9 +42,9 @@
 }
 
 * { box-sizing: border-box; }
-body { margin:0; background:var(--bg); color:var(--txt);
-       font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
-header { padding:1rem 1.5rem; border-bottom:1px solid var(--line);
+body { margin:0; background:var(--bg); color:var(--txt); font-family:var(--font); }
+header { padding:1rem 1.5rem; border-bottom:1px solid var(--hdr-rule);
+         background:var(--hdr-bg); color:var(--hdr-fg);
          display:flex; align-items:center; gap:1.5rem; flex-wrap:wrap; }
 h1 { font-size:1.15rem; margin:0; }
 .spacer { flex:1; }
@@ -56,10 +76,14 @@ td.mono { font-family: ui-monospace, monospace; }
 .mon-nav a { font-size:.82rem; text-decoration:none; color:var(--mut);
              padding:.3rem .6rem; border:1px solid transparent; border-radius:6px; }
 .mon-nav a:hover { color:var(--txt); border-color:var(--line); }
-.mon-nav a.active { color:#fff; background:#334155; border-color:var(--mut); font-weight:600; }
+.mon-nav a.active { color:var(--active-fg); background:var(--active-bg); border-color:var(--mut); font-weight:600; }
 /* Lien vers l'admin Django : pas un board pair → séparé par un filet à gauche. */
 .mon-nav a.admin { margin-left:.4rem; padding-left:.7rem; border-left:1px solid var(--line);
                    border-radius:0 6px 6px 0; }
+
+/* Menu de layout (partials/monitoring_nav.html) : choix du thème visuel, persisté
+   côté navigateur (MShared.applyLayout). */
+.layout-pick { margin-left:.4rem; font-size:.78rem; padding:.25rem .5rem; }
 
 /* Chips de filtre (boards métier / VNI). Le board fichier a ses propres `.stat`. */
 .chips { display:flex; gap:.5rem; flex-wrap:wrap; padding:.8rem 1.5rem 0; }
@@ -89,7 +113,7 @@ td.mono { font-family: ui-monospace, monospace; }
                box-shadow:inset 2px 0 0 var(--sev-warn-action-rail); }
 .ds-recycled { background:var(--sev-recycled-bg); color:var(--sev-recycled-fg); }
 .ds-rejected { background:var(--sev-reject-bg); color:var(--sev-reject-fg); }
-.ds-all      { background:#1e293b; color:#cbd5e1; }
+.ds-all      { background:var(--card); color:var(--sev-warn-noaction-fg); }
 
 /* Verdicts MÉTIER (board business) mappés sur l'échelle — pas de palette parallèle.
    known = OK (push) ; candidate = action requise (warning_action). */
@@ -105,3 +129,43 @@ td.mono { font-family: ui-monospace, monospace; }
 .v-not_due        { background:var(--sev-warn-noaction-bg); color:var(--sev-warn-noaction-fg); }
 .v-unanchored     { background:var(--sev-info-bg); color:var(--sev-info-fg); }
 .v-non_expansible { background:var(--sev-warn-noaction-bg); color:var(--mut); }
+
+/* ── Layouts ─────────────────────────────────────────────────────────────────
+   `black` = valeurs par défaut de :root (ci-dessus). Chaque autre layout ne fait
+   que REDÉFINIR les jetons, posé via <html data-layout="…"> (MShared.applyLayout).
+   Aucune règle de composant ici : tout passe par les variables. */
+
+/* Generali : fond clair, rouge Generali (#C21B17) en accent, badges pastel. */
+:root[data-layout="generali"] {
+  --bg:#f5f5f5; --card:#ffffff; --txt:#333333; --mut:#6e6e6e; --line:#e0e0e0;
+  --hdr-bg:#ffffff;      --hdr-fg:#c21b17;      --hdr-rule:#c21b17;
+  --active-bg:#c21b17;   --active-fg:#ffffff;
+  --sel-bg:#fbe9e8;      --sel-line:#c21b17;
+  --neutral-bg:#5c5c5c;  --neutral-fg:#ffffff;
+  --link:#c21b17;        --link-alt:#8c1411;
+  --ok-txt:#2e7d32;      --ko-txt:#c21b17;
+  --flash:#fbe9e8;       --row-failed:rgba(194,27,23,.07); --row-failed-rail:#c21b17;
+  --shadow:rgba(0,0,0,.18); --overlay:rgba(0,0,0,.4);
+  --font:"Roboto", Arial, Helvetica, sans-serif;
+
+  --sev-blocking-bg:#fde2e1;      --sev-blocking-fg:#8b0f0c;      --sev-blocking-rail:#c21b17;
+  --sev-warn-action-bg:#fdebd8;   --sev-warn-action-fg:#8a3b00;   --sev-warn-action-rail:#e8740c;
+  --sev-recycle-bg:#fff4c2;       --sev-recycle-fg:#6b5000;
+  --sev-reject-bg:#f9d5d3;        --sev-reject-fg:#7a1210;
+  --sev-warn-noaction-bg:#ececec; --sev-warn-noaction-fg:#4a4a4a;
+  --sev-ok-bg:#dff2e3;            --sev-ok-fg:#1b5e20;
+  --sev-info-bg:#e3e6fa;          --sev-info-fg:#2e3a8c;
+  --sev-recycled-bg:#dce8f8;      --sev-recycled-fg:#1e4a80;
+
+  --st-receiving-bg:#dce8f8; --st-receiving-fg:#1e4a80;
+  --st-stored-bg:#dff2e3;    --st-stored-fg:#1b5e20;
+  --st-failed-bg:#f9d5d3;    --st-failed-fg:#7a1210;
+  --st-deleted-bg:#ececec;   --st-deleted-fg:#4a4a4a;
+  --st-missing-bg:#fdebd8;   --st-missing-fg:#8a3b00;
+  --st-archived-bg:#e3e6fa;  --st-archived-fg:#2e3a8c;
+}
+:root[data-layout="generali"] h1 { font-weight:700; letter-spacing:.01em; }
+:root[data-layout="generali"] th { color:#333333; border-bottom:2px solid #c21b17; }
+:root[data-layout="generali"] .mon-nav a.active { border-color:#c21b17; }
+:root[data-layout="generali"] button:hover,
+:root[data-layout="generali"] select:hover { border-color:#c21b17; color:#c21b17; }

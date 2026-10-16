@@ -1,0 +1,79 @@
+{% extends "admin/base_site.html" %}
+{% load i18n static %}
+{% comment %}
+  Écran de connexion au format du layout client : panneau de marque + formulaire.
+  Mêmes champs/URL que le login admin de Django (csrf, next, reset éventuel).
+{% endcomment %}
+
+{% block title %}{% if form.errors %}{% translate "Error:" %} {% endif %}{{ block.super }}{% endblock %}
+
+{% block extrastyle %}{{ block.super }}{% if alfaway_layout %}<link rel="stylesheet" href="{% static alfaway_layout.login_css %}">{% endif %}
+{{ form.media }}
+{% endblock %}
+
+{% block bodyclass %}{{ block.super }} login{% endblock %}
+
+{% block header %}{% endblock %}
+{% block usertools %}{% endblock %}
+{% block nav-global %}{% endblock %}
+{% block nav-sidebar %}{% endblock %}
+{% block content_title %}{% endblock %}
+{% block nav-breadcrumbs %}{% endblock %}
+
+{% block content %}
+<div class="login-shell">
+  <aside class="login-brand">
+    {% if alfaway_layout.logo %}<img class="layout-logo" src="{% static alfaway_layout.logo %}" alt="{{ alfaway_layout.label }}">{% endif %}
+    <p class="login-tagline">Data Transfer Platform</p>
+  </aside>
+
+  <section class="login-panel">
+    <div id="content-main">
+    <div class="login-panel-head">
+      <h1>{% translate 'Log in' %}</h1>
+      {% include "admin/color_theme_toggle.html" %}
+    </div>
+
+    {% if form.errors and not form.non_field_errors %}
+    <div class="login-alert" role="alert">
+    {% blocktranslate count counter=form.errors.items|length %}Please correct the error below.{% plural %}Please correct the errors below.{% endblocktranslate %}
+    </div>
+    {% endif %}
+
+    {% for error in form.non_field_errors %}
+    <div class="login-alert" role="alert">{{ error }}</div>
+    {% endfor %}
+
+    {% if user.is_authenticated %}
+    <div class="login-alert" role="alert">
+    {% blocktranslate trimmed %}
+        You are authenticated as {{ username }}, but are not authorized to
+        access this page. Would you like to login to a different account?
+    {% endblocktranslate %}
+    </div>
+    {% endif %}
+
+    <form action="{{ app_path }}" method="post" id="login-form">{% csrf_token %}
+      <div class="form-row">
+        {{ form.username.errors }}
+        {{ form.username.label_tag }} {{ form.username }}
+      </div>
+      <div class="form-row">
+        {{ form.password.errors }}
+        {{ form.password.label_tag }} {{ form.password }}
+        <input type="hidden" name="next" value="{{ next }}">
+      </div>
+      {% url 'admin_password_reset' as password_reset_url %}
+      {% if password_reset_url %}
+      <div class="password-reset-link">
+        <a href="{{ password_reset_url }}">{% translate 'Forgotten your login credentials?' %}</a>
+      </div>
+      {% endif %}
+      <div class="submit-row">
+        <input type="submit" value="{% translate 'Log in' %}">
+      </div>
+    </form>
+    </div>
+  </section>
+</div>
+{% endblock %}

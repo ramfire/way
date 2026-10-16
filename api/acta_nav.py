@@ -33,13 +33,15 @@ plan ne vérifie que la forme (champs présents, nombres et dates lisibles, devi
 connues d'Acta).
 """
 import logging
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
+from django.utils import timezone
 
-from .acta import ActaClient, ActaError, SOURCE_CODE
+from .acta import ActaClient, ActaError, ActaTimeout, SOURCE_CODE
 from .models import (
     Event, ReceivedFile, current_control_rollup, refresh_control_class, run_scope,
 )
@@ -108,6 +110,10 @@ def build_plan(rf, feed, client, known_codes=None, currencies=None):
         settings.ACTA_SOURCE)
     ccys = currencies if currencies is not None else client.currencies()
     plan = Plan()
+    # Acta résout codes et entités « à maintenant » (``.current()``) : une entité
+    # datée d'une VNI future y serait invisible jusqu'à cette date (codes non
+    # retrouvés, VNI « référence non résolue », re-création refusée).
+    today = timezone.localdate().isoformat()
     for n, r in _rows(rf, feed):
         fund, share = r.get('Fund_code', '').strip(), r.get('Share_code', '').strip()
         nav_date = _iso(r.get('NAV_date'))
@@ -138,13 +144,13 @@ def build_plan(rf, feed, client, known_codes=None, currencies=None):
 
         f = plan.funds.setdefault(fund, {
             'code': fund, 'name': r.get('Fund_name', '').strip(), 'currency': fund_ccy,
-            'uid': known.get(fund), 'valid_from': nav_date})
+            'uid': known.get(fund), 'valid_from': min(nav_date, today)})
         f['valid_from'] = min(f['valid_from'], nav_date)
         c = plan.classes.setdefault(share, {
             'code': share, 'fund': fund, 'currency': class_ccy,
             'isin': r.get('ISIN_code', '').strip() or None,
             'name': f"{f['name']} — {r.get('Share_type', '').strip() or share}",
-            'uid': known.get(share), 'valid_from': nav_date})
+            'uid': known.get(share), 'valid_from': min(nav_date, today)})
         c['valid_from'] = min(c['valid_from'], nav_date)
         f['valid_from'] = min(f['valid_from'], c['valid_from'])
 
@@ -175,9 +181,13 @@ def _create_entity(client, payload, code, created, failures):
         'entity': uid, 'source': settings.ACTA_SOURCE, 'code_type': SOURCE_CODE,
         'code': code, 'valid_from': payload['valid_from']})
     if status != 201:
-        client.send_json('DELETE', f'/api/v1/entities/{uid}/', None)
-        failures.append({'code': code, 'step': 'external_code', 'status': status,
-                         'detail': ext, 'rolled_back': uid})
+        del_status, _ = client.send_json('DELETE', f'/api/v1/entities/{uid}/', None)
+        failure = {'code': code, 'step': 'external_code', 'status': status,
+                   'detail': ext, 'rolled_back': uid}
+        if del_status not in (200, 204):
+            # Clôture refusée : l'entité reste orpheline dans Acta (à nettoyer).
+            failure['rollback_failed'] = del_status
+        failures.append(failure)
         return None
     created.append({'code': code, 'uid': uid, 'type': payload['entity_type']})
     return uid
@@ -214,6 +224,36 @@ def read_journal(client, file_ref, after_id, sent):
             'rejected_lines': rejected_lines, 'mismatch': totals['rows'] != sent}
 
 
+RECOVERY_POLL = 5   # s entre deux relectures du journal après un timeout d'ingest
+
+
+def _recover_batch(client, file_ref, after_id, expected_rows, error):
+    """Lot d'ingest sans réponse (timeout) : Acta a pu l'ingérer quand même — il
+    poursuit le traitement côté serveur. On relit son journal (imports ``> after_id``
+    pour ce ``file_ref``) jusqu'à ``ACTA_INGEST_RECOVERY_WAIT`` s : si les VNI
+    journalisées atteignent ``expected_rows`` (cumul envoyé, lot compris), le lot est
+    acquis → renvoie le dernier import. Sinon relève ``error`` (→ ``acta_unreachable``,
+    rejouable). Sans ``file_ref`` / journal illisible avant ingest : pas de preuve
+    possible, on relève directement."""
+    if not file_ref or after_id is None:
+        raise error
+    deadline = time.monotonic() + settings.ACTA_INGEST_RECOVERY_WAIT
+    while True:
+        try:
+            imports = [i for i in client.nav_imports(file_ref) if i['id'] > after_id]
+            if imports and sum(i['rows'] for i in imports) >= expected_rows:
+                imp = max(imports, key=lambda i: i['id'])
+                logger.warning('Ingest Acta sans réponse mais journalisé (%s, import %s)',
+                               file_ref, imp['id'])
+                return imp
+        except ActaError as e:
+            logger.warning('Journal Acta illisible après timeout (%s) : %s', file_ref, e)
+        if time.monotonic() >= deadline:
+            raise ActaError(f'{error} ; lot absent du journal Acta après '
+                            f'{settings.ACTA_INGEST_RECOVERY_WAIT} s') from error
+        time.sleep(RECOVERY_POLL)
+
+
 def apply_plan(client, plan, file_ref=None):
     created, links, failures = [], [], []
     for f in plan.funds.values():
@@ -222,6 +262,15 @@ def apply_plan(client, plan, file_ref=None):
                 'name': f['name'] or f['code'], 'entity_type': 'SUB_FUND',
                 'currency': f['currency'], 'valid_from': f'{f["valid_from"]}T00:00:00Z',
             }, f['code'], created, failures)
+    # Classes liées par fonds, lues UNE fois par fonds (``share_classes_of`` = 1 appel
+    # HTTP) : sinon 1 appel par classe — 220 appels pour 67 fonds (~23 s, fichier 595).
+    linked = {}
+
+    def _linked(fund_uid):
+        if fund_uid not in linked:
+            linked[fund_uid] = set(client.share_classes_of(fund_uid))
+        return linked[fund_uid]
+
     for c in plan.classes.values():
         fund = plan.funds[c['fund']]
         if fund['uid'] is None:
@@ -236,13 +285,15 @@ def apply_plan(client, plan, file_ref=None):
             c['uid'] = _create_entity(client, payload, c['code'], created, failures)
             if c['uid'] is None:
                 continue
-        if new_class or c['uid'] not in client.share_classes_of(fund['uid']):
+        if new_class or c['uid'] not in _linked(fund['uid']):
             status, body = client.send_json('POST', '/api/v1/entity-relationships/', {
                 'parent': fund['uid'], 'child': c['uid'],
                 'relationship_type': 'SHARE_CLASS_OF',
                 'valid_from': f'{fund["valid_from"]}T00:00:00Z'})
             if status == 201:
                 links.append({'fund': fund['code'], 'class': c['code']})
+                if fund['uid'] in linked:
+                    linked[fund['uid']].add(c['uid'])
             else:
                 failures.append({'code': c['code'], 'step': 'link', 'status': status,
                                  'detail': body})
@@ -257,11 +308,25 @@ def apply_plan(client, plan, file_ref=None):
     envelope = {'schema_version': '1', 'source': settings.ACTA_SOURCE}
     if file_ref:
         envelope['file_ref'] = file_ref
-    returned, missing = 0, []
+    returned, missing, recovered = 0, [], []
     for i in range(0, len(plan.navs), INGEST_BATCH):
         records = plan.navs[i:i + INGEST_BATCH]
-        status, body = client.send_json('POST', '/api/v1/ingest/', {
-            **envelope, 'records': records})
+        try:
+            status, body = client.send_json('POST', '/api/v1/ingest/', {
+                **envelope, 'records': records}, timeout=settings.ACTA_INGEST_TIMEOUT)
+        except ActaTimeout as e:
+            # Pas de réponse API : on prend le journal Acta comme preuve d'ingestion.
+            imp = _recover_batch(client, file_ref, after_id, i + len(records), e)
+            recovered.append({'import': imp['id'], 'rows': len(records)})
+            for k in ('stored', 'unchanged', 'rejected'):
+                counts[k] = counts.get(k, 0) + imp.get(k, 0)
+            if imp.get('rejected'):
+                rejected += [
+                    {'status': 'rejected', 'import': imp['id'],
+                     'source_record_id': l.get('source_record_id'),
+                     'reason': l.get('reason')}
+                    for l in client.nav_import_lines(imp['id'], 'REJECTED')]
+            continue
         if status != 200:
             raise ActaError(f'ingest refusé (HTTP {status}) : {str(body)[:500]}')
         for k, v in (body.get('counts') or {}).items():
@@ -281,7 +346,8 @@ def apply_plan(client, plan, file_ref=None):
             journal = {'unavailable': str(e)[:300]}
     return {'created': created, 'links': links, 'failures': failures,
             'nav_counts': counts, 'nav_rejected': rejected, 'journal': journal,
-            'sent': len(plan.navs), 'returned': returned, 'missing': missing}
+            'sent': len(plan.navs), 'returned': returned, 'missing': missing,
+            'recovered': recovered}
 
 
 def count_check(res):
@@ -290,9 +356,14 @@ def count_check(res):
     l'ingest, même ``source_record_id``) ; et, si le journal Acta a pu être relu, il
     doit avoir journalisé autant de VNI qu'envoyées. → ``(ok, detail)``."""
     journal = res['journal'] or {}
+    # Lots repris via le journal après timeout : pas de retour API à compter, c'est
+    # la relecture du journal (``acta_journal_mismatch``) qui les contrôle.
+    recovered_rows = sum(r['rows'] for r in res.get('recovered', []))
     detail = {'sent': res['sent'], 'returned': res['returned'],
               'missing': res['missing'][:50], 'journal_rows': journal.get('rows')}
-    if res['returned'] != res['sent'] or res['missing']:
+    if recovered_rows:
+        detail['recovered_rows'] = recovered_rows
+    if res['returned'] + recovered_rows != res['sent'] or res['missing']:
         detail['reason'] = 'api_count_mismatch'
     elif journal.get('mismatch'):
         detail['reason'] = 'acta_journal_mismatch'
@@ -335,8 +406,20 @@ def load_file(file_id, dry_run=False, client=None):
     from .admission import _resolve_feed
     rf = ReceivedFile.objects.get(pk=file_id)
     feed = _resolve_feed(rf)
-    client = client or ActaClient()
-    plan = build_plan(rf, feed, client)
+    try:
+        client = client or ActaClient()
+        plan = build_plan(rf, feed, client)
+    except ActaError as e:
+        if dry_run:
+            raise
+        # Lecture du référentiel Acta impossible avant tout envoi : même verdict que
+        # pendant l'ingest. Sans cet Event, l'échec restait invisible (log seul) et
+        # le board affichait encore la passe précédente.
+        with run_scope():
+            _emit(rf, CTRL_NAV, Event.Result.FAILED, Event.MonitoringClass.RECYCLE,
+                  {'reason': 'acta_unreachable', 'step': 'plan', 'error': str(e)[:500]})
+        refresh_control_class([rf.pk])
+        return {'error': str(e)[:500]}, None
     summary = {
         'funds_total': len(plan.funds),
         'funds_to_create': sum(1 for f in plan.funds.values() if f['uid'] is None),
@@ -372,6 +455,8 @@ def load_file(file_id, dry_run=False, client=None):
                   'file_ref': file_ref_of(rf)}
         if res['journal'] is not None:
             detail['journal'] = {**journal, 'rejected_lines': journal.get('rejected_lines', [])[:50]}
+        if res['recovered']:
+            detail['recovered_after_timeout'] = res['recovered']
         _emit(rf, CTRL_NAV,
               Event.Result.PASSED if ok_nav else Event.Result.FAILED,
               Event.MonitoringClass.PUSH if ok_nav else Event.MonitoringClass.WARNING_ACTION,

@@ -1,0 +1,146 @@
+/*
+ * Layout Generali — variables CSS de l'admin Django (chargé après base.css et
+ * dark_mode.css). Mêmes sélecteurs que Django pour garder le sélecteur de thème
+ * clair / sombre / auto. Palette alignée sur [data-layout="generali"] du monitoring
+ * (api/static/css/monitoring_shared.css).
+ */
+html[data-theme="light"],
+:root {
+    --primary: #c21b17;
+    --secondary: #8c1411;
+    --accent: #ffffff;
+    --primary-fg: #ffffff;
+
+    --body-fg: #333333;
+    --body-bg: #ffffff;
+    --body-quiet-color: #6e6e6e;
+
+    --header-color: #ffffff;
+    --header-branding-color: #ffffff;
+    --header-bg: #c21b17;
+    --header-link-color: #ffffff;
+
+    --breadcrumbs-fg: #6e6e6e;
+    --breadcrumbs-link-fg: #c21b17;
+    --breadcrumbs-bg: #f5f5f5;
+
+    --link-fg: #c21b17;
+    --link-hover-color: #8c1411;
+    --link-selected-fg: #8c1411;
+
+    --hairline-color: #e0e0e0;
+    --border-color: #cccccc;
+
+    --darkened-bg: #f5f5f5;
+    --selected-row: #fbe9e8;
+
+    --button-bg: #c21b17;
+    --button-hover-bg: #8c1411;
+    --default-button-bg: #8c1411;
+    --default-button-hover-bg: #c21b17;
+    --close-button-bg: #5c5c5c;
+    --close-button-hover-bg: #333333;
+
+    --font-family-primary: "Roboto", Arial, Helvetica, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --primary: #8c1411;
+        --secondary: #5e0d0b;
+        --primary-fg: #f7f7f7;
+
+        --body-fg: #eeeeee;
+        --body-bg: #121212;
+        --body-quiet-color: #c8c8c8;
+
+        --header-bg: #8c1411;
+
+        --breadcrumbs-fg: #bdbdbd;
+        --breadcrumbs-link-fg: #ff8a80;
+        --breadcrumbs-bg: #212121;
+
+        --link-fg: #ff8a80;
+        --link-hover-color: #ffb3ad;
+        --link-selected-fg: #ff8a80;
+
+        --hairline-color: #272727;
+        --border-color: #353535;
+
+        --darkened-bg: #212121;
+        --selected-row: #3a1514;
+
+        --button-bg: #a8201c;
+        --button-hover-bg: #c21b17;
+        --default-button-bg: #c21b17;
+        --default-button-hover-bg: #a8201c;
+        --close-button-bg: #333333;
+        --close-button-hover-bg: #666666;
+    }
+}
+
+html[data-theme="dark"] {
+    --primary: #8c1411;
+    --secondary: #5e0d0b;
+    --primary-fg: #f7f7f7;
+
+    --body-fg: #eeeeee;
+    --body-bg: #121212;
+    --body-quiet-color: #c8c8c8;
+
+    --header-bg: #8c1411;
+
+    --breadcrumbs-fg: #bdbdbd;
+    --breadcrumbs-link-fg: #ff8a80;
+    --breadcrumbs-bg: #212121;
+
+    --link-fg: #ff8a80;
+    --link-hover-color: #ffb3ad;
+    --link-selected-fg: #ff8a80;
+
+    --hairline-color: #272727;
+    --border-color: #353535;
+
+    --darkened-bg: #212121;
+    --selected-row: #3a1514;
+
+    --button-bg: #a8201c;
+    --button-hover-bg: #c21b17;
+    --default-button-bg: #c21b17;
+    --default-button-hover-bg: #a8201c;
+    --close-button-bg: #333333;
+    --close-button-hover-bg: #666666;
+}
+
+/* Bandeau : marque blanche sur rouge, filet bas plus sombre. */
+.layout-generali #header {
+    border-bottom: 3px solid var(--secondary);
+}
+
+.layout-brand a,
+.layout-brand a:link,
+.layout-brand a:visited {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--header-branding-color);
+    font-weight: 700;
+    letter-spacing: .01em;
+}
+
+.layout-logo {
+    height: 28px;
+    width: auto;
+}
+
+/* Titres de modules et en-têtes de tableau. */
+.layout-generali .module h2,
+.layout-generali .module caption,
+.layout-generali .inline-group h2 {
+    font-weight: 700;
+}
+
+.layout-generali thead th,
+.layout-generali tfoot td {
+    border-bottom: 2px solid var(--primary);
+}

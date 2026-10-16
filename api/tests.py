@@ -294,6 +294,15 @@ class MonitoringCausesTests(TestCase):
                          Event.MonitoringClass.WARNING_ACTION)
 
 
+def drain_pipeline():
+    """Vide la file du worker (``--once``) en neutralisant identification et
+    chargement Acta : scénarios centrés sur l'admission (sans profil d'identification
+    configuré, l'identification poserait ``warning_action``)."""
+    from django.core.management import call_command
+    with patch('api.admission.file_identification'), patch('api.acta_nav.maybe_load'):
+        call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+
+
 class HandledTests(TestCase):
     """Tampon « traité » set-once au niveau fichier + réconciliation (étape 5).
 
@@ -317,8 +326,15 @@ class HandledTests(TestCase):
         return {c['control']: c for c in self.client.get('/monitoring/causes/').json()['causes']}
 
     def _handle(self, rf):
-        # « Recycle » est le mécanisme unique : rejoue ET pose le flag si OK.
-        return self.client.post(f'/monitoring/files/{rf.pk}/recycle/').json()
+        # « Recycle » est le mécanisme unique : met en file (202) ; le worker rejoue
+        # la chaîne ET pose le flag si OK. On draine la file pour observer le verdict.
+        resp = self.client.post(f'/monitoring/files/{rf.pk}/recycle/')
+        if resp.status_code != 202:
+            return resp.json()
+        drain_pipeline()
+        rf.refresh_from_db()
+        return {'control_class': rf.control_class,
+                'handled': Handled.objects.filter(file=rf).exists()}
 
     def test_file_override_reconciliation(self):
         # On enrôle le partenaire (cause corrigée) pour que le « Handle » aboutisse.
@@ -530,6 +546,16 @@ class QualificationTests(TestCase):
         self.assertEqual(ev.detail['verdict'], qual.VERDICT_RECYCLE)
         self.assertEqual(ev.cause_code, qual.CAUSE_GRAMMAR_INVALID)
 
+    def test_invalid_regex_rejected_at_save(self):
+        # Garde-fou admin : une grammaire qui ne compile pas échoue à full_clean.
+        from django.core.exceptions import ValidationError
+        from .models import validate_grammar
+        validate_grammar({})
+        validate_grammar({'filename': r'.*PO_NAV_.*\.csv'})
+        for bad in ({'filename': r'*PO_NAV_.*\.csv'}, {'filename': 3}, []):
+            with self.assertRaises(ValidationError):
+                validate_grammar(bad)
+
     def test_not_run_when_admission_not_admis(self):
         # Compte non mappé → admission recycle → AUCUN événement de qualification.
         rf = make_file(username='ghost', s3_key='in/ghost/x.csv')
@@ -691,8 +717,8 @@ class RemediationEndpointTests(TestCase):
         enrol('newcomer')
         add_feed('newcomer', 'in/acme', r'.+', route=add_route('newcomer'))  # corrige la cause + route
         r = self.client.post(f'/monitoring/files/{rf.pk}/recycle/')
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()['verdict'], VERDICT_ADMIS)
+        self.assertEqual(r.status_code, 202)               # mis en file du worker
+        drain_pipeline()
         rf.refresh_from_db()
         self.assertEqual(rf.control_class, Event.MonitoringClass.PUSH)
 
@@ -767,7 +793,8 @@ class RemediationEndpointTests(TestCase):
         file_admission(rf.pk)
         enrol('newcomer')
         add_feed('newcomer', 'in/acme', r'.+', route=add_route('newcomer'))  # route → push
-        self.client.post(f'/monitoring/files/{rf.pk}/recycle/')   # → push + Handled
+        self.client.post(f'/monitoring/files/{rf.pk}/recycle/')   # mis en file
+        drain_pipeline()                                          # → push + Handled
         row = next(x for x in self.client.get('/monitoring/feed/?control=recycled')
                    .json()['rows'] if x['id'] == rf.pk)
         self.assertEqual(row['display_state'], 'recycled')
@@ -1182,6 +1209,92 @@ class RunScopeTests(TestCase):
                 monitoring_class=Event.MonitoringClass.PUSH)
         ev.refresh_from_db()
         self.assertEqual(ev.run_id, rid)
+
+
+def _xlsx(rows, sheet='Sheet1'):
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet
+    for r in rows:
+        ws.append(r)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+class ParsingXlsxTests(ParsingTests):
+    """Parsing ``format: xlsx`` : même contrôles que le CSV, cellules typées."""
+
+    COLS = ['COMPANY', 'VALUATION_INS_CURR', 'REPORT_DATE']
+    LAYOUT = {'format': 'xlsx', 'header': {'present': True, 'columns': COLS},
+              'column_contracts': [
+                  {'name': 'COMPANY', 'type': 'string', 'required': True, 'nullable': False},
+                  {'name': 'VALUATION_INS_CURR', 'type': 'number', 'required': True},
+                  {'name': 'REPORT_DATE', 'type': 'date', 'format': '%d/%m/%Y',
+                   'required': True}]}
+
+    def test_typed_cells_parse(self):
+        # Date Excel native et nombre : conformes sans passer par le format texte.
+        rf, _ = self._qualified_file(layout=self.LAYOUT)
+        verdict = self._parse(rf, _xlsx([self.COLS, ['Acme', 1250.5, date(2025, 5, 13)],
+                                         ['Beta', 10, '13/05/2025'], [None, None]]))
+        self.assertEqual(verdict, parsing.VERDICT_PARSED)
+        ev = parsing.latest_parsing_event(rf)
+        self.assertEqual((ev.detail['format'], ev.detail['record_count'],
+                          ev.detail['column_count']), ('xlsx', 2, 3))
+
+    def test_header_only_workbook_parses_zero_records(self):
+        # Cas du fichier AD_DEMO_FUND_CREDIT_DIRECT_NAV (#690) : en-tête seul.
+        rf, _ = self._qualified_file(layout=self.LAYOUT)
+        self.assertEqual(self._parse(rf, _xlsx([self.COLS])), parsing.VERDICT_PARSED)
+        self.assertEqual(parsing.latest_parsing_event(rf).detail['record_count'], 0)
+
+    def test_short_row_is_trailing_blanks_but_long_row_is_malformed(self):
+        layout = {**self.LAYOUT, 'column_contracts': []}
+        rf, _ = self._qualified_file(layout=layout)
+        self.assertEqual(self._parse(rf, _xlsx([self.COLS, ['Acme']])),
+                         parsing.VERDICT_PARSED)
+        verdict = self._parse(rf, _xlsx([self.COLS, ['Acme', 1, 2, 'extra']]))
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
+                         parsing.CAUSE_MALFORMED_RECORD)
+
+    def test_contract_type_failure_on_text_cell(self):
+        rf, _ = self._qualified_file(layout=self.LAYOUT)
+        verdict = self._parse(rf, _xlsx([self.COLS, ['Acme', 'n/a', date(2025, 5, 13)]]))
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        ev = parsing.latest_parsing_event(rf)
+        self.assertEqual(ev.cause_code, parsing.CAUSE_COLUMN_TYPE)
+        self.assertEqual(ev.detail['columns'][0]['column'], 'VALUATION_INS_CURR')
+
+    def test_header_mismatch_recycles(self):
+        rf, _ = self._qualified_file(layout=self.LAYOUT)
+        verdict = self._parse(rf, _xlsx([['COMPANY', 'OTHER', 'REPORT_DATE']]))
+        self.assertEqual(verdict, parsing.VERDICT_RECYCLE)
+        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
+                         parsing.CAUSE_HEADER_MISMATCH)
+
+    def test_unknown_sheet_or_not_a_workbook_is_decode_error(self):
+        rf, _ = self._qualified_file(layout={**self.LAYOUT, 'sheet': 'Data'})
+        self.assertEqual(self._parse(rf, _xlsx([self.COLS])), parsing.VERDICT_RECYCLE)
+        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
+                         parsing.CAUSE_DECODE_ERROR)
+        self.assertEqual(self._parse(rf, b'A;B;C\n'), parsing.VERDICT_RECYCLE)
+        self.assertEqual(parsing.latest_parsing_event(rf).cause_code,
+                         parsing.CAUSE_DECODE_ERROR)
+
+    def test_named_sheet_is_read(self):
+        rf, _ = self._qualified_file(layout={**self.LAYOUT, 'sheet': 'Data'})
+        self.assertEqual(self._parse(rf, _xlsx([self.COLS], sheet='Data')),
+                         parsing.VERDICT_PARSED)
+
+    def test_layout_sheet_must_be_name_or_index(self):
+        from django.core.exceptions import ValidationError
+        from .models import validate_layout
+        validate_layout({'format': 'xlsx', 'sheet': 0})
+        with self.assertRaises(ValidationError):
+            validate_layout({'format': 'xlsx', 'sheet': ['Data']})
 
 
 class RunIdRollupTests(ParsingTests):
@@ -1827,7 +1940,7 @@ class ActaNavLoaderTests(TestCase):
         return rf, feed
 
     def _client(self, known=None, ingest_status='created', journal=None, journal_gap=0,
-                api_gap=0):
+                api_gap=0, ingest_timeout=None):
         from unittest.mock import MagicMock
         c = MagicMock()
         c.source_codes.return_value = known or {}
@@ -1838,7 +1951,7 @@ class ActaNavLoaderTests(TestCase):
         # Journal Acta simulé : un import par lot ingéré (cf. Acta /api/v1/nav-imports/).
         c.journal, c.journal_lines = list(journal or []), {}
 
-        def send(method, path, payload):
+        def send(method, path, payload, timeout=None):
             if path == '/api/v1/entities/':
                 return 201, {'uid': next(uids)}
             if path == '/api/v1/ingest/':
@@ -1854,6 +1967,13 @@ class ActaNavLoaderTests(TestCase):
                     {'line_no': i + 1, 'source_line_no': r.get('source_line_no'),
                      'source_record_id': r['source_record_id'], 'outcome': 'REJECTED',
                      'reason': 'classe inconnue'} for i, r in enumerate(records)] if refused else []
+                if ingest_timeout:
+                    # 'ingested' : Acta a traité le lot mais la réponse n'est pas arrivée ;
+                    # 'lost' : rien dans le journal (on retire l'import simulé).
+                    if ingest_timeout == 'lost':
+                        c.journal.pop()
+                    from .acta import ActaTimeout
+                    raise ActaTimeout('Acta injoignable (http://acta) : timed out')
                 echoed = records[:len(records) - api_gap]
                 return 200, {'counts': {ingest_status: len(echoed)},
                              'results': [{'status': ingest_status, 'index': i,
@@ -1885,6 +2005,28 @@ class ActaNavLoaderTests(TestCase):
         self.assertEqual(plan.funds['FX0001']['valid_from'], '2026-09-30')
         self.assertEqual(len(plan.classes), 2)
 
+    def test_valid_from_capped_at_today_for_future_nav(self):
+        # Acta résout « à maintenant » : une entité datée d'une VNI future y serait
+        # invisible (FA0702, 2026-10-12) → valid_from plafonné à aujourd'hui.
+        with patch('api.acta_nav.timezone.localdate', return_value=date(2026, 9, 15)):
+            plan = self._plan()
+        self.assertEqual(plan.funds['FX0001']['valid_from'], '2026-09-15')
+        self.assertEqual(plan.classes['900001']['valid_from'], '2026-09-15')
+        self.assertEqual(plan.navs[0]['nav_date'], '2026-10-01')
+
+    def test_failed_rollback_is_traced(self):
+        from unittest.mock import MagicMock
+        from .acta_nav import _create_entity
+        c = MagicMock()
+        c.send_json.side_effect = [(201, {'uid': 'u1'}), (400, {'__all__': ['dup']}),
+                                   (404, {'detail': 'not found'})]
+        created, failures = [], []
+        self.assertIsNone(_create_entity(
+            c, {'valid_from': '2026-10-01T00:00:00Z', 'entity_type': 'SUB_FUND'},
+            'FA0702', created, failures))
+        self.assertEqual(failures[0]['rolled_back'], 'u1')
+        self.assertEqual(failures[0]['rollback_failed'], 404)
+
     def test_known_codes_are_not_recreated(self):
         plan = self._plan(known={'FX0001': 'f-uid', '900001': 'c-uid'})
         self.assertEqual(plan.funds['FX0001']['uid'], 'f-uid')
@@ -1912,6 +2054,71 @@ class ActaNavLoaderTests(TestCase):
         with patch('api.parsing.get_s3_client', return_value=_fake_s3(self.CONTENT)):
             load_file(rf.pk, client=self._client(ingest_status='rejected'))
         ev = Event.objects.get(file=rf, stage='load', control='acta_nav')
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.WARNING_ACTION)
+        self.assertEqual(len(ev.detail['rejected']), 2)
+
+    def test_share_classes_read_once_per_fund(self):
+        # 2 classes connues du même fonds, déjà liées : 1 seul appel share-classes,
+        # aucun lien recréé.
+        client = self._client(known={'FX0001': 'f-uid', '900001': 'c1', '900002': 'c2'})
+        client.share_classes_of.return_value = {'c1', 'c2'}
+        _, ev = self._load(client)
+        client.share_classes_of.assert_called_once_with('f-uid')
+        paths = [c.args[1] for c in client.send_json.call_args_list]
+        self.assertNotIn('/api/v1/entity-relationships/', paths)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+
+    def test_unlinked_known_classes_still_linked(self):
+        # Classes connues mais non liées : lecture unique, puis un lien par classe.
+        client = self._client(known={'FX0001': 'f-uid', '900001': 'c1', '900002': 'c2'})
+        self._load(client)
+        client.share_classes_of.assert_called_once_with('f-uid')
+        links = [c for c in client.send_json.call_args_list
+                 if c.args[1] == '/api/v1/entity-relationships/']
+        self.assertEqual(len(links), 2)
+
+    def test_plan_read_failure_emits_unreachable_event(self):
+        # Acta injoignable dès la lecture du référentiel (build_plan) : Event
+        # acta_unreachable visible, rien n'est envoyé.
+        from .acta import ActaError
+        client = self._client()
+        client.source_codes.side_effect = ActaError('Acta injoignable : timed out')
+        rf, ev = self._load(client)
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.RECYCLE)
+        self.assertEqual(ev.detail['reason'], 'acta_unreachable')
+        self.assertEqual(ev.detail['step'], 'plan')
+        client.send_json.assert_not_called()
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
+
+    # --- timeout d'ingest : délai dédié + reprise par le journal --------------
+    def test_ingest_uses_dedicated_timeout(self):
+        client = self._client()
+        with override_settings(ACTA_INGEST_TIMEOUT=77):
+            self._load(client)
+        call = next(c for c in client.send_json.call_args_list
+                    if c.args[1] == '/api/v1/ingest/')
+        self.assertEqual(call.kwargs['timeout'], 77)
+
+    def test_timeout_but_journalised_is_success(self):
+        # Cas du fichier 595 : Acta a ingéré (import ACCEPTED) après le timeout client.
+        rf, ev = self._load(self._client(ingest_timeout='ingested'))
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.PUSH)
+        self.assertEqual(ev.detail['recovered_after_timeout'], [{'import': 1, 'rows': 2}])
+        self.assertEqual(ev.detail['counts']['stored'], 2)
+        cnt = Event.objects.get(file=rf, stage='load', control='acta_count')
+        self.assertEqual(cnt.result, Event.Result.PASSED)
+        self.assertEqual(cnt.detail['recovered_rows'], 2)
+
+    def test_timeout_and_absent_from_journal_is_unreachable(self):
+        with override_settings(ACTA_INGEST_RECOVERY_WAIT=0), patch('api.acta_nav.time.sleep'):
+            rf, ev = self._load(self._client(ingest_timeout='lost'))
+        self.assertEqual(ev.monitoring_class, Event.MonitoringClass.RECYCLE)
+        self.assertEqual(ev.detail['reason'], 'acta_unreachable')
+        self.assertIn('absent du journal', ev.detail['error'])
+
+    def test_timeout_recovered_rejections_are_warning_action(self):
+        _, ev = self._load(self._client(ingest_timeout='ingested', ingest_status='rejected'))
         self.assertEqual(ev.monitoring_class, Event.MonitoringClass.WARNING_ACTION)
         self.assertEqual(len(ev.detail['rejected']), 2)
 
@@ -2051,7 +2258,7 @@ class ActaNavLoaderTests(TestCase):
         client = self._client()
         base = client.send_json.side_effect
 
-        def send(method, path, payload):
+        def send(method, path, payload, timeout=None):
             if path == '/api/v1/entity-external-codes/':
                 return 400, {'code': ['déjà utilisé']}
             return base(method, path, payload)
@@ -2112,3 +2319,235 @@ class ActaNavLoaderTests(TestCase):
         rf = self._routed_file()
         with patch('api.acta_nav.load_file', side_effect=RuntimeError('boom')):
             self.assertIsNone(maybe_load(rf.pk))
+
+
+@override_settings(SFTPGO_WEBHOOK_TOKEN='tok')
+class AsyncPipelineTests(TestCase):
+    """Le webhook `upload` met en file sans exécuter la chaîne ; le worker la
+    déroule hors requête (évite les rejeux SFTPGo sur timeout, incident 2026-10-12)."""
+
+    def _upload(self, **extra):
+        payload = {'action': 'upload', 'username': 'acme', 'status': 1,
+                   'virtual_path': '/NAV.csv', 'path': 'acme/NAV.csv',
+                   'bucket': 'alfaway-dev', 'session_id': 's1', 'file_size': 10,
+                   **extra}
+        return self.client.post('/api/internal/sftp-webhook/?token=tok',
+                                payload, content_type='application/json')
+
+    def test_webhook_enqueues_without_running_pipeline(self):
+        with patch('api.admission.file_admission') as fa:
+            resp = self._upload()
+        self.assertEqual(resp.status_code, 200)
+        fa.assert_not_called()
+        rf = ReceivedFile.objects.get(s3_key='/NAV.csv')
+        self.assertEqual(rf.pipeline_state, ReceivedFile.PipelineState.PENDING)
+
+    def test_replayed_upload_hook_is_ignored(self):
+        """SFTPGo rejoue le hook (même session + même timestamp) : une seule ligne."""
+        self._upload(timestamp=123)
+        rf = ReceivedFile.objects.get(s3_key='/NAV.csv')
+        ReceivedFile.objects.filter(pk=rf.pk).update(
+            pipeline_state=ReceivedFile.PipelineState.DONE)
+        resp = self._upload(timestamp=123)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(ReceivedFile.objects.filter(s3_key='/NAV.csv').count(), 1)
+        rf.refresh_from_db()
+        self.assertEqual(rf.pipeline_state, ReceivedFile.PipelineState.DONE)
+
+    def test_new_upload_same_file_is_kept(self):
+        """Ré-dépôt réel du même fichier (nouvel événement) : nouvelle ligne."""
+        self._upload(timestamp=123)
+        self._upload(timestamp=456)
+        self.assertEqual(ReceivedFile.objects.filter(s3_key='/NAV.csv').count(), 2)
+
+    def test_replay_after_delete_still_ignored(self):
+        self._upload(timestamp=123)
+        self.client.post('/api/internal/sftp-webhook/?token=tok',
+                         {'action': 'delete', 'virtual_path': '/NAV.csv'},
+                         content_type='application/json')
+        self._upload(timestamp=123)
+        self.assertEqual(ReceivedFile.objects.filter(s3_key='/NAV.csv').count(), 1)
+
+    def test_failed_upload_not_enqueued(self):
+        self._upload(status=2)
+        rf = ReceivedFile.objects.get(s3_key='/NAV.csv')
+        self.assertEqual(rf.pipeline_state, '')
+
+    def test_worker_once_processes_pending(self):
+        from django.core.management import call_command
+        self._upload()
+        rf = ReceivedFile.objects.get(s3_key='/NAV.csv')
+        with patch('api.admission.file_admission') as fa:
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        fa.assert_called_once_with(rf.pk)
+        rf.refresh_from_db()
+        self.assertEqual(rf.pipeline_state, ReceivedFile.PipelineState.DONE)
+        self.assertIsNotNone(rf.pipeline_finished_at)
+
+    def test_worker_marks_error_and_continues(self):
+        from django.core.management import call_command
+        a = make_file(s3_key='a.csv', pipeline_state='pending')
+        b = make_file(s3_key='b.csv', pipeline_state='pending')
+        with patch('api.admission.file_admission',
+                   side_effect=[RuntimeError('boom'), 'admis']):
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        a.refresh_from_db(); b.refresh_from_db()
+        self.assertEqual({a.pipeline_state, b.pipeline_state}, {'error', 'done'})
+
+    def test_worker_requeues_orphan_running(self):
+        from django.core.management import call_command
+        rf = make_file(pipeline_state='running')
+        with patch('api.admission.file_admission') as fa:
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        fa.assert_called_once_with(rf.pk)
+        rf.refresh_from_db()
+        self.assertEqual(rf.pipeline_state, 'done')
+
+    def test_legacy_rows_not_picked_up(self):
+        from django.core.management import call_command
+        make_file()   # pipeline_state vide (ligne antérieure / backfill)
+        with patch('api.admission.file_admission') as fa:
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        fa.assert_not_called()
+
+
+class RecycleViaPipelineTests(TestCase):
+    """« Recycle » passe par la file du worker et rejoue la chaîne COMPLÈTE
+    (identification + chargement inclus) — cas du fichier 593 : identification en
+    échec (Acta injoignable) que l'ancien Recycle (admission seule) ne pouvait lever."""
+
+    def setUp(self):
+        self.rf = make_file(username='stranger')    # jamais enrôlé → recycle
+        file_admission(self.rf.pk)
+        self.rf.refresh_from_db()
+        self.assertEqual(self.rf.control_class, Event.MonitoringClass.RECYCLE)
+        self.staff = get_user_model().objects.create_user('staff', is_staff=True)
+        self.client.force_login(self.staff)
+
+    def _recycle(self):
+        return self.client.post(f'/monitoring/files/{self.rf.pk}/recycle/')
+
+    def test_recycle_enqueues_without_running_inline(self):
+        with patch('api.admission.file_admission') as fa:
+            resp = self._recycle()
+        self.assertEqual(resp.status_code, 202)
+        fa.assert_not_called()
+        self.rf.refresh_from_db()
+        self.assertEqual(self.rf.pipeline_state, ReceivedFile.PipelineState.PENDING)
+        self.assertEqual(self.rf.pipeline_requested_by, 'staff')
+
+    def test_second_recycle_while_queued_is_refused(self):
+        self.assertEqual(self._recycle().status_code, 202)
+        self.assertEqual(self._recycle().status_code, 409)
+        resp = self.client.post(f'/monitoring/files/{self.rf.pk}/reject/')
+        self.assertEqual(resp.status_code, 409)
+
+    def test_worker_runs_identification_and_load_then_flags(self):
+        from django.core.management import call_command
+
+        # Cause corrigée (enrôlement + feed routée) : l'admission rejouée passe push.
+        enrol('stranger')
+        add_feed('stranger', 'in/acme', r'.+', route=add_route('stranger'))
+        self._recycle()
+        with patch('api.admission.file_identification') as fi, \
+                patch('api.acta_nav.maybe_load') as ml:
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        fi.assert_called_once_with(self.rf.pk)
+        ml.assert_called_once_with(self.rf.pk)
+        self.rf.refresh_from_db()
+        self.assertEqual(self.rf.pipeline_state, ReceivedFile.PipelineState.DONE)
+        self.assertEqual(self.rf.pipeline_requested_by, '')
+        self.assertEqual(Handled.objects.get(file=self.rf).owner, 'staff')
+
+    def test_recycle_after_downstream_failure_replays_identification(self):
+        """Cas du fichier 595 : amont OK, mais dernier chargement en échec (Acta
+        injoignable) → control_class=recycle. Le worker doit quand même rejouer
+        identification + chargement (garde sur l'amont, pas sur control_class)."""
+        from django.core.management import call_command
+        from .models import run_scope, refresh_control_class
+        enrol('acme')
+        add_feed('acme', 'in/acme', r'.+', route=add_route('acme'))
+        rf = make_file(username='acme', s3_key='in/acme/nav.csv')
+        file_admission(rf.pk)
+        with run_scope():
+            Event.objects.create(file=rf, stage='load', control='acta_nav',
+                                 result=Event.Result.FAILED,
+                                 monitoring_class=Event.MonitoringClass.RECYCLE,
+                                 sub_tenant_id=rf.sub_tenant_id,
+                                 detail={'reason': 'acta_unreachable'})
+        refresh_control_class([rf.pk])
+        rf.refresh_from_db()
+        self.assertEqual(rf.control_class, Event.MonitoringClass.RECYCLE)
+
+        self.assertEqual(
+            self.client.post(f'/monitoring/files/{rf.pk}/recycle/').status_code, 202)
+        with patch('api.admission.file_identification') as fi, \
+                patch('api.acta_nav.maybe_load') as ml:
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        fi.assert_called_once_with(rf.pk)
+        ml.assert_called_once_with(rf.pk)
+
+    def test_upstream_failure_still_blocks_identification(self):
+        from django.core.management import call_command
+        from api.pipeline import enqueue
+        enqueue(self.rf.pk)      # partenaire jamais enrôlé → amont recycle
+        with patch('api.admission.file_identification') as fi, \
+                patch('api.acta_nav.maybe_load') as ml:
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        fi.assert_not_called()
+        ml.assert_not_called()
+
+    def test_webhook_run_never_flags_handled(self):
+        """Une mise en file par le webhook (sans opérateur) ne pose jamais Handled."""
+        from django.core.management import call_command
+        from api.pipeline import enqueue
+        enqueue(self.rf.pk)
+        with patch('api.admission.file_admission', side_effect=lambda pk: (
+                ReceivedFile.objects.filter(pk=pk).update(
+                    control_class=Event.MonitoringClass.PUSH), 'admis')[1]), \
+                patch('api.admission.file_identification'), \
+                patch('api.acta_nav.maybe_load'):
+            call_command('run_pipeline_worker', '--once', stdout=io.StringIO())
+        self.assertFalse(Handled.objects.filter(file=self.rf).exists())
+
+
+@override_settings(ACTA_URL='http://acta', ACTA_USER='u', ACTA_PASSWORD='p')
+class ActaClientTimeoutTests(TestCase):
+    """Un timeout réseau devient ``ActaTimeout`` (la requête a pu aboutir côté Acta),
+    distinct des autres erreurs de transport (``ActaError``)."""
+
+    def _raise(self, exc):
+        from .acta import ActaClient, ActaError, ActaTimeout
+        c = ActaClient()
+        c._opener = type('O', (), {'open': staticmethod(lambda *a, **k: (_ for _ in ()).throw(exc))})()
+        with self.assertRaises(ActaError) as cm:
+            c._request('GET', '/x')
+        return isinstance(cm.exception, ActaTimeout)
+
+    def test_socket_timeout_is_acta_timeout(self):
+        self.assertTrue(self._raise(TimeoutError('timed out')))
+
+    def test_urlerror_timeout_is_acta_timeout(self):
+        import urllib.error
+        self.assertTrue(self._raise(urllib.error.URLError(TimeoutError('timed out'))))
+
+    def test_get_json_retries_once_on_timeout(self):
+        from .acta import ActaClient, ActaTimeout
+        c = ActaClient()
+        c._cookies['sessionid'] = 's'
+        with patch.object(c, '_request', side_effect=[
+                ActaTimeout('timed out'), (200, b'{"ok": 1}')]) as req:
+            self.assertEqual(c.get_json('/x'), {'ok': 1})
+        self.assertEqual(req.call_count, 2)
+
+    def test_get_json_gives_up_after_second_timeout(self):
+        from .acta import ActaClient, ActaTimeout
+        c = ActaClient()
+        c._cookies['sessionid'] = 's'
+        with patch.object(c, '_request', side_effect=ActaTimeout('timed out')) as req:
+            with self.assertRaises(ActaTimeout):
+                c.get_json('/x')
+        self.assertEqual(req.call_count, 2)
+
+    def test_connection_refused_is_not_timeout(self):
+        self.assertFalse(self._raise(ConnectionRefusedError('refused')))

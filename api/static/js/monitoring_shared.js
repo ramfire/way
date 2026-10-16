@@ -2,6 +2,7 @@
    Exposé en global `window.MShared`. Portée strictement présentation :
    - formatters date/heure/octets/durée + échappement HTML (mêmes conventions
      d'affichage sur les trois boards, cf. décision §5) ;
+   - menu de layout (thème visuel black/generali) persisté en localStorage ;
    - dictionnaire i18n des libellés STRUCTURELS communs (nav croisée) EN/FR/IT,
      consommé par les trois boards (décision §4).
    Le vocabulaire MÉTIER propre à chaque board reste dans son template. */
@@ -68,7 +69,34 @@
     });
   }
 
+  // Layouts visuels disponibles (thèmes CSS, cf. bloc `data-layout` du CSS partagé).
+  // Choix persisté côté navigateur, commun aux trois boards. `generali` = défaut (nouveau navigateur).
+  var LAYOUTS = ['black', 'generali'];
+  var LAYOUT_KEY = 'alfaway_layout';
+
+  function currentLayout() {
+    var v;
+    try { v = localStorage.getItem(LAYOUT_KEY); } catch (e) { v = null; }
+    return LAYOUTS.indexOf(v) >= 0 ? v : 'generali';
+  }
+
+  // Pose <html data-layout> + synchronise le menu ; `persist` enregistre le choix.
+  function applyLayout(name, persist) {
+    if (LAYOUTS.indexOf(name) < 0) name = 'generali';
+    document.documentElement.setAttribute('data-layout', name);
+    if (persist) { try { localStorage.setItem(LAYOUT_KEY, name); } catch (e) { /* privé */ } }
+    document.querySelectorAll('[data-layout-pick]').forEach(function (el) { el.value = name; });
+  }
+
+  // Menu de layout de la nav croisée : script chargé en fin de <body>, le DOM est là.
+  applyLayout(currentLayout(), false);
+  document.querySelectorAll('[data-layout-pick]').forEach(function (el) {
+    el.addEventListener('change', function () { applyLayout(el.value, true); });
+  });
+
   window.MShared = {
+    LAYOUTS: LAYOUTS,
+    applyLayout: applyLayout,
     NAV_I18N: NAV_I18N,
     esc: esc,
     fmtTime: fmtTime,

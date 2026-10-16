@@ -5,12 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AlfaWay — Monitoring</title>
   <link rel="stylesheet" href="{% static 'css/monitoring_shared.css' %}">
+  {% include 'partials/layout_head.html' %}
   <style>
     /* Chrome commun (variables, body/header/table, badges .mc-*/.ds-*, .dot…) :
        monitoring_shared.css. Ici, UNIQUEMENT le spécifique board fichier. */
     .tabs { display:flex; gap:.3rem; }
     .tab { font-size:.82rem; }
-    .tab.active { background:#334155; border-color:var(--mut); color:#fff; font-weight:600; }
+    .tab.active { background:var(--active-bg); border-color:var(--mut); color:var(--active-fg); font-weight:600; }
     .stats { display:flex; gap:.6rem; flex-wrap:wrap; }
     .stat { background:var(--card); border:1px solid var(--line); border-radius:8px;
             padding:.35rem .7rem; font-size:.85rem; }
@@ -19,49 +20,50 @@
     td.fid { font-family: ui-monospace, monospace; color:var(--mut); }
     /* Axe STOCKAGE — badges d'état propres au board fichier (distincts de l'échelle
        de sévérité ; voir design §8). */
-    .receiving { background:#1e3a8a; color:#bfdbfe; }
-    .stored    { background:#14532d; color:#bbf7d0; }
-    .failed    { background:#7f1d1d; color:#fecaca; }
-    .deleted   { background:#374151; color:#d1d5db; }
-    .missing   { background:#78350f; color:#fed7aa; }
-    .archived  { background:#312e81; color:#c7d2fe; }
+    .receiving { background:var(--st-receiving-bg); color:var(--st-receiving-fg); }
+    .stored    { background:var(--st-stored-bg); color:var(--st-stored-fg); }
+    .failed    { background:var(--st-failed-bg); color:var(--st-failed-fg); }
+    .deleted   { background:var(--st-deleted-bg); color:var(--st-deleted-fg); }
+    .missing   { background:var(--st-missing-bg); color:var(--st-missing-fg); }
+    .archived  { background:var(--st-archived-bg); color:var(--st-archived-fg); }
     /* Chip « All » : neutralise le surlignage bleu par défaut de .stat.active
        (spécificité 3 classes > .stat.active) ; `.ds-all` vient du CSS partagé. */
-    .stat.chip-all.active { background:#0f172a; border-color:#64748b; }
-    .stat.chip-all.active .ds-all { background:#475569; color:#e2e8f0; }
+    .stat.chip-all.active { background:var(--bg); border-color:var(--mut); }
+    .stat.chip-all.active .ds-all { background:var(--neutral-bg); color:var(--neutral-fg); }
     /* Barre de filtre par classe de contrôle (chips, axe contrôles). */
     .cbar { display:flex; align-items:center; gap:.5rem; flex-wrap:wrap;
             padding:.55rem 1.5rem; border-bottom:1px solid var(--line); font-size:.82rem; }
     .cbar:empty { display:none; }
     .cbar .cbar-lbl { color:var(--mut); margin-right:.2rem; }
     /* Statuts de triage (étape 5) : ouvert / en cours / résolu. */
-    .tr-open        { background:#334155; color:#cbd5e1; }
-    .tr-in_progress { background:#1e3a8a; color:#bfdbfe; }
-    .tr-resolved    { background:#14532d; color:#bbf7d0; }
+    .tr-open        { background:var(--sev-warn-noaction-bg); color:var(--sev-warn-noaction-fg); }
+    .tr-in_progress { background:var(--st-receiving-bg); color:var(--st-receiving-fg); }
+    .tr-resolved    { background:var(--st-stored-bg); color:var(--st-stored-fg); }
     .tr-owner { color:var(--mut); font-size:.74rem; margin-left:.3rem; }
     /* Flag « traité » : marqueur orthogonal au résultat (à côté du badge de classe). */
-    .flag-handled { font-size:.7rem; font-weight:600; color:#bbf7d0;
-      border:1px solid #14532d; border-radius:999px; padding:.05rem .4rem; white-space:nowrap; }
+    .flag-handled { font-size:.7rem; font-weight:600; color:var(--ok-txt);
+      border:1px solid var(--ok-txt); border-radius:999px; padding:.05rem .4rem; white-space:nowrap; }
     .chk { font-size:.8rem; color:var(--mut); display:flex; align-items:center;
            gap:.3rem; cursor:pointer; user-select:none; }
     button.act, button.rem-act { padding:.2rem .55rem; font-size:.76rem; }
-    a.dl { color:#7dd3fc; text-decoration:none; }
+    .rem-queued { font-size:.76rem; color:var(--mut); white-space:nowrap; }
+    a.dl { color:var(--link); text-decoration:none; }
     a.dl:hover { text-decoration:underline; }
-    a.ev { color:#a5b4fc; text-decoration:none; cursor:pointer; }
+    a.ev { color:var(--link-alt); text-decoration:none; cursor:pointer; }
     a.ev:hover { text-decoration:underline; }
     tr.new td { animation:flash 2.5s ease-out; }
-    @keyframes flash { from{background:#3730a3} to{background:transparent} }
-    tr.row-failed td { background:rgba(239,68,68,.14); }
-    tr.row-failed td:first-child { box-shadow:inset 3px 0 0 #ef4444; }
-    .err { background:#7f1d1d; color:#fecaca; padding:.5rem 1.5rem; font-size:.85rem;
+    @keyframes flash { from{background:var(--flash)} to{background:transparent} }
+    tr.row-failed td { background:var(--row-failed); }
+    tr.row-failed td:first-child { box-shadow:inset 3px 0 0 var(--row-failed-rail); }
+    .err { background:var(--st-failed-bg); color:var(--st-failed-fg); padding:.5rem 1.5rem; font-size:.85rem;
            display:none; }
     .empty { color:var(--mut); padding:2rem; text-align:center; }
     th.sortable { cursor:pointer; user-select:none; }
     th.sortable:hover { color:var(--txt); }
-    th .arr { color:#7dd3fc; }
+    th .arr { color:var(--link); }
     .stat.clickable { cursor:pointer; user-select:none; }
     .stat.clickable:hover { border-color:var(--mut); }
-    .stat.active { border-color:#7dd3fc; background:#0c4a6e; }
+    .stat.active { border-color:var(--sel-line); background:var(--sel-bg); }
     .pager { display:flex; align-items:center; gap:.7rem; padding:.6rem 1.5rem;
              color:var(--mut); font-size:.82rem; border-top:1px solid var(--line); }
     .pager:empty { display:none; }
@@ -78,11 +80,11 @@
     /* Toast transitoire (confirmation d'une relance de contrôles). */
     .toast { position:fixed; left:50%; bottom:2.2rem; transform:translateX(-50%);
              background:var(--card); border:1px solid var(--line); border-radius:8px;
-             padding:.6rem 1rem; font-size:.85rem; box-shadow:0 6px 24px rgba(0,0,0,.45);
+             padding:.6rem 1rem; font-size:.85rem; box-shadow:0 6px 24px var(--shadow);
              opacity:0; pointer-events:none; transition:opacity .2s; z-index:60; }
     .toast.show { opacity:1; }
     /* Modale détail d'admission (ouverte au double-clic, pour le support). */
-    .modal-bg { display:none; position:fixed; inset:0; background:rgba(0,0,0,.62);
+    .modal-bg { display:none; position:fixed; inset:0; background:var(--overlay);
                 align-items:flex-start; justify-content:center; z-index:50; }
     .modal-bg.open { display:flex; }
     .modal { background:var(--card); border:1px solid var(--line); border-radius:10px;
@@ -96,8 +98,8 @@
     .modal table { font-size:.82rem; }
     .modal td.det { color:var(--mut); font-family:ui-monospace,monospace;
                     white-space:normal; max-width:32rem; }
-    .modal .res-passed { color:#4ade80; font-weight:600; }
-    .modal .res-failed { color:#f87171; font-weight:600; }
+    .modal .res-passed { color:var(--ok-txt); font-weight:600; }
+    .modal .res-failed { color:var(--ko-txt); font-weight:600; }
     .modal .mclass { color:var(--mut); text-transform:uppercase; font-size:.72rem; }
   </style>
 </head>
@@ -194,7 +196,7 @@
         tr_open: 'Open', tr_in_progress: 'In progress', tr_resolved: 'Resolved',
         tr_claim: 'Claim', tr_resolve: 'Resolve', tr_reopen: 'Reopen',
         tr_handled: '✓ handled', tr_rejected: '⊘ rejected',
-        tr_recycle: '↻ Recycle', tr_reject: '⊘ Reject',
+        tr_recycle: '↻ Recycle', tr_reject: '⊘ Reject', tr_queued: '⏳ Processing…',
         hide_handled: 'Hide resolved',
         // libellés de la modale détail (support)
         adm_title: 'Admission checks', adm_no_events: 'No admission event for this file yet.',
@@ -257,7 +259,7 @@
         tr_open: 'Ouvert', tr_in_progress: 'En cours', tr_resolved: 'Résolu',
         tr_claim: 'Prendre', tr_resolve: 'Résoudre', tr_reopen: 'Rouvrir',
         tr_handled: '✓ traité', tr_rejected: '⊘ rejeté',
-        tr_recycle: '↻ Recycler', tr_reject: '⊘ Rejeter',
+        tr_recycle: '↻ Recycler', tr_reject: '⊘ Rejeter', tr_queued: '⏳ En cours…',
         hide_handled: 'Masquer tranchés',
         adm_title: 'Contrôles d’admission', adm_no_events: 'Aucun événement d’admission pour ce fichier.',
         adm_c_control: 'Contrôle', adm_c_result: 'Résultat', adm_c_class: 'Classe',
@@ -318,7 +320,7 @@
         tr_open: 'Aperto', tr_in_progress: 'In corso', tr_resolved: 'Risolto',
         tr_claim: 'Prendi', tr_resolve: 'Risolvi', tr_reopen: 'Riapri',
         tr_handled: '✓ gestito', tr_rejected: '⊘ rifiutato',
-        tr_recycle: '↻ Ricicla', tr_reject: '⊘ Rifiuta',
+        tr_recycle: '↻ Ricicla', tr_reject: '⊘ Rifiuta', tr_queued: '⏳ In corso…',
         hide_handled: 'Nascondi risolti',
         adm_title: 'Controlli di ammissione', adm_no_events: 'Nessun evento di ammissione per questo file.',
         adm_c_control: 'Controllo', adm_c_result: 'Esito', adm_c_class: 'Classe',
@@ -571,6 +573,10 @@
         if (r.can_remediate) {
           acts.push(`<button class="rem-act" data-rem="recycle" data-id="${r.id}">${t('tr_recycle')}</button>`);
           acts.push(`<button class="rem-act" data-rem="reject" data-id="${r.id}">${t('tr_reject')}</button>`);
+        } else if (r.display_state === 'failed'
+                   && (r.pipeline_state === 'pending' || r.pipeline_state === 'running')) {
+          // Recycle en file du worker : boutons masqués (garde serveur) jusqu'au verdict.
+          acts.push(`<span class="rem-queued">${t('tr_queued')}</span>`);
         }
         const dl = acts.join(' ');
         // Dernière colonne « horodatage » : stockage (Live) ou archivage/suppression (History).
@@ -783,6 +789,10 @@
     // Remédiation contrôle (Recycle/Reject) : POST dédié, append-only côté serveur ;
     // on repolle pour refléter la nouvelle classe (recyclé re-dérivé, rejeté terminal).
     async function doRemediate(act, id) {
+      // Anti double-clic : on désactive les deux actions de la ligne dès le clic
+      // (le re-render du poll les remplace ensuite).
+      document.querySelectorAll(`button.rem-act[data-id="${id}"]`)
+        .forEach(b => { b.disabled = true; });
       try {
         const res = await fetch(`/monitoring/files/${id}/${act}/`, {
           method: 'POST',
@@ -849,7 +859,7 @@
       const counts = ['rows', 'stored', 'unchanged', 'rejected']
         .map(k => `${esc(t('aj_' + k))} <strong>${esc(String(j[k] ?? 0))}</strong>`).join(' · ');
       const mismatch = j.mismatch
-        ? `<div class="empty" style="color:#f87171">${esc(t('aj_mismatch').replace('{r}', j.rows))}</div>` : '';
+        ? `<div class="empty" style="color:var(--ko-txt)">${esc(t('aj_mismatch').replace('{r}', j.rows))}</div>` : '';
       const rej = j.rejected_lines || [];
       const rejRows = rej.map(l => `<tr>
           <td>${esc(String(l.source_line_no ?? l.line_no))}</td>

@@ -710,7 +710,7 @@ def file_identification(file_id):
     et **ne lève JAMAIS** vers l'appelant (garde englobante) ; rematérialise
     ``control_class`` en ``finally``. Ne modifie ni ``state`` ni ``file_admission``.
     Chaînée après l'admission par l'**orchestrateur** webhook
-    (``SFTPWebhookView._run_admission``, §1.6-b2a) lorsque le verdict est ``push`` ;
+    (``api.pipeline.run_pipeline``, §1.6-b2a) lorsque le verdict est ``push`` ;
     aussi déclenchable à la demande via ``manage.py run_identification``.
 
     Passe propre (``run_scope``), distincte de celle de l'admission : ses Event

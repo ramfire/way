@@ -31,6 +31,10 @@ class ActaError(Exception):
     """Acta injoignable, refus d'authentification ou réponse inattendue."""
 
 
+class ActaTimeout(ActaError):
+    """Pas de réponse d'Acta dans le délai : la requête a pu aboutir côté serveur."""
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None     # le 302 du login est un succès : on lit ses cookies
@@ -50,7 +54,7 @@ class ActaClient:
             raise ActaError('ACTA_URL / ACTA_USER / ACTA_PASSWORD non configurés')
 
     # --- transport ----------------------------------------------------------
-    def _request(self, method, path, data=None, content_type=None):
+    def _request(self, method, path, data=None, content_type=None, timeout=None):
         headers = {
             'Host': self.host,
             'X-Forwarded-Proto': 'https',
@@ -67,10 +71,14 @@ class ActaClient:
         req = urllib.request.Request(self.base_url + path, data=data,
                                      headers=headers, method=method)
         try:
-            resp = self._opener.open(req, timeout=self.timeout)
+            resp = self._opener.open(req, timeout=timeout or self.timeout)
         except urllib.error.HTTPError as e:
             resp = e     # 3xx/4xx/5xx : on lit statut + cookies, l'appelant tranche
+        except TimeoutError as e:
+            raise ActaTimeout(f'Acta injoignable ({self.base_url}) : {e}') from e
         except (urllib.error.URLError, OSError) as e:
+            if isinstance(getattr(e, 'reason', None), TimeoutError):
+                raise ActaTimeout(f'Acta injoignable ({self.base_url}) : {e}') from e
             raise ActaError(f'Acta injoignable ({self.base_url}) : {e}') from e
         for sc in resp.headers.get_all('Set-Cookie') or []:
             name, _, value = sc.split(';', 1)[0].partition('=')
@@ -94,7 +102,13 @@ class ActaClient:
     def get_json(self, path):
         if 'sessionid' not in self._cookies:
             self.login()
-        status, body = self._request('GET', path)
+        try:
+            status, body = self._request('GET', path)
+        except ActaTimeout as e:
+            # Lecture sans effet de bord : un 2e essai absorbe un ralentissement
+            # passager d'Acta (page de 15 s sous charge, fichier 595).
+            logger.warning('GET %s : timeout, nouvel essai (%s)', path, e)
+            status, body = self._request('GET', path)
         if status != 200:
             raise ActaError(f'GET {path} → HTTP {status}')
         try:
@@ -102,14 +116,15 @@ class ActaClient:
         except ValueError as e:
             raise ActaError(f'GET {path} : JSON invalide') from e
 
-    def send_json(self, method, path, payload):
+    def send_json(self, method, path, payload, timeout=None):
         """POST/PUT/DELETE JSON → ``(statut, corps décodé ou None)``. Ne lève que
-        sur transport : un 4xx est rendu à l'appelant (motif de rejet Acta)."""
+        sur transport : un 4xx est rendu à l'appelant (motif de rejet Acta).
+        ``timeout`` : délai propre à cet appel (sinon ``ACTA_TIMEOUT``)."""
         if 'sessionid' not in self._cookies:
             self.login()
         data = json.dumps(payload).encode() if payload is not None else None
         status, body = self._request(method, path, data,
-                                     'application/json' if data else None)
+                                     'application/json' if data else None, timeout)
         try:
             return status, (json.loads(body) if body else None)
         except ValueError:
