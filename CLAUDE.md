@@ -214,6 +214,14 @@ sudo systemctl restart alfaway alfaway-worker
 > jusqu'à `ACTA_INGEST_RECOVERY_WAIT` (60 s) : lot journalisé ⇒ succès
 > (`recovered_after_timeout`), sinon `acta_unreachable` (incident fichier 595, 2026-10-12).
 Aussi : `path("healthz/", ...)` pour les health checks.
+>
+> **Layout client de l'admin (`core/layouts.py`, depuis 2026-10-16)** : `settings.ALFAWAY_LAYOUT`
+> (env `ALFAWAY_LAYOUT`, défaut `generali`, nom inconnu → `generali` + warning) choisit le thème
+> de `/admin/` et `/admin/login/` (gabarits `templates/admin/`, prioritaires via `TEMPLATES["DIRS"]`).
+> **Nouveau layout client** : entrée `LAYOUTS["<nom>"] = {label, admin_css, login_css, logo}` +
+> `core/static/layouts/<nom>/{admin,login}.css` (redéfinir les variables CSS de l'admin, clair
+> **et** sombre), puis collectstatic + restart. Distinct du sélecteur black/generali du
+> monitoring (localStorage, `monitoring_shared.css`).
 
 ---
 
