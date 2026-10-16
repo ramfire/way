@@ -68,15 +68,6 @@ body.login #footer {
     align-self: flex-start;
 }
 
-.login-wordmark {
-    margin: 0;
-    padding: 0;
-    font-size: 2rem;
-    font-weight: 700;
-    line-height: 1.1;
-    letter-spacing: .01em;
-}
-
 .login-tagline {
     margin: 0;
     padding: 0;
@@ -191,10 +182,6 @@ body.login .login-panel .submit-row input {
         padding: 28px 24px;
         border-right: none;
         border-bottom: 4px solid var(--secondary);
-    }
-
-    .login-wordmark {
-        font-size: 1.6rem;
     }
 
     .login-panel {
